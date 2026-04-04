@@ -35,7 +35,7 @@ enum CliTransportMode {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "adele-tui")]
+#[command(name = "adele")]
 struct CliArgs {
     #[arg(
         long,
@@ -347,7 +347,7 @@ mod tests {
     use super::*;
 
     fn args(parts: &[&str]) -> Vec<String> {
-        let mut out = vec!["adele-tui".to_string()];
+        let mut out = vec!["adele".to_string()];
         out.extend(parts.iter().map(|value| value.to_string()));
         out
     }
