@@ -142,7 +142,7 @@ async fn run(
                 Ok(convs) => app.set_conversations(convs),
                 Err(e) => app.status_message = format!("Error loading conversations: {e}"),
             }
-            app.status_message = transport_label(config.transport_mode).to_string();
+            app.status_message = transport_label(&config);
             (Some(transport_client), rx)
         }
         Err(e) => {
