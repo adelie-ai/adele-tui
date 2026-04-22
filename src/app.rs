@@ -1,6 +1,9 @@
 pub use desktop_assistant_client_common::{ChatMessage, ConversationDetail, ConversationSummary};
+use desktop_assistant_client_common::api;
 use ratatui::style::Style;
 use tui_textarea::{CursorMove, TextArea};
+
+use crate::views::{ConnectionsView, ConversationSelections, ModelSelector, PurposesView};
 
 fn new_textarea() -> TextArea<'static> {
     let mut ta = TextArea::default();
@@ -64,6 +67,15 @@ pub enum InputMode {
     Editing,
 }
 
+/// Top-level screen shown to the user. The chat list + chat panel live under
+/// `Chat`; the other two are settings screens reachable via `S`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    Chat,
+    Connections,
+    Purposes,
+}
+
 pub struct App {
     pub conversations: Vec<ConversationSummary>,
     pub selected_conversation: Option<usize>,
@@ -78,6 +90,16 @@ pub struct App {
     pub scroll_offset: u16,
     /// Whether to include archived conversations in the list.
     pub show_archived: bool,
+
+    // --- Multi-connection additions (issue #1) ---
+    pub screen: Screen,
+    pub connections_view: ConnectionsView,
+    pub purposes_view: PurposesView,
+    pub model_selector: ModelSelector,
+    pub conversation_selections: ConversationSelections,
+    /// One-line inline advisory shown above the status bar (e.g. dangling
+    /// model selection). Cleared on the next status update.
+    pub inline_notice: Option<String>,
 }
 
 impl App {
@@ -96,6 +118,13 @@ impl App {
             should_quit: false,
             scroll_offset: 0,
             show_archived: false,
+
+            screen: Screen::Chat,
+            connections_view: ConnectionsView::default(),
+            purposes_view: PurposesView::default(),
+            model_selector: ModelSelector::default(),
+            conversation_selections: ConversationSelections::default(),
+            inline_notice: None,
         }
     }
 
@@ -158,8 +187,10 @@ impl App {
         self.textarea.lines().join("\n")
     }
 
-    /// Returns (conversation_id, prompt) if valid, None otherwise.
-    pub fn submit_prompt(&mut self) -> Option<(String, String)> {
+    /// Returns (conversation_id, prompt, optional override) if valid,
+    /// None otherwise. The override reflects the user's current per-
+    /// conversation selection (mutable-sticky).
+    pub fn submit_prompt(&mut self) -> Option<(String, String, Option<api::SendPromptOverride>)> {
         let content = self.textarea_content();
         if content.is_empty() {
             return None;
@@ -171,7 +202,8 @@ impl App {
         });
         self.textarea = new_textarea();
         self.scroll_offset = 0;
-        Some((conv.id.clone(), content))
+        let override_sel = self.conversation_selections.get(&conv.id).cloned();
+        Some((conv.id.clone(), content, override_sel))
     }
 
     /// Hard-wrap textarea lines to fit the available editor width.
@@ -309,7 +341,84 @@ impl App {
     }
 
     pub fn load_conversation(&mut self, detail: ConversationDetail) {
+        // Absorb any warnings the daemon attached — e.g. a stored model
+        // selection no longer resolves — and surface them as an inline notice
+        // above the status bar.
+        for warning in &detail.warnings {
+            self.apply_conversation_warning(&detail.id, warning);
+        }
         self.current_conversation = Some(detail);
+    }
+
+    /// Handle a `ConversationWarningEmitted` event (or a warning attached to
+    /// `GetConversation`). Updates the in-app selection cache where the daemon
+    /// fell back and shows an inline notice.
+    pub fn apply_conversation_warning(
+        &mut self,
+        conversation_id: &str,
+        warning: &api::ConversationWarning,
+    ) {
+        self.inline_notice = Some(crate::views::selector::warning_notice(warning));
+        match warning {
+            api::ConversationWarning::DanglingModelSelection { fallback_to, .. } => {
+                self.conversation_selections
+                    .hydrate_from_dangling_fallback(conversation_id, fallback_to);
+            }
+        }
+    }
+
+    /// The override for the currently-loaded conversation (for status bar).
+    pub fn current_selection_label(&self) -> String {
+        let sel = self
+            .current_conversation
+            .as_ref()
+            .and_then(|c| self.conversation_selections.get(&c.id));
+        crate::views::selector::status_bar_label(sel)
+    }
+
+    /// Commit the highlighted model selector row to the per-conversation map,
+    /// closing the popup. Returns true iff a pinned (non-Auto) row was picked.
+    pub fn apply_model_selection(&mut self) -> bool {
+        let Some(conv) = self.current_conversation.as_ref() else {
+            self.model_selector.close();
+            return false;
+        };
+        let conv_id = conv.id.clone();
+        match self.model_selector.selected_entry() {
+            Some(entry) => {
+                let sel = api::SendPromptOverride {
+                    connection_id: entry.connection_id.clone(),
+                    model_id: entry.model.id.clone(),
+                    effort: None,
+                };
+                self.conversation_selections.set(conv_id, sel);
+                self.model_selector.close();
+                true
+            }
+            None => {
+                // Auto row — clear any pinned selection.
+                self.conversation_selections.clear(&conv_id);
+                self.model_selector.close();
+                false
+            }
+        }
+    }
+
+    pub fn switch_to_chat(&mut self) {
+        self.screen = Screen::Chat;
+        self.connections_view.close_overlay();
+        self.purposes_view.close_editor();
+        self.model_selector.close();
+    }
+
+    pub fn switch_to_connections(&mut self) {
+        self.screen = Screen::Connections;
+        self.mode = InputMode::Normal;
+    }
+
+    pub fn switch_to_purposes(&mut self) {
+        self.screen = Screen::Purposes;
+        self.mode = InputMode::Normal;
     }
 
     pub fn update_conversation_title(&mut self, conversation_id: &str, title: &str) {
@@ -559,6 +668,7 @@ mod tests {
             id: "1".into(),
             title: "Test".into(),
             messages: vec![],
+    warnings: vec![],
         });
         assert!(app.submit_prompt().is_none());
     }
@@ -570,13 +680,14 @@ mod tests {
             id: "conv1".into(),
             title: "Test".into(),
             messages: vec![],
+            warnings: vec![],
         });
         app.textarea.insert_str("What is Rust?");
 
         let result = app.submit_prompt();
         assert_eq!(
             result,
-            Some(("conv1".to_string(), "What is Rust?".to_string()))
+            Some(("conv1".to_string(), "What is Rust?".to_string(), None))
         );
         assert_eq!(app.textarea_content(), "");
 
@@ -584,6 +695,30 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[0].content, "What is Rust?");
+    }
+
+    #[test]
+    fn submit_prompt_includes_override_when_selection_is_set() {
+        let mut app = App::new();
+        app.current_conversation = Some(ConversationDetail {
+            id: "conv1".into(),
+            title: "Test".into(),
+            messages: vec![],
+            warnings: vec![],
+        });
+        app.conversation_selections.set(
+            "conv1".into(),
+            api::SendPromptOverride {
+                connection_id: "work".into(),
+                model_id: "gpt-5".into(),
+                effort: Some(api::EffortLevel::High),
+            },
+        );
+        app.textarea.insert_str("hi");
+        let (_, _, ov) = app.submit_prompt().unwrap();
+        let ov = ov.expect("override should be threaded through");
+        assert_eq!(ov.connection_id, "work");
+        assert_eq!(ov.effort, Some(api::EffortLevel::High));
     }
 
     // --- Streaming tests ---
@@ -595,6 +730,7 @@ mod tests {
             id: "c1".into(),
             title: "Test".into(),
             messages: vec![],
+    warnings: vec![],
         });
 
         app.start_streaming("req1".into());
@@ -621,6 +757,7 @@ mod tests {
             id: "c1".into(),
             title: "Test".into(),
             messages: vec![],
+    warnings: vec![],
         });
 
         app.start_streaming("req1".into());
@@ -648,6 +785,7 @@ mod tests {
             id: "c1".into(),
             title: "Test".into(),
             messages: vec![],
+    warnings: vec![],
         });
 
         app.start_streaming_without_request_id();
@@ -727,6 +865,7 @@ mod tests {
             id: "2".into(),
             title: "Second".into(),
             messages: vec![],
+    warnings: vec![],
         });
 
         let deleted = app.delete_selected_conversation();
@@ -816,6 +955,7 @@ mod tests {
             id: "c1".into(),
             title: "Test".into(),
             messages: vec![],
+    warnings: vec![],
         });
         app.scroll_up(10);
         app.textarea.insert_str("hello");
