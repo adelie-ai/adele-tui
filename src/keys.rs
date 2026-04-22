@@ -1,16 +1,24 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::InputMode;
+use crate::app::{App, InputMode, Screen};
 
+/// High-level actions the main loop can dispatch. The dispatch table lives in
+/// `handle_action` (main.rs); this module only decides "what semantic action
+/// does this keystroke mean *right now*". The `right now` depends on the
+/// active [`Screen`], any overlay popup, and the textarea's [`InputMode`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Quit,
+
+    // Chat-list navigation
     NextConversation,
     PreviousConversation,
     OpenConversation,
     DeleteConversation,
     ArchiveConversation,
     NewConversation,
+
+    // Chat input / streaming
     EnterEditMode,
     ExitEditMode,
     SubmitPrompt,
@@ -19,17 +27,81 @@ pub enum Action {
     ScrollDown,
     ScrollToBottom,
     ToggleShowArchived,
+
+    // Screen switches
+    OpenConnectionsView,
+    OpenPurposesView,
+    BackToChat,
+
+    // Connections view
+    ConnectionsNext,
+    ConnectionsPrevious,
+    ConnectionsAdd,
+    ConnectionsConfigure,
+    ConnectionsRemove,
+    ConnectionsRefreshModels,
+    ConnectionsFormSubmit,
+    ConnectionsFormCancel,
+    ConnectionsFormNextField,
+    ConnectionsFormPreviousField,
+    ConnectionsFormCycleKindNext,
+    ConnectionsFormCycleKindPrev,
+    ConnectionsFormInsertChar(char),
+    ConnectionsFormBackspace,
+    ConnectionsFormToggleAutoPull,
+    ConnectionsDeleteConfirm,
+    ConnectionsDeleteForce,
+    ConnectionsDeleteCancel,
+
+    // Purposes view
+    PurposesNext,
+    PurposesPrevious,
+    PurposesEdit,
+    PurposesEditorSubmit,
+    PurposesEditorCancel,
+    PurposesEditorNextField,
+    PurposesEditorPreviousField,
+    PurposesEditorInsertChar(char),
+    PurposesEditorBackspace,
+
+    // Model selector popup
+    OpenModelSelector,
+    ModelSelectorNext,
+    ModelSelectorPrevious,
+    ModelSelectorConfirm,
+    ModelSelectorCancel,
+    ModelSelectorRefresh,
 }
 
-/// Handle key events that we intercept before passing to textarea.
-/// Returns None for keys that should be forwarded to textarea.input().
-pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
+/// Route a key event to an action, given the app's current screen / overlay
+/// / input mode. Returns `None` for keys that should be forwarded to the
+/// underlying widget (textarea) or ignored outright.
+pub fn route_key(key: KeyEvent, app: &App) -> Option<Action> {
+    // Ctrl-M always opens the model selector from the chat screen.
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if ctrl && key.code == KeyCode::Char('m') && matches!(app.screen, Screen::Chat) {
+        return Some(Action::OpenModelSelector);
+    }
+
+    // Model selector popup grabs every key when it's open.
+    if app.model_selector.open {
+        return route_model_selector(key);
+    }
+
+    match app.screen {
+        Screen::Chat => route_chat(key, app),
+        Screen::Connections => route_connections(key, app),
+        Screen::Purposes => route_purposes(key, app),
+    }
+}
+
+fn route_chat(key: KeyEvent, app: &App) -> Option<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
-    // Ctrl+u / Ctrl+d / Ctrl+e for scrolling — works in all modes
+    // Scroll shortcuts work in any chat sub-mode
     if ctrl {
-        if matches!(mode, InputMode::Editing) && matches!(key.code, KeyCode::Char('j')) {
+        if matches!(app.mode, InputMode::Editing) && matches!(key.code, KeyCode::Char('j')) {
             return Some(Action::InsertNewline);
         }
         return match key.code {
@@ -40,9 +112,8 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
         };
     }
 
-    match mode {
+    match app.mode {
         InputMode::Normal => {
-            // Ignore Alt/Meta combos in Normal mode
             if alt || key.modifiers.intersects(KeyModifiers::META) {
                 return None;
             }
@@ -58,37 +129,133 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
                 KeyCode::Char('a') => Some(Action::ToggleShowArchived),
                 KeyCode::Char('A') => Some(Action::ArchiveConversation),
                 KeyCode::Char('i') => Some(Action::EnterEditMode),
+                KeyCode::Char('S') => Some(Action::OpenConnectionsView),
+                KeyCode::Char('P') => Some(Action::OpenPurposesView),
                 KeyCode::PageUp => Some(Action::ScrollUp),
                 KeyCode::PageDown => Some(Action::ScrollDown),
                 KeyCode::End => Some(Action::ScrollToBottom),
                 _ => None,
             }
         }
-        InputMode::Editing => {
-            // Shift+Enter inserts a newline while plain Enter submits.
-            match key.code {
-                KeyCode::Enter => {
-                    if key.modifiers.contains(KeyModifiers::SHIFT) {
-                        return Some(Action::InsertNewline);
-                    }
-                    if key.modifiers.is_empty() {
-                        return Some(Action::SubmitPrompt);
-                    }
-                    None
+        InputMode::Editing => match key.code {
+            KeyCode::Enter => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    return Some(Action::InsertNewline);
                 }
-                // Preserve terminal-provided newline chars by forwarding them
-                // to textarea.input(...), which keeps composer and payload in sync.
-                KeyCode::Char('\n') | KeyCode::Char('\r') => Some(Action::InsertNewline),
-                KeyCode::Esc => Some(Action::ExitEditMode),
-                KeyCode::PageUp => Some(Action::ScrollUp),
-                KeyCode::PageDown => Some(Action::ScrollDown),
-                KeyCode::End if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    Some(Action::ScrollToBottom)
+                if key.modifiers.is_empty() {
+                    return Some(Action::SubmitPrompt);
                 }
-                // All other keys: return None so they get forwarded to textarea
-                _ => None,
+                None
             }
+            KeyCode::Char('\n') | KeyCode::Char('\r') => Some(Action::InsertNewline),
+            KeyCode::Esc => Some(Action::ExitEditMode),
+            KeyCode::PageUp => Some(Action::ScrollUp),
+            KeyCode::PageDown => Some(Action::ScrollDown),
+            KeyCode::End if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                Some(Action::ScrollToBottom)
+            }
+            _ => None,
+        },
+    }
+}
+
+fn route_connections(key: KeyEvent, app: &App) -> Option<Action> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Delete-confirm overlay takes priority.
+    if app.connections_view.delete.is_some() {
+        return match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                Some(Action::ConnectionsDeleteConfirm)
+            }
+            KeyCode::Char('f') | KeyCode::Char('F') => Some(Action::ConnectionsDeleteForce),
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                Some(Action::ConnectionsDeleteCancel)
+            }
+            _ => None,
+        };
+    }
+
+    // Configure form.
+    if app.connections_view.form.is_some() {
+        if ctrl {
+            return None;
         }
+        return route_connection_form(key, app);
+    }
+
+    // List mode.
+    if ctrl {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => Some(Action::BackToChat),
+        KeyCode::Char('j') | KeyCode::Down => Some(Action::ConnectionsNext),
+        KeyCode::Char('k') | KeyCode::Up => Some(Action::ConnectionsPrevious),
+        KeyCode::Char('a') => Some(Action::ConnectionsAdd),
+        KeyCode::Char('c') | KeyCode::Enter => Some(Action::ConnectionsConfigure),
+        KeyCode::Char('d') => Some(Action::ConnectionsRemove),
+        KeyCode::Char('r') => Some(Action::ConnectionsRefreshModels),
+        _ => None,
+    }
+}
+
+fn route_connection_form(key: KeyEvent, app: &App) -> Option<Action> {
+    let form = app.connections_view.form.as_ref()?;
+    match key.code {
+        KeyCode::Esc => Some(Action::ConnectionsFormCancel),
+        KeyCode::Tab => Some(Action::ConnectionsFormNextField),
+        KeyCode::BackTab => Some(Action::ConnectionsFormPreviousField),
+        KeyCode::Enter => Some(Action::ConnectionsFormSubmit),
+        KeyCode::Backspace => Some(Action::ConnectionsFormBackspace),
+        // On the kind picker row, left/right cycle through connector types.
+        KeyCode::Left if form.is_on_kind() => Some(Action::ConnectionsFormCycleKindPrev),
+        KeyCode::Right if form.is_on_kind() => Some(Action::ConnectionsFormCycleKindNext),
+        KeyCode::Char(' ') if form.current_field().is_some_and(|f| f.is_toggle()) => {
+            Some(Action::ConnectionsFormToggleAutoPull)
+        }
+        KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(Action::ConnectionsFormInsertChar(ch))
+        }
+        _ => None,
+    }
+}
+
+fn route_purposes(key: KeyEvent, app: &App) -> Option<Action> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if app.purposes_view.editor.is_some() {
+        if ctrl {
+            return None;
+        }
+        return match key.code {
+            KeyCode::Esc => Some(Action::PurposesEditorCancel),
+            KeyCode::Tab => Some(Action::PurposesEditorNextField),
+            KeyCode::BackTab => Some(Action::PurposesEditorPreviousField),
+            KeyCode::Enter => Some(Action::PurposesEditorSubmit),
+            KeyCode::Backspace => Some(Action::PurposesEditorBackspace),
+            KeyCode::Char(ch) => Some(Action::PurposesEditorInsertChar(ch)),
+            _ => None,
+        };
+    }
+    if ctrl {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => Some(Action::BackToChat),
+        KeyCode::Char('j') | KeyCode::Down => Some(Action::PurposesNext),
+        KeyCode::Char('k') | KeyCode::Up => Some(Action::PurposesPrevious),
+        KeyCode::Char('c') | KeyCode::Enter => Some(Action::PurposesEdit),
+        _ => None,
+    }
+}
+
+fn route_model_selector(key: KeyEvent) -> Option<Action> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => Some(Action::ModelSelectorCancel),
+        KeyCode::Enter => Some(Action::ModelSelectorConfirm),
+        KeyCode::Char('j') | KeyCode::Down => Some(Action::ModelSelectorNext),
+        KeyCode::Char('k') | KeyCode::Up => Some(Action::ModelSelectorPrevious),
+        KeyCode::Char('r') => Some(Action::ModelSelectorRefresh),
+        _ => None,
     }
 }
 
@@ -115,298 +282,172 @@ mod tests {
         }
     }
 
-    // --- Normal mode tests ---
+    fn chat_normal() -> App {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.mode = InputMode::Normal;
+        app
+    }
+
+    fn chat_editing() -> App {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.mode = InputMode::Editing;
+        app
+    }
 
     #[test]
-    fn normal_q_quits() {
+    fn chat_normal_q_quits() {
         assert_eq!(
-            handle_key_event(key(KeyCode::Char('q')), &InputMode::Normal),
+            route_key(key(KeyCode::Char('q')), &chat_normal()),
             Some(Action::Quit)
         );
     }
 
     #[test]
-    fn normal_j_next() {
+    fn chat_normal_capital_s_opens_connections() {
         assert_eq!(
-            handle_key_event(key(KeyCode::Char('j')), &InputMode::Normal),
-            Some(Action::NextConversation)
+            route_key(key(KeyCode::Char('S')), &chat_normal()),
+            Some(Action::OpenConnectionsView)
         );
     }
 
     #[test]
-    fn normal_down_next() {
+    fn chat_normal_capital_p_opens_purposes() {
         assert_eq!(
-            handle_key_event(key(KeyCode::Down), &InputMode::Normal),
-            Some(Action::NextConversation)
+            route_key(key(KeyCode::Char('P')), &chat_normal()),
+            Some(Action::OpenPurposesView)
         );
     }
 
     #[test]
-    fn normal_k_previous() {
+    fn chat_ctrl_m_opens_selector() {
         assert_eq!(
-            handle_key_event(key(KeyCode::Char('k')), &InputMode::Normal),
-            Some(Action::PreviousConversation)
-        );
-    }
-
-    #[test]
-    fn normal_up_previous() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::Up), &InputMode::Normal),
-            Some(Action::PreviousConversation)
-        );
-    }
-
-    #[test]
-    fn normal_enter_opens() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::Enter), &InputMode::Normal),
-            Some(Action::OpenConversation)
-        );
-    }
-
-    #[test]
-    fn normal_char_newline_is_ignored() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::Char('\n')), &InputMode::Normal),
-            None
-        );
-    }
-
-    #[test]
-    fn normal_d_deletes() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::Char('d')), &InputMode::Normal),
-            Some(Action::DeleteConversation)
-        );
-    }
-
-    #[test]
-    fn normal_n_new_conversation() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::Char('n')), &InputMode::Normal),
-            Some(Action::NewConversation)
-        );
-    }
-
-    #[test]
-    fn normal_i_enter_edit() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::Char('i')), &InputMode::Normal),
-            Some(Action::EnterEditMode)
-        );
-    }
-
-    #[test]
-    fn normal_unknown_key_ignored() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::Char('x')), &InputMode::Normal),
-            None
-        );
-    }
-
-    #[test]
-    fn normal_ctrl_modifier_ignored() {
-        assert_eq!(
-            handle_key_event(
-                key_with_mod(KeyCode::Char('q'), KeyModifiers::CONTROL),
-                &InputMode::Normal
+            route_key(
+                key_with_mod(KeyCode::Char('m'), KeyModifiers::CONTROL),
+                &chat_normal()
             ),
-            None
+            Some(Action::OpenModelSelector)
         );
     }
 
     #[test]
-    fn normal_alt_modifier_ignored() {
+    fn ctrl_m_from_editing_mode_also_opens_selector() {
         assert_eq!(
-            handle_key_event(
-                key_with_mod(KeyCode::Char('j'), KeyModifiers::ALT),
-                &InputMode::Normal
+            route_key(
+                key_with_mod(KeyCode::Char('m'), KeyModifiers::CONTROL),
+                &chat_editing()
             ),
-            None
-        );
-    }
-
-    // --- Editing mode tests ---
-
-    #[test]
-    fn editing_escape_exits() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::Esc), &InputMode::Editing),
-            Some(Action::ExitEditMode)
+            Some(Action::OpenModelSelector)
         );
     }
 
     #[test]
-    fn editing_enter_submits_prompt() {
+    fn connections_a_adds() {
+        let mut app = App::new();
+        app.screen = Screen::Connections;
         assert_eq!(
-            handle_key_event(key(KeyCode::Enter), &InputMode::Editing),
+            route_key(key(KeyCode::Char('a')), &app),
+            Some(Action::ConnectionsAdd)
+        );
+    }
+
+    #[test]
+    fn connections_d_prompts_remove() {
+        let mut app = App::new();
+        app.screen = Screen::Connections;
+        assert_eq!(
+            route_key(key(KeyCode::Char('d')), &app),
+            Some(Action::ConnectionsRemove)
+        );
+    }
+
+    #[test]
+    fn connections_form_tab_next_field() {
+        let mut app = App::new();
+        app.screen = Screen::Connections;
+        app.connections_view.start_add();
+        assert_eq!(
+            route_key(key(KeyCode::Tab), &app),
+            Some(Action::ConnectionsFormNextField)
+        );
+    }
+
+    #[test]
+    fn connections_delete_prompt_force_key() {
+        let mut app = App::new();
+        app.screen = Screen::Connections;
+        app.connections_view.connections = vec![crate::views::connections::tests_fixture(
+            "a", "openai",
+        )];
+        app.connections_view.selected = Some(0);
+        app.connections_view.start_delete();
+        assert_eq!(
+            route_key(key(KeyCode::Char('f')), &app),
+            Some(Action::ConnectionsDeleteForce)
+        );
+    }
+
+    #[test]
+    fn model_selector_captures_all_keys_when_open() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.model_selector.open = true;
+        assert_eq!(
+            route_key(key(KeyCode::Down), &app),
+            Some(Action::ModelSelectorNext)
+        );
+        assert_eq!(
+            route_key(key(KeyCode::Esc), &app),
+            Some(Action::ModelSelectorCancel)
+        );
+    }
+
+    #[test]
+    fn purposes_normal_c_edits() {
+        let mut app = App::new();
+        app.screen = Screen::Purposes;
+        assert_eq!(
+            route_key(key(KeyCode::Char('c')), &app),
+            Some(Action::PurposesEdit)
+        );
+    }
+
+    #[test]
+    fn purposes_editor_backspace() {
+        let mut app = App::new();
+        app.screen = Screen::Purposes;
+        app.purposes_view.start_edit();
+        assert_eq!(
+            route_key(key(KeyCode::Backspace), &app),
+            Some(Action::PurposesEditorBackspace)
+        );
+    }
+
+    #[test]
+    fn chat_editing_enter_submits() {
+        assert_eq!(
+            route_key(key(KeyCode::Enter), &chat_editing()),
             Some(Action::SubmitPrompt)
         );
     }
 
     #[test]
-    fn editing_shift_enter_inserts_newline() {
+    fn chat_editing_shift_enter_newline() {
         assert_eq!(
-            handle_key_event(
+            route_key(
                 key_with_mod(KeyCode::Enter, KeyModifiers::SHIFT),
-                &InputMode::Editing
+                &chat_editing()
             ),
             Some(Action::InsertNewline)
         );
     }
 
     #[test]
-    fn editing_newline_char_is_forwarded_to_textarea() {
+    fn chat_editing_esc_exits() {
         assert_eq!(
-            handle_key_event(
-                key_with_mod(KeyCode::Char('\n'), KeyModifiers::NONE),
-                &InputMode::Editing
-            ),
-            Some(Action::InsertNewline)
-        );
-    }
-
-    #[test]
-    fn editing_carriage_return_char_is_forwarded_to_textarea() {
-        assert_eq!(
-            handle_key_event(
-                key_with_mod(KeyCode::Char('\r'), KeyModifiers::NONE),
-                &InputMode::Editing
-            ),
-            Some(Action::InsertNewline)
-        );
-    }
-
-    #[test]
-    fn editing_ctrl_j_inserts_newline() {
-        assert_eq!(
-            handle_key_event(
-                key_with_mod(KeyCode::Char('j'), KeyModifiers::CONTROL),
-                &InputMode::Editing
-            ),
-            Some(Action::InsertNewline)
-        );
-    }
-
-    #[test]
-    fn editing_alt_enter_is_forwarded_to_textarea() {
-        assert_eq!(
-            handle_key_event(
-                key_with_mod(KeyCode::Enter, KeyModifiers::ALT),
-                &InputMode::Editing
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn editing_char_forwarded_to_textarea() {
-        // Regular chars should return None so they get forwarded to textarea
-        assert_eq!(
-            handle_key_event(key(KeyCode::Char('a')), &InputMode::Editing),
-            None
-        );
-    }
-
-    #[test]
-    fn editing_backspace_forwarded_to_textarea() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::Backspace), &InputMode::Editing),
-            None
-        );
-    }
-
-    #[test]
-    fn editing_arrows_forwarded_to_textarea() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::Left), &InputMode::Editing),
-            None
-        );
-        assert_eq!(
-            handle_key_event(key(KeyCode::Right), &InputMode::Editing),
-            None
-        );
-        assert_eq!(
-            handle_key_event(key(KeyCode::Up), &InputMode::Editing),
-            None
-        );
-        assert_eq!(
-            handle_key_event(key(KeyCode::Down), &InputMode::Editing),
-            None
-        );
-    }
-
-    // --- Scroll tests (Ctrl+u/d/e work in all modes) ---
-
-    #[test]
-    fn ctrl_u_scrolls_up() {
-        assert_eq!(
-            handle_key_event(
-                key_with_mod(KeyCode::Char('u'), KeyModifiers::CONTROL),
-                &InputMode::Normal
-            ),
-            Some(Action::ScrollUp)
-        );
-    }
-
-    #[test]
-    fn ctrl_d_scrolls_down() {
-        assert_eq!(
-            handle_key_event(
-                key_with_mod(KeyCode::Char('d'), KeyModifiers::CONTROL),
-                &InputMode::Normal
-            ),
-            Some(Action::ScrollDown)
-        );
-    }
-
-    #[test]
-    fn ctrl_e_scrolls_to_bottom() {
-        assert_eq!(
-            handle_key_event(
-                key_with_mod(KeyCode::Char('e'), KeyModifiers::CONTROL),
-                &InputMode::Normal
-            ),
-            Some(Action::ScrollToBottom)
-        );
-    }
-
-    #[test]
-    fn ctrl_u_works_in_editing_mode() {
-        assert_eq!(
-            handle_key_event(
-                key_with_mod(KeyCode::Char('u'), KeyModifiers::CONTROL),
-                &InputMode::Editing
-            ),
-            Some(Action::ScrollUp)
-        );
-    }
-
-    #[test]
-    fn ctrl_d_works_in_editing_mode() {
-        assert_eq!(
-            handle_key_event(
-                key_with_mod(KeyCode::Char('d'), KeyModifiers::CONTROL),
-                &InputMode::Editing
-            ),
-            Some(Action::ScrollDown)
-        );
-    }
-
-    #[test]
-    fn normal_pageup_scrolls_up() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::PageUp), &InputMode::Normal),
-            Some(Action::ScrollUp)
-        );
-    }
-
-    #[test]
-    fn normal_pagedown_scrolls_down() {
-        assert_eq!(
-            handle_key_event(key(KeyCode::PageDown), &InputMode::Normal),
-            Some(Action::ScrollDown)
+            route_key(key(KeyCode::Esc), &chat_editing()),
+            Some(Action::ExitEditMode)
         );
     }
 }

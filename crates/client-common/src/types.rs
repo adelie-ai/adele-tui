@@ -19,6 +19,8 @@ pub struct ConversationDetail {
     pub id: String,
     pub title: String,
     pub messages: Vec<ChatMessage>,
+    /// One-time advisories surfaced by the daemon after `GetConversation`.
+    pub warnings: Vec<api::ConversationWarning>,
 }
 
 impl From<api::ConversationSummary> for ConversationSummary {
@@ -47,6 +49,7 @@ impl From<api::ConversationView> for ConversationDetail {
             id: value.id,
             title: value.title,
             messages: value.messages.into_iter().map(ChatMessage::from).collect(),
+            warnings: value.warnings,
         }
     }
 }
