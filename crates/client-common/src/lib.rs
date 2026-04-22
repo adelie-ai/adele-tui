@@ -8,6 +8,7 @@ pub mod types;
 pub mod ws_client;
 
 pub use config::{ConnectionConfig, TransportMode};
+pub use desktop_assistant_api_model as api;
 pub use signal::SignalEvent;
 pub use transport::{AssistantClient, TransportClient, connect_transport};
 pub use types::{ChatMessage, ConversationDetail, ConversationSummary};

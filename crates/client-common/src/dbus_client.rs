@@ -150,6 +150,8 @@ impl DbusClient {
                 .into_iter()
                 .map(|(role, content)| ChatMessage { role, content })
                 .collect(),
+            // D-Bus ConversationsProxy predates ConversationWarning; no warnings surface here.
+            warnings: Vec::new(),
         })
     }
 

@@ -1,3 +1,5 @@
+use desktop_assistant_api_model as api;
+
 #[derive(Debug)]
 pub enum SignalEvent {
     Chunk {
@@ -19,6 +21,12 @@ pub enum SignalEvent {
     TitleChanged {
         conversation_id: String,
         title: String,
+    },
+    /// One-time advisory about a conversation — e.g. its stored model
+    /// selection no longer resolves and was cleared.
+    ConversationWarning {
+        conversation_id: String,
+        warning: api::ConversationWarning,
     },
     Disconnected {
         reason: String,

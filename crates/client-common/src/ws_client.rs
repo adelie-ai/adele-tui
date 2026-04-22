@@ -3,8 +3,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
-use desktop_assistant_api_model as api;
 use api::{WsFrame, WsRequest};
+use desktop_assistant_api_model as api;
 use futures::{SinkExt, StreamExt};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
@@ -255,10 +255,26 @@ impl WsClient {
     }
 
     pub async fn send_prompt(&self, conversation_id: &str, prompt: &str) -> Result<String> {
+        self.send_prompt_with_override(conversation_id, prompt, None)
+            .await
+    }
+
+    /// Send a prompt, optionally pinning it to a specific connection/model/effort.
+    ///
+    /// The daemon persists the override on the conversation row so subsequent
+    /// sends without an override still target the same model (until it is
+    /// changed again or the referenced connection goes away).
+    pub async fn send_prompt_with_override(
+        &self,
+        conversation_id: &str,
+        prompt: &str,
+        override_selection: Option<api::SendPromptOverride>,
+    ) -> Result<String> {
         let result = self
             .send_command(api::Command::SendMessage {
                 conversation_id: conversation_id.to_string(),
                 content: prompt.to_string(),
+                override_selection,
             })
             .await?;
         let api::CommandResult::Ack = result else {
@@ -267,6 +283,112 @@ impl WsClient {
 
         // WS send-message ack does not include request id; first stream event carries it.
         Ok(String::new())
+    }
+
+    // --- Multi-connection API (issue #11 / TUI issue #1) -------------------
+
+    pub async fn list_connections(&self) -> Result<Vec<api::ConnectionView>> {
+        let result = self.send_command(api::Command::ListConnections).await?;
+        let api::CommandResult::Connections(items) = result else {
+            return Err(anyhow!(
+                "unexpected websocket response for list_connections"
+            ));
+        };
+        Ok(items)
+    }
+
+    pub async fn create_connection(
+        &self,
+        id: &str,
+        config: api::ConnectionConfigView,
+    ) -> Result<()> {
+        let result = self
+            .send_command(api::Command::CreateConnection {
+                id: id.to_string(),
+                config,
+            })
+            .await?;
+        let api::CommandResult::Ack = result else {
+            return Err(anyhow!(
+                "unexpected websocket response for create_connection"
+            ));
+        };
+        Ok(())
+    }
+
+    pub async fn update_connection(
+        &self,
+        id: &str,
+        config: api::ConnectionConfigView,
+    ) -> Result<()> {
+        let result = self
+            .send_command(api::Command::UpdateConnection {
+                id: id.to_string(),
+                config,
+            })
+            .await?;
+        let api::CommandResult::Ack = result else {
+            return Err(anyhow!(
+                "unexpected websocket response for update_connection"
+            ));
+        };
+        Ok(())
+    }
+
+    pub async fn delete_connection(&self, id: &str, force: bool) -> Result<()> {
+        let result = self
+            .send_command(api::Command::DeleteConnection {
+                id: id.to_string(),
+                force,
+            })
+            .await?;
+        let api::CommandResult::Ack = result else {
+            return Err(anyhow!(
+                "unexpected websocket response for delete_connection"
+            ));
+        };
+        Ok(())
+    }
+
+    pub async fn list_available_models(
+        &self,
+        connection_id: Option<&str>,
+        refresh: bool,
+    ) -> Result<Vec<api::ModelListing>> {
+        let result = self
+            .send_command(api::Command::ListAvailableModels {
+                connection_id: connection_id.map(str::to_string),
+                refresh,
+            })
+            .await?;
+        let api::CommandResult::Models(items) = result else {
+            return Err(anyhow!(
+                "unexpected websocket response for list_available_models"
+            ));
+        };
+        Ok(items)
+    }
+
+    pub async fn get_purposes(&self) -> Result<api::PurposesView> {
+        let result = self.send_command(api::Command::GetPurposes).await?;
+        let api::CommandResult::Purposes(view) = result else {
+            return Err(anyhow!("unexpected websocket response for get_purposes"));
+        };
+        Ok(view)
+    }
+
+    pub async fn set_purpose(
+        &self,
+        purpose: api::PurposeKindApi,
+        config: api::PurposeConfigView,
+    ) -> Result<()> {
+        let result = self
+            .send_command(api::Command::SetPurpose { purpose, config })
+            .await?;
+        let api::CommandResult::Ack = result else {
+            return Err(anyhow!("unexpected websocket response for set_purpose"));
+        };
+        Ok(())
     }
 }
 
@@ -324,6 +446,13 @@ pub fn map_event_to_signal(event: api::Event) -> Option<SignalEvent> {
             request_id,
             message,
         }),
+        api::Event::ConversationWarningEmitted {
+            conversation_id,
+            warning,
+        } => Some(SignalEvent::ConversationWarning {
+            conversation_id,
+            warning,
+        }),
         api::Event::ConfigChanged { .. } => None,
     }
 }
@@ -366,19 +495,29 @@ mod tests {
     }
 
     #[test]
-    fn ignores_non_stream_config_events() {
+    fn maps_conversation_warning_event() {
+        let event = map_event_to_signal(api::Event::ConversationWarningEmitted {
+            conversation_id: "c1".to_string(),
+            warning: api::ConversationWarning::DanglingModelSelection {
+                previous_selection: api::ConversationModelSelectionView {
+                    connection_id: "old".into(),
+                    model_id: "gone".into(),
+                    effort: None,
+                },
+                fallback_to: api::ConversationModelSelectionView {
+                    connection_id: "work".into(),
+                    model_id: "gpt-5".into(),
+                    effort: None,
+                },
+            },
+        });
+        assert!(matches!(event, Some(SignalEvent::ConversationWarning { .. })));
+    }
+
+    #[test]
+    fn ignores_config_changed_event() {
         let event = map_event_to_signal(api::Event::ConfigChanged {
             config: api::Config {
-                llm: api::LlmSettingsView {
-                    connector: "openai".to_string(),
-                    model: "gpt-5.4".to_string(),
-                    base_url: "https://api.openai.com/v1".to_string(),
-                    has_api_key: true,
-                    temperature: None,
-                    top_p: None,
-                    max_tokens: None,
-                    hosted_tool_search: None,
-                },
                 embeddings: api::EmbeddingsSettingsView {
                     connector: "openai".to_string(),
                     model: "text-embedding-3-small".to_string(),
