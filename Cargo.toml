@@ -19,6 +19,7 @@ clap = { version = "4", features = ["derive", "env"] }
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
+pulldown-cmark = { version = "0.13", default-features = false }
 tui-textarea = "0.7"
 # Shared protocol + transport crates live in the desktop-assistant repo.
 # Cargo resolves the package by name from that workspace; Cargo.lock pins

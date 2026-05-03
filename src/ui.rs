@@ -227,70 +227,118 @@ fn draw_toolbar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     f.render_widget(toolbar, area);
 }
 
+fn push_user_message(lines: &mut Vec<Line<'static>>, content: &str, style: Style) {
+    let mut first = true;
+    for text_line in split_display_lines(content) {
+        if first {
+            lines.push(Line::from(vec![
+                Span::styled("You: ", style.add_modifier(Modifier::BOLD)),
+                Span::styled(text_line, style),
+            ]));
+            first = false;
+        } else {
+            lines.push(Line::from(Span::styled(text_line, style)));
+        }
+    }
+}
+
+fn push_prefixed_message(
+    lines: &mut Vec<Line<'static>>,
+    prefix: &'static str,
+    content: &str,
+    style: Style,
+) {
+    let mut first = true;
+    for text_line in split_display_lines(content) {
+        if first {
+            lines.push(Line::from(vec![
+                Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
+                Span::styled(text_line, style),
+            ]));
+            first = false;
+        } else {
+            lines.push(Line::from(Span::styled(text_line, style)));
+        }
+    }
+    if first {
+        // Empty content — still emit the prefix line so it shows up.
+        lines.push(Line::from(Span::styled(
+            prefix,
+            style.add_modifier(Modifier::BOLD),
+        )));
+    }
+}
+
+fn push_assistant_markdown(lines: &mut Vec<Line<'static>>, content: &str, style: Style) {
+    let mut rendered = crate::markdown::render(content, style);
+    if rendered.is_empty() {
+        rendered.push(Line::from(""));
+    }
+    // Prepend "Adele: " to the first non-empty line so the prefix sits with
+    // the response rather than on its own row.
+    let prefix_pos = rendered
+        .iter()
+        .position(|l| !l.spans.is_empty())
+        .unwrap_or(0);
+    let prefix_span = Span::styled("Adele: ", style.add_modifier(Modifier::BOLD));
+    if let Some(first) = rendered.get_mut(prefix_pos) {
+        first.spans.insert(0, prefix_span);
+    } else {
+        rendered.push(Line::from(prefix_span));
+    }
+    lines.extend(rendered);
+}
+
 fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let mut lines: Vec<Line> = Vec::new();
 
     if let Some(conv) = &app.current_conversation {
         for msg in &conv.messages {
-            // Roles fall into three buckets: user/assistant render normally;
-            // tool/system render only with debug view; empty assistant content
-            // is debug-only too (it usually carries tool-call metadata).
-            let (prefix, style) = match msg.role.as_str() {
-                "user" => ("You: ", Style::default().fg(COLOR_USER_PREFIX)),
+            // Roles fall into a few buckets: user/assistant render normally
+            // (assistant via markdown); tool/system/empty-assistant render
+            // only when the debug view is enabled.
+            match msg.role.as_str() {
+                "user" => {
+                    let style = Style::default().fg(COLOR_USER_PREFIX);
+                    push_user_message(&mut lines, &msg.content, style);
+                    lines.push(Line::from(""));
+                }
                 "assistant" if !msg.content.trim().is_empty() => {
-                    ("Adele: ", Style::default().fg(COLOR_ASSISTANT_PREFIX))
+                    let style = Style::default().fg(COLOR_ASSISTANT_PREFIX);
+                    push_assistant_markdown(&mut lines, &msg.content, style);
+                    lines.push(Line::from(""));
                 }
-                "tool" if app.show_debug => (
-                    "tool: ",
-                    Style::default()
+                "tool" if app.show_debug => {
+                    let style = Style::default()
                         .fg(COLOR_DEBUG_TOOL)
-                        .add_modifier(Modifier::DIM | Modifier::ITALIC),
-                ),
-                "system" if app.show_debug => (
-                    "system: ",
-                    Style::default()
-                        .fg(COLOR_DEBUG_SYSTEM)
-                        .add_modifier(Modifier::DIM | Modifier::ITALIC),
-                ),
-                "assistant" if app.show_debug => (
-                    "Adele (empty): ",
-                    Style::default()
-                        .fg(COLOR_ASSISTANT_PREFIX)
-                        .add_modifier(Modifier::DIM | Modifier::ITALIC),
-                ),
-                _ => continue,
-            };
-            // Split content on newlines so ratatui renders them as separate lines
-            let mut first = true;
-            for text_line in split_display_lines(&msg.content) {
-                if first {
-                    lines.push(Line::from(vec![
-                        Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
-                        Span::styled(text_line, style),
-                    ]));
-                    first = false;
-                } else {
-                    lines.push(Line::from(Span::styled(text_line, style)));
+                        .add_modifier(Modifier::DIM | Modifier::ITALIC);
+                    push_prefixed_message(&mut lines, "tool: ", &msg.content, style);
+                    lines.push(Line::from(""));
                 }
+                "system" if app.show_debug => {
+                    let style = Style::default()
+                        .fg(COLOR_DEBUG_SYSTEM)
+                        .add_modifier(Modifier::DIM | Modifier::ITALIC);
+                    push_prefixed_message(&mut lines, "system: ", &msg.content, style);
+                    lines.push(Line::from(""));
+                }
+                "assistant" if app.show_debug => {
+                    let style = Style::default()
+                        .fg(COLOR_ASSISTANT_PREFIX)
+                        .add_modifier(Modifier::DIM | Modifier::ITALIC);
+                    push_prefixed_message(&mut lines, "Adele (empty): ", &msg.content, style);
+                    lines.push(Line::from(""));
+                }
+                _ => continue,
             }
-            lines.push(Line::from("")); // spacing
         }
 
-        // Show streaming buffer as in-progress assistant message
+        // Show streaming buffer as in-progress assistant message. Markdown is
+        // applied to the partial buffer too — unclosed fences just show
+        // their literal backticks until the stream catches up.
         if !app.streaming_buffer.is_empty() {
             let style = Style::default().fg(COLOR_ASSISTANT_STREAMING);
-            let mut first = true;
-            for text_line in split_display_lines(&app.streaming_buffer) {
-                if first {
-                    lines.push(Line::from(vec![
-                        Span::styled("Adele: ", style.add_modifier(Modifier::BOLD)),
-                        Span::styled(text_line, style),
-                    ]));
-                    first = false;
-                } else {
-                    lines.push(Line::from(Span::styled(text_line, style)));
-                }
-            }
+            push_assistant_markdown(&mut lines, &app.streaming_buffer, style);
             // Cursor on last line
             if let Some(last) = lines.last_mut() {
                 last.spans.push(Span::styled("▌", style));
@@ -650,5 +698,28 @@ mod tests {
         assert!(dump.contains("send"));
         // Normal-mode-only hint should not appear in editing mode.
         assert!(!dump.contains("archive"));
+    }
+
+    #[test]
+    fn assistant_markdown_strips_emphasis_markers() {
+        // `**strong**` should render as `strong` (markdown punctuation
+        // consumed by the parser), not literal `**strong**`.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.current_conversation = Some(ConversationDetail {
+            id: "1".into(),
+            title: "Test".into(),
+            messages: vec![ChatMessage {
+                role: "assistant".into(),
+                content: "answer with **strong** word".into(),
+            }],
+            model_selection: None,
+        });
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(dump.contains("strong"));
+        assert!(!dump.contains("**strong**"));
     }
 }
