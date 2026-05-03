@@ -1,5 +1,6 @@
 mod app;
 mod keys;
+mod settings;
 mod ui;
 
 use std::io;
@@ -23,6 +24,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use app::{App, InputMode};
 use keys::{Action, handle_key_event};
+use settings::Settings;
 
 const DEFAULT_WS_URL: &str = desktop_assistant_client_common::config::DEFAULT_WS_URL;
 const DEFAULT_WS_SUBJECT: &str = desktop_assistant_client_common::config::DEFAULT_WS_SUBJECT;
@@ -134,6 +136,8 @@ async fn run(
     config: &ConnectionConfig,
 ) -> Result<()> {
     let mut app = App::new();
+    let settings = Settings::load();
+    app.show_debug = settings.show_debug;
 
     // Connect using configured transport (WS by default, D-Bus optional).
     let (client, mut signal_rx) = match connect_transport(config).await {
@@ -364,6 +368,21 @@ async fn handle_action(
             }
         }
         Action::CancelRename => app.cancel_rename(),
+        Action::ToggleDebug => {
+            app.show_debug = !app.show_debug;
+            let settings = Settings {
+                show_debug: app.show_debug,
+            };
+            if let Err(e) = settings.save() {
+                app.status_message = format!("Settings save failed: {e}");
+            } else {
+                app.status_message = if app.show_debug {
+                    "Debug view ON (showing tool/system messages)".into()
+                } else {
+                    "Debug view OFF".into()
+                };
+            }
+        }
     }
 }
 

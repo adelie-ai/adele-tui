@@ -22,6 +22,7 @@ pub enum Action {
     BeginRename,
     SubmitRename,
     CancelRename,
+    ToggleDebug,
 }
 
 /// Handle key events that we intercept before passing to textarea.
@@ -30,9 +31,8 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
-    // Ctrl+u / Ctrl+d / Ctrl+e for scrolling — works in Normal/Editing only.
-    // In Renaming mode we forward all Ctrl combos to the rename textarea
-    // (Ctrl+a/e/u/k word/line edits).
+    // Ctrl combos. Most apply across modes, but in Renaming we forward
+    // all Ctrl combos to the rename textarea (Ctrl+a/e/u/k word/line edits).
     if ctrl && !matches!(mode, InputMode::Renaming) {
         if matches!(mode, InputMode::Editing) && matches!(key.code, KeyCode::Char('j')) {
             return Some(Action::InsertNewline);
@@ -41,6 +41,7 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
             KeyCode::Char('u') => Some(Action::ScrollUp),
             KeyCode::Char('d') => Some(Action::ScrollDown),
             KeyCode::Char('e') => Some(Action::ScrollToBottom),
+            KeyCode::Char('t') => Some(Action::ToggleDebug),
             _ => None,
         };
     }
@@ -479,6 +480,30 @@ mod tests {
                 &InputMode::Renaming
             ),
             None
+        );
+    }
+
+    // --- Debug toggle (Ctrl+T) ---
+
+    #[test]
+    fn ctrl_t_toggles_debug_in_normal() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('t'), KeyModifiers::CONTROL),
+                &InputMode::Normal
+            ),
+            Some(Action::ToggleDebug)
+        );
+    }
+
+    #[test]
+    fn ctrl_t_toggles_debug_in_editing() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('t'), KeyModifiers::CONTROL),
+                &InputMode::Editing
+            ),
+            Some(Action::ToggleDebug)
         );
     }
 }
