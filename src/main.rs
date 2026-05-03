@@ -16,11 +16,15 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use desktop_assistant_client_common::{
-    AssistantClient, ConnectionConfig, SignalEvent, TransportMode, connect_transport,
-    transport::transport_label,
+    AssistantClient, ConnectionConfig, SignalEvent, TransportClient, TransportMode,
+    connect_transport, transport::transport_label,
 };
 use futures::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
+use tokio::{
+    sync::mpsc::{UnboundedReceiver, unbounded_channel},
+    time::{Instant, sleep_until},
+};
 
 use app::{App, InputMode};
 use keys::{Action, handle_key_event};
@@ -131,6 +135,33 @@ async fn main() -> Result<()> {
     result
 }
 
+/// Reconnect backoff state machine. Sequence: 2s → 4s → 8s → 16s → 30s,
+/// then stays at 30s indefinitely. `Connected` means we're not currently
+/// trying to reconnect.
+#[derive(Debug)]
+enum ReconnectState {
+    Connected,
+    Pending { next_at: Instant, delay_secs: u64 },
+}
+
+const RECONNECT_INITIAL_SECS: u64 = 2;
+const RECONNECT_MAX_SECS: u64 = 30;
+
+fn next_backoff(prev_secs: u64) -> u64 {
+    prev_secs.saturating_mul(2).min(RECONNECT_MAX_SECS)
+}
+
+fn schedule_reconnect(prev: Option<u64>) -> ReconnectState {
+    let delay_secs = match prev {
+        None => RECONNECT_INITIAL_SECS,
+        Some(p) => next_backoff(p),
+    };
+    ReconnectState::Pending {
+        next_at: Instant::now() + std::time::Duration::from_secs(delay_secs),
+        delay_secs,
+    }
+}
+
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     config: &ConnectionConfig,
@@ -139,21 +170,28 @@ async fn run(
     let settings = Settings::load();
     app.show_debug = settings.show_debug;
 
-    // Connect using configured transport (WS by default, D-Bus optional).
-    let (client, mut signal_rx) = match connect_transport(config).await {
+    let mut client: Option<TransportClient> = None;
+    let mut signal_rx: UnboundedReceiver<SignalEvent> = unbounded_channel().1;
+    let mut reconnect = ReconnectState::Connected;
+
+    // Initial connect — on failure, fall straight into the backoff loop
+    // instead of running with no client.
+    match connect_transport(config).await {
         Ok((transport_client, rx)) => {
             match transport_client.list_conversations().await {
                 Ok(convs) => app.set_conversations(convs),
                 Err(e) => app.status_message = format!("Error loading conversations: {e}"),
             }
-            app.status_message = transport_label(&config);
-            (Some(transport_client), rx)
+            app.status_message = transport_label(config);
+            client = Some(transport_client);
+            signal_rx = rx;
         }
         Err(e) => {
-            app.status_message = format!("Connection failed: {e}");
-            (None, tokio::sync::mpsc::unbounded_channel().1)
+            reconnect = schedule_reconnect(None);
+            app.status_message =
+                format!("Connection failed: {e}. Reconnecting in {RECONNECT_INITIAL_SECS}s...");
         }
-    };
+    }
 
     let mut event_stream = crossterm::event::EventStream::new();
 
@@ -161,8 +199,15 @@ async fn run(
         terminal.draw(|f| ui::draw(f, &mut app))?;
 
         if app.should_quit {
-            break;
+            return Ok(());
         }
+
+        // The reconnect timer is built fresh each loop iteration so that it
+        // gets re-armed when state transitions in/out of Pending.
+        let next_retry = match &reconnect {
+            ReconnectState::Pending { next_at, .. } => Some(*next_at),
+            ReconnectState::Connected => None,
+        };
 
         tokio::select! {
             Some(Ok(evt)) = event_stream.next() => {
@@ -204,7 +249,12 @@ async fn run(
                         app.update_conversation_title(&conversation_id, &title);
                     }
                     SignalEvent::Disconnected { reason } => {
-                        app.status_message = format!("Disconnected: {reason}");
+                        client = None;
+                        signal_rx = unbounded_channel().1;
+                        reconnect = schedule_reconnect(None);
+                        app.status_message = format!(
+                            "Disconnected: {reason}. Reconnecting in {RECONNECT_INITIAL_SECS}s..."
+                        );
                     }
                     SignalEvent::ConversationWarning { warning, .. } => {
                         // Currently only the dangling-model-selection warning is
@@ -215,10 +265,41 @@ async fn run(
                     }
                 }
             }
+            _ = async {
+                match next_retry {
+                    Some(deadline) => sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                let prev_delay = match &reconnect {
+                    ReconnectState::Pending { delay_secs, .. } => Some(*delay_secs),
+                    ReconnectState::Connected => None,
+                };
+                app.status_message = "Reconnecting...".to_string();
+                match connect_transport(config).await {
+                    Ok((transport_client, rx)) => {
+                        match transport_client.list_conversations().await {
+                            Ok(convs) => app.set_conversations(convs),
+                            Err(e) => app.status_message = format!("Error loading conversations: {e}"),
+                        }
+                        client = Some(transport_client);
+                        signal_rx = rx;
+                        reconnect = ReconnectState::Connected;
+                        app.status_message = transport_label(config);
+                    }
+                    Err(e) => {
+                        reconnect = schedule_reconnect(prev_delay);
+                        let next_in = match &reconnect {
+                            ReconnectState::Pending { delay_secs, .. } => *delay_secs,
+                            ReconnectState::Connected => RECONNECT_MAX_SECS,
+                        };
+                        app.status_message =
+                            format!("Reconnect failed: {e}. Retrying in {next_in}s...");
+                    }
+                }
+            }
         }
     }
-
-    Ok(())
 }
 
 async fn handle_action(
@@ -443,5 +524,41 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("ws"));
         assert!(rendered.contains("dbus"));
+    }
+
+    // --- Reconnect backoff tests ---
+
+    #[test]
+    fn next_backoff_doubles_until_cap() {
+        assert_eq!(next_backoff(2), 4);
+        assert_eq!(next_backoff(4), 8);
+        assert_eq!(next_backoff(8), 16);
+        assert_eq!(next_backoff(16), 30);
+    }
+
+    #[test]
+    fn next_backoff_caps_at_30() {
+        assert_eq!(next_backoff(30), 30);
+        assert_eq!(next_backoff(60), 30);
+    }
+
+    #[test]
+    fn schedule_reconnect_starts_at_initial_when_no_prev() {
+        let s = schedule_reconnect(None);
+        match s {
+            ReconnectState::Pending { delay_secs, .. } => {
+                assert_eq!(delay_secs, RECONNECT_INITIAL_SECS);
+            }
+            _ => panic!("expected Pending"),
+        }
+    }
+
+    #[test]
+    fn schedule_reconnect_doubles_from_prev() {
+        let s = schedule_reconnect(Some(4));
+        match s {
+            ReconnectState::Pending { delay_secs, .. } => assert_eq!(delay_secs, 8),
+            _ => panic!("expected Pending"),
+        }
     }
 }
