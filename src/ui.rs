@@ -168,6 +168,7 @@ fn draw_chat_panel(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             Constraint::Length(status_height),
             Constraint::Length(INPUT_TOTAL_HEIGHT),
             Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(area);
 
@@ -176,7 +177,8 @@ fn draw_chat_panel(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         draw_assistant_status(f, app, chunks[1]);
     }
     draw_input(f, app, chunks[2]);
-    draw_status_bar(f, app, chunks[3]);
+    draw_toolbar(f, app, chunks[3]);
+    draw_status_bar(f, app, chunks[4]);
 }
 
 fn draw_assistant_status(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -198,6 +200,31 @@ fn draw_assistant_status(f: &mut Frame, app: &App, area: ratatui::layout::Rect) 
         ),
     ]));
     f.render_widget(indicator, area);
+}
+
+fn draw_toolbar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let mode_str = match app.mode {
+        InputMode::Normal => "NORMAL",
+        InputMode::Editing => "EDITING",
+        InputMode::Renaming => "RENAME",
+    };
+    let chip_text = format!(" [{mode_str}] ");
+    let chip_width = chip_text.chars().count() as u16;
+
+    let mut spans: Vec<Span> = Vec::with_capacity(8);
+    spans.push(Span::styled(chip_text, mode_chip_style(&app.mode)));
+
+    let separator_after_chip = "  ";
+    let after_chip_width = separator_after_chip.chars().count() as u16;
+    let hints_budget = area.width.saturating_sub(chip_width).saturating_sub(after_chip_width);
+    if hints_budget > 0 {
+        spans.push(Span::raw(separator_after_chip));
+        let (hint_spans, _) = crate::toolbar::render_hints(&app.mode, hints_budget);
+        spans.extend(hint_spans);
+    }
+
+    let toolbar = Paragraph::new(Line::from(spans));
+    f.render_widget(toolbar, area);
 }
 
 fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -336,21 +363,16 @@ fn draw_input(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
 }
 
 fn draw_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let mode_str = match app.mode {
-        InputMode::Normal => "NORMAL",
-        InputMode::Editing => "EDITING",
-        InputMode::Renaming => "RENAME",
-    };
-
+    if app.status_message.is_empty() {
+        return;
+    }
     let status = Paragraph::new(Line::from(vec![
-        Span::styled(format!(" [{mode_str}] "), mode_chip_style(&app.mode)),
         Span::styled(" • ", Style::default().fg(COLOR_STATUS_DIM)),
         Span::styled(
             app.status_message.as_str(),
             Style::default().fg(Color::White),
         ),
     ]));
-
     f.render_widget(status, area);
 }
 
@@ -600,5 +622,33 @@ mod tests {
         let dump: String = buf.content.iter().map(|c| c.symbol()).collect();
         // The bullet glyph used by the indicator should not appear when no status.
         assert!(!dump.contains("● "));
+    }
+
+    #[test]
+    fn toolbar_renders_mode_chip_and_hints_in_normal() {
+        let backend = TestBackend::new(200, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(dump.contains("[NORMAL]"));
+        assert!(dump.contains("quit"));
+        assert!(dump.contains("new"));
+    }
+
+    #[test]
+    fn toolbar_switches_hints_in_editing_mode() {
+        let backend = TestBackend::new(160, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.enter_editing_mode();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(dump.contains("[EDITING]"));
+        assert!(dump.contains("send"));
+        // Normal-mode-only hint should not appear in editing mode.
+        assert!(!dump.contains("archive"));
     }
 }
