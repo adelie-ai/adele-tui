@@ -1,17 +1,24 @@
 //! Renders markdown text into ratatui `Line`s.
 //!
 //! Supports inline formatting (bold, italic, inline code, links), headings,
-//! bullet/numbered lists, fenced code blocks (rendered with a distinct muted
-//! style — language-aware highlighting belongs in #8), and a simple aligned
-//! grid for tables.
+//! bullet/numbered lists, fenced code blocks (with language-aware syntax
+//! highlighting via `syntect`), and a simple aligned grid for tables.
 //!
 //! The output is plain `Line`s of styled `Span`s — no widget state — so it
 //! plugs straight into the existing `Paragraph::new(lines)` flow.
 
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use std::sync::OnceLock;
+
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
+};
+use syntect::{
+    easy::HighlightLines,
+    highlighting::{FontStyle, Style as SynStyle, Theme, ThemeSet},
+    parsing::{SyntaxReference, SyntaxSet},
+    util::LinesWithEndings,
 };
 
 const COLOR_HEADING: Color = Color::Rgb(166, 182, 255);
@@ -20,6 +27,55 @@ const COLOR_CODE_BG: Color = Color::Rgb(40, 44, 56);
 const COLOR_LINK: Color = Color::Rgb(132, 204, 232);
 const COLOR_BLOCKQUOTE: Color = Color::Rgb(170, 178, 196);
 const COLOR_TABLE_BORDER: Color = Color::Rgb(82, 90, 110);
+
+/// Theme used for code-block syntax highlighting. `base16-ocean.dark` reads
+/// well on the dark TUI background and ships with syntect by default.
+const HIGHLIGHT_THEME: &str = "base16-ocean.dark";
+
+struct HighlightAssets {
+    syntaxes: SyntaxSet,
+    theme: Theme,
+}
+
+fn highlight_assets() -> &'static HighlightAssets {
+    static ASSETS: OnceLock<HighlightAssets> = OnceLock::new();
+    ASSETS.get_or_init(|| {
+        let syntaxes = SyntaxSet::load_defaults_newlines();
+        let themes = ThemeSet::load_defaults();
+        let theme = themes
+            .themes
+            .get(HIGHLIGHT_THEME)
+            .cloned()
+            .unwrap_or_else(|| themes.themes.values().next().cloned().unwrap_or_default());
+        HighlightAssets { syntaxes, theme }
+    })
+}
+
+fn syntax_for_lang<'a>(syntaxes: &'a SyntaxSet, lang: Option<&str>) -> Option<&'a SyntaxReference> {
+    let token = lang?.trim();
+    if token.is_empty() {
+        return None;
+    }
+    // Try by token (e.g. "rust"), then file extension (".rs").
+    syntaxes
+        .find_syntax_by_token(token)
+        .or_else(|| syntaxes.find_syntax_by_extension(token))
+}
+
+fn synstyle_to_ratatui(style: SynStyle) -> Style {
+    let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
+    let mut out = Style::default().fg(fg).bg(COLOR_CODE_BG);
+    if style.font_style.contains(FontStyle::BOLD) {
+        out = out.add_modifier(Modifier::BOLD);
+    }
+    if style.font_style.contains(FontStyle::ITALIC) {
+        out = out.add_modifier(Modifier::ITALIC);
+    }
+    if style.font_style.contains(FontStyle::UNDERLINE) {
+        out = out.add_modifier(Modifier::UNDERLINED);
+    }
+    out
+}
 
 /// Render a markdown source string into styled lines.
 ///
@@ -50,6 +106,11 @@ struct Renderer {
     in_code_span: bool,
     /// Are we inside a fenced code block?
     in_code_block: bool,
+    /// Language hint for the active code block (from a fenced opener).
+    code_lang: Option<String>,
+    /// Buffered code-block source — flushed to syntect on close so the
+    /// highlighter sees a complete (line-terminated) input.
+    code_buffer: String,
     /// Are we inside a link? Active link target if so.
     link_target: Option<String>,
     /// List nesting state. `Some(Some(n))` = numbered list at index n;
@@ -79,6 +140,8 @@ impl Renderer {
             modifier: Modifier::empty(),
             in_code_span: false,
             in_code_block: false,
+            code_lang: None,
+            code_buffer: String::new(),
             link_target: None,
             list_stack: Vec::new(),
             heading_level: None,
@@ -131,9 +194,21 @@ impl Renderer {
                 self.flush_line();
                 self.blockquote_depth += 1;
             }
-            Tag::CodeBlock(_) => {
+            Tag::CodeBlock(kind) => {
                 self.flush_line();
                 self.in_code_block = true;
+                self.code_buffer.clear();
+                self.code_lang = match kind {
+                    CodeBlockKind::Fenced(s) => {
+                        let trimmed = s.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    }
+                    CodeBlockKind::Indented => None,
+                };
             }
             Tag::List(start) => {
                 self.flush_line();
@@ -214,7 +289,10 @@ impl Renderer {
             }
             TagEnd::CodeBlock => {
                 self.flush_line();
+                let buffered = std::mem::take(&mut self.code_buffer);
+                let lang = self.code_lang.take();
                 self.in_code_block = false;
+                self.emit_highlighted_code_block(&buffered, lang.as_deref());
                 self.lines.push(Line::from(""));
             }
             TagEnd::List(_) => {
@@ -263,18 +341,9 @@ impl Renderer {
 
     fn push_text(&mut self, text: &str) {
         if self.in_code_block {
-            for line in text.split('\n') {
-                self.current.push(Span::styled(
-                    format!(" {line} "),
-                    Style::default().fg(COLOR_CODE_FG).bg(COLOR_CODE_BG),
-                ));
-                self.flush_line();
-            }
-            // Trailing flush already happened; drop the empty extra line that
-            // the trailing '\n' would create.
-            if text.ends_with('\n') && self.lines.last().is_some_and(|l| l.spans.is_empty()) {
-                self.lines.pop();
-            }
+            // Buffer the entire block; we run syntect once on close so the
+            // highlighter sees the full source and stays in sync across lines.
+            self.code_buffer.push_str(text);
             return;
         }
 
@@ -366,6 +435,71 @@ impl Renderer {
             self.lines.pop();
         }
         self.lines
+    }
+
+    fn emit_highlighted_code_block(&mut self, source: &str, lang: Option<&str>) {
+        if source.is_empty() {
+            return;
+        }
+        let assets = highlight_assets();
+        let syntax = syntax_for_lang(&assets.syntaxes, lang);
+        match syntax {
+            Some(syn) => {
+                let mut highlighter = HighlightLines::new(syn, &assets.theme);
+                for raw_line in LinesWithEndings::from(source) {
+                    let regions = highlighter
+                        .highlight_line(raw_line, &assets.syntaxes)
+                        .unwrap_or_default();
+                    let trimmed_line = raw_line.trim_end_matches('\n');
+                    let mut spans: Vec<Span<'static>> = Vec::with_capacity(regions.len() + 2);
+                    // Leading gutter so the bg covers a small left margin.
+                    spans.push(Span::styled(
+                        " ",
+                        Style::default().bg(COLOR_CODE_BG),
+                    ));
+                    if regions.is_empty() {
+                        spans.push(Span::styled(
+                            trimmed_line.to_string(),
+                            Style::default().fg(COLOR_CODE_FG).bg(COLOR_CODE_BG),
+                        ));
+                    } else {
+                        for (style, segment) in regions {
+                            // Strip the trailing newline that LinesWithEndings keeps —
+                            // ratatui adds its own line break between Line entries.
+                            let text = segment.trim_end_matches('\n').to_string();
+                            if text.is_empty() {
+                                continue;
+                            }
+                            spans.push(Span::styled(text, synstyle_to_ratatui(style)));
+                        }
+                    }
+                    spans.push(Span::styled(
+                        " ",
+                        Style::default().bg(COLOR_CODE_BG),
+                    ));
+                    self.lines.push(Line::from(spans));
+                }
+            }
+            None => {
+                // Unknown language — fall back to the muted plain code style.
+                let style = Style::default().fg(COLOR_CODE_FG).bg(COLOR_CODE_BG);
+                for raw_line in source.split('\n') {
+                    self.lines.push(Line::from(Span::styled(
+                        format!(" {raw_line} "),
+                        style,
+                    )));
+                }
+                // Drop the trailing empty line caused by the source ending in '\n'.
+                if source.ends_with('\n')
+                    && self
+                        .lines
+                        .last()
+                        .is_some_and(|l| l.spans.iter().all(|s| s.content.trim().is_empty()))
+                {
+                    self.lines.pop();
+                }
+            }
+        }
     }
 
     fn render_table(&mut self, t: TableState) {
@@ -536,5 +670,58 @@ mod tests {
     fn empty_input_produces_no_lines() {
         let lines = render_test("");
         assert!(lines.is_empty());
+    }
+
+    // --- Syntax highlighting (#8) ---
+
+    #[test]
+    fn rust_code_block_tokens_get_distinct_colors() {
+        let src = "```rust\nfn main() { let x = 1; }\n```\n";
+        let lines = render_test(src);
+        // Collect unique foreground colors on spans inside the code block.
+        let fgs: std::collections::HashSet<_> = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.style.bg == Some(COLOR_CODE_BG) && !s.content.trim().is_empty())
+            .filter_map(|s| s.style.fg)
+            .collect();
+        // Highlighted rust should produce more than one distinct fg color
+        // (keyword vs. identifier vs. literal vs. punctuation).
+        assert!(
+            fgs.len() > 1,
+            "expected multiple foreground colors, got {fgs:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_language_falls_back_to_plain_code_style() {
+        let src = "```not-a-real-lang\nliteral content\n```\n";
+        let lines = render_test(src);
+        let plain_span = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
+            s.style.bg == Some(COLOR_CODE_BG) && s.content.contains("literal content")
+        });
+        assert!(plain_span);
+    }
+
+    #[test]
+    fn unfenced_code_block_uses_plain_style() {
+        // No language tag — fallback path.
+        let src = "```\nplain block content\n```\n";
+        let lines = render_test(src);
+        let plain_span = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
+            s.style.bg == Some(COLOR_CODE_BG) && s.content.contains("plain block content")
+        });
+        assert!(plain_span);
+    }
+
+    #[test]
+    fn syntax_for_lang_handles_aliases_and_extensions() {
+        let assets = highlight_assets();
+        // Common aliases that should resolve to a syntax.
+        assert!(syntax_for_lang(&assets.syntaxes, Some("rust")).is_some());
+        assert!(syntax_for_lang(&assets.syntaxes, Some("py")).is_some());
+        // Empty / unknown returns None.
+        assert!(syntax_for_lang(&assets.syntaxes, Some("")).is_none());
+        assert!(syntax_for_lang(&assets.syntaxes, None).is_none());
     }
 }
