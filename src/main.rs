@@ -1,11 +1,13 @@
 mod app;
 mod keys;
+mod picker;
+mod profile;
 mod ui;
 
 use std::io;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser, parser::ValueSource};
 use crossterm::{
     event::{
         DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
@@ -23,6 +25,8 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use app::{App, InputMode};
 use keys::{Action, handle_key_event};
+use picker::PickerOutcome;
+use profile::ProfileStore;
 
 const DEFAULT_WS_URL: &str = desktop_assistant_client_common::config::DEFAULT_WS_URL;
 const DEFAULT_WS_SUBJECT: &str = desktop_assistant_client_common::config::DEFAULT_WS_SUBJECT;
@@ -97,7 +101,9 @@ impl From<CliArgs> for ConnectionConfig {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = ConnectionConfig::from(CliArgs::parse());
+    let matches = CliArgs::command().get_matches();
+    let cli = CliArgs::from_arg_matches(&matches)?;
+    let cli_explicit = any_explicit_connection_arg(&matches);
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -114,7 +120,7 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal, &config).await;
+    let result = run_app(&mut terminal, cli, cli_explicit).await;
 
     // Restore terminal
     disable_raw_mode()?;
@@ -127,6 +133,42 @@ async fn main() -> Result<()> {
     terminal.show_cursor()?;
 
     result
+}
+
+/// Returns true if the user explicitly supplied any connection-related CLI
+/// flag or env var, in which case we skip the profile picker and connect
+/// using the provided values (matching pre-profile-picker behavior).
+fn any_explicit_connection_arg(matches: &clap::ArgMatches) -> bool {
+    ["transport", "ws_url", "ws_subject"]
+        .iter()
+        .any(|name| {
+            matches!(
+                matches.value_source(name),
+                Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+            )
+        })
+}
+
+/// Decide between picker-driven and CLI-driven connection, then hand off
+/// to the chat loop.
+async fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    cli: CliArgs,
+    cli_explicit: bool,
+) -> Result<()> {
+    let store = ProfileStore::load();
+
+    let config = if cli_explicit || store.profiles.is_empty() {
+        ConnectionConfig::from(cli)
+    } else {
+        let (outcome, _store) = picker::run(terminal, store).await?;
+        match outcome {
+            PickerOutcome::Selected(profile) => profile.to_connection_config(),
+            PickerOutcome::Cancelled => return Ok(()),
+        }
+    };
+
+    run(terminal, &config).await
 }
 
 async fn run(

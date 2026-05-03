@@ -12,6 +12,7 @@ dependencies = [
  "desktop-assistant-client-common",
  "futures",
  "ratatui",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
