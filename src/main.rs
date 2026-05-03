@@ -2,6 +2,7 @@ mod app;
 mod credentials;
 mod keys;
 mod markdown;
+mod oauth;
 mod picker;
 mod profile;
 mod settings;

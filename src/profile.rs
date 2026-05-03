@@ -94,6 +94,7 @@ impl Profile {
     pub fn purge_credentials(&self) {
         let _ = credentials::delete(&self.id, CredentialKind::Password);
         let _ = credentials::delete(&self.id, CredentialKind::Jwt);
+        let _ = credentials::delete(&self.id, CredentialKind::OauthRefresh);
     }
 
     /// Short display label combining name and URL/transport.

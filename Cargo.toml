@@ -20,9 +20,13 @@ ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+oauth2 = "5"
+open = "5"
 pulldown-cmark = { version = "0.13", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 tui-textarea = "0.7"
+url = "2"
 # Shared protocol + transport crates live in the desktop-assistant repo.
 # Cargo resolves the package by name from that workspace; Cargo.lock pins
 # the exact revision for reproducibility.

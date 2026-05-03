@@ -17,8 +17,10 @@ const ENV_DISABLE: &str = "ADELE_TUI_DISABLE_KEYRING";
 pub enum CredentialKind {
     /// Login password used for username/password auth.
     Password,
-    /// Direct JWT token.
+    /// Direct JWT (or OAuth access token after sign-in).
     Jwt,
+    /// OAuth refresh token, paired with an access token stored under `Jwt`.
+    OauthRefresh,
 }
 
 impl CredentialKind {
@@ -26,6 +28,7 @@ impl CredentialKind {
         match self {
             CredentialKind::Password => "password",
             CredentialKind::Jwt => "jwt",
+            CredentialKind::OauthRefresh => "oauth_refresh",
         }
     }
 }
@@ -108,6 +111,8 @@ mod tests {
         assert_eq!(k, "password::abc-123");
         let k = account_key("abc-123", CredentialKind::Jwt);
         assert_eq!(k, "jwt::abc-123");
+        let k = account_key("abc-123", CredentialKind::OauthRefresh);
+        assert_eq!(k, "oauth_refresh::abc-123");
     }
 
     #[test]
