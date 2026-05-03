@@ -1,4 +1,5 @@
 pub mod app;
+pub mod credentials;
 pub mod keys;
 pub mod markdown;
 pub mod picker;

@@ -20,7 +20,10 @@ use ratatui::{
 };
 use tui_textarea::{CursorMove, TextArea};
 
-use crate::profile::{Profile, ProfileStore};
+use crate::{
+    credentials::{self, CredentialKind},
+    profile::{Profile, ProfileStore},
+};
 
 const COLOR_BORDER: Color = Color::Rgb(82, 104, 173);
 const COLOR_BORDER_ACTIVE: Color = Color::Rgb(120, 183, 109);
@@ -53,9 +56,18 @@ enum Field {
     Transport,
     Url,
     Subject,
+    Username,
+    Password,
 }
 
-const FIELD_ORDER: [Field; 4] = [Field::Name, Field::Transport, Field::Url, Field::Subject];
+const FIELD_ORDER: [Field; 6] = [
+    Field::Name,
+    Field::Transport,
+    Field::Url,
+    Field::Subject,
+    Field::Username,
+    Field::Password,
+];
 
 struct PickerState {
     store: ProfileStore,
@@ -72,6 +84,14 @@ struct FormState {
     name: TextArea<'static>,
     url: TextArea<'static>,
     subject: TextArea<'static>,
+    username: TextArea<'static>,
+    /// Password buffer — masked in the UI. Empty on edit means "leave the
+    /// stored secret untouched"; non-empty replaces the stored value.
+    password: TextArea<'static>,
+    /// Whether this profile already has a stored password (set when
+    /// editing). Drives the placeholder hint and decides whether to
+    /// preserve or clear.
+    had_stored_password: bool,
     transport: TransportMode,
 }
 
@@ -84,6 +104,9 @@ impl FormState {
         let mut subject = single_line_textarea();
         subject.insert_str("desktop-tui");
         subject.move_cursor(CursorMove::End);
+        let username = single_line_textarea();
+        let mut password = single_line_textarea();
+        password.set_mask_char('•');
         // Default focus on Name so users can just start typing.
         name.move_cursor(CursorMove::Head);
         Self {
@@ -92,6 +115,9 @@ impl FormState {
             name,
             url,
             subject,
+            username,
+            password,
+            had_stored_password: false,
             transport: TransportMode::Ws,
         }
     }
@@ -108,6 +134,15 @@ impl FormState {
         form.subject = single_line_textarea();
         form.subject.insert_str(&profile.ws_subject);
         form.subject.move_cursor(CursorMove::End);
+        form.username = single_line_textarea();
+        if let Some(user) = &profile.username {
+            form.username.insert_str(user);
+            form.username.move_cursor(CursorMove::End);
+        }
+        // Don't reveal stored password — leave the field empty and let the
+        // submit logic preserve the existing secret unless the user types
+        // a replacement.
+        form.had_stored_password = profile.has_password;
         form.transport = profile.transport;
         form
     }
@@ -122,7 +157,7 @@ impl FormState {
         self.focus = FIELD_ORDER[(pos + FIELD_ORDER.len() - 1) % FIELD_ORDER.len()];
     }
 
-    fn submit(&self) -> Result<Profile, String> {
+    fn submit(&self) -> Result<SubmittedProfile, String> {
         let name = self.name.lines().join(" ").trim().to_string();
         if name.is_empty() {
             return Err("Name is required".into());
@@ -132,6 +167,25 @@ impl FormState {
             return Err("URL is required for WebSocket transport".into());
         }
         let ws_subject = self.subject.lines().join(" ").trim().to_string();
+        let username_raw = self.username.lines().join(" ").trim().to_string();
+        let username = if username_raw.is_empty() {
+            None
+        } else {
+            Some(username_raw)
+        };
+        let password_raw = self.password.lines().join("");
+        // Empty password on edit = preserve the stored secret. On a fresh
+        // profile (no editing_id), empty just means "no password set".
+        let password_action = if password_raw.is_empty() {
+            if self.editing_id.is_some() && self.had_stored_password {
+                PasswordAction::PreserveExisting
+            } else {
+                PasswordAction::None
+            }
+        } else {
+            PasswordAction::Set(password_raw)
+        };
+
         let id = self.editing_id.clone().unwrap_or_else(|| {
             // Sourced from time-since-epoch in profile::new_id; reuse its format.
             crate::profile::Profile::new(
@@ -142,14 +196,37 @@ impl FormState {
             )
             .id
         });
-        Ok(Profile {
+        Ok(SubmittedProfile {
             id,
             name,
             transport: self.transport,
             ws_url,
             ws_subject,
+            username,
+            password_action,
         })
     }
+}
+
+#[derive(Debug, Clone)]
+enum PasswordAction {
+    /// No password — clear any existing stored secret.
+    None,
+    /// Replace stored secret with this value.
+    Set(String),
+    /// Leave the stored secret as-is (only meaningful on edit).
+    PreserveExisting,
+}
+
+#[derive(Debug, Clone)]
+struct SubmittedProfile {
+    id: String,
+    name: String,
+    transport: TransportMode,
+    ws_url: String,
+    ws_subject: String,
+    username: Option<String>,
+    password_action: PasswordAction,
 }
 
 fn single_line_textarea() -> TextArea<'static> {
@@ -287,36 +364,14 @@ fn handle_form_key(state: &mut PickerState, key: KeyEvent) {
         (KeyCode::Down, m) if m.is_empty() => state.form.next_field(),
         (KeyCode::Enter, m) if m.is_empty() => {
             match state.form.submit() {
-                Ok(profile) => {
-                    let editing = state.form.editing_id.is_some();
-                    if editing {
-                        // Replace existing profile in place.
-                        if let Some(existing) = state
-                            .store
-                            .profiles
-                            .iter_mut()
-                            .find(|p| p.id == profile.id)
-                        {
-                            *existing = profile.clone();
-                        }
+                Ok(submitted) => {
+                    if let Err(e) = apply_submission(state, submitted) {
+                        state.error = Some(e);
                     } else {
-                        state.store.add(profile.clone());
+                        state.error = None;
+                        state.mode = Mode::List;
+                        state.form = FormState::empty();
                     }
-                    if let Err(e) = state.store.save() {
-                        state.error = Some(format!("Save failed: {e}"));
-                        return;
-                    }
-                    // Reselect to the saved profile.
-                    let new_index = state
-                        .store
-                        .profiles
-                        .iter()
-                        .position(|p| p.id == profile.id)
-                        .unwrap_or(state.selected);
-                    state.selected = new_index;
-                    state.error = None;
-                    state.mode = Mode::List;
-                    state.form = FormState::empty();
                 }
                 Err(msg) => state.error = Some(msg),
             }
@@ -340,9 +395,91 @@ fn handle_form_key(state: &mut PickerState, key: KeyEvent) {
             Field::Subject => {
                 state.form.subject.input(key);
             }
+            Field::Username => {
+                state.form.username.input(key);
+            }
+            Field::Password => {
+                state.form.password.input(key);
+            }
             Field::Transport => {}
         },
     }
+}
+
+/// Persist a submitted profile: update keyring, write profile, save store,
+/// reselect. Returns an error string suitable for the UI on failure.
+fn apply_submission(state: &mut PickerState, submitted: SubmittedProfile) -> Result<(), String> {
+    let editing = state
+        .store
+        .profiles
+        .iter()
+        .any(|p| p.id == submitted.id);
+
+    let mut has_password = match &submitted.password_action {
+        PasswordAction::Set(_) => true,
+        PasswordAction::PreserveExisting => true,
+        PasswordAction::None => false,
+    };
+
+    // Apply password change first; if keyring fails, surface it before we
+    // touch the on-disk store so state stays consistent.
+    match &submitted.password_action {
+        PasswordAction::Set(secret) => {
+            if let Err(e) = credentials::store(&submitted.id, CredentialKind::Password, secret) {
+                return Err(format!("Could not store password: {e}"));
+            }
+        }
+        PasswordAction::PreserveExisting => {
+            // Keep the keyring as-is; nothing to do.
+        }
+        PasswordAction::None => {
+            let _ = credentials::delete(&submitted.id, CredentialKind::Password);
+            has_password = false;
+        }
+    }
+
+    let new_profile = Profile {
+        id: submitted.id.clone(),
+        name: submitted.name,
+        transport: submitted.transport,
+        ws_url: submitted.ws_url,
+        ws_subject: submitted.ws_subject,
+        username: submitted.username,
+        has_password,
+        // JWT is managed by #14 OAuth flow — preserve any existing flag
+        // when editing, default to false on create.
+        has_jwt: state
+            .store
+            .profiles
+            .iter()
+            .find(|p| p.id == submitted.id)
+            .map(|p| p.has_jwt)
+            .unwrap_or(false),
+    };
+
+    if editing {
+        if let Some(existing) = state
+            .store
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == new_profile.id)
+        {
+            *existing = new_profile.clone();
+        }
+    } else {
+        state.store.add(new_profile.clone());
+    }
+    state
+        .store
+        .save()
+        .map_err(|e| format!("Save failed: {e}"))?;
+    state.selected = state
+        .store
+        .profiles
+        .iter()
+        .position(|p| p.id == new_profile.id)
+        .unwrap_or(state.selected);
+    Ok(())
 }
 
 fn handle_delete_key(state: &mut PickerState, key: KeyEvent) {
@@ -497,6 +634,10 @@ fn draw_form(f: &mut Frame, state: &PickerState, area: Rect) {
             Constraint::Length(3),
             Constraint::Length(1),
             Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(3),
             Constraint::Min(0),
         ])
         .split(inner);
@@ -526,6 +667,37 @@ fn draw_form(f: &mut Frame, state: &PickerState, area: Rect) {
         rows[7],
         &state.form.subject,
         state.form.focus == Field::Subject,
+    );
+
+    draw_field_label(
+        f,
+        rows[8],
+        "Username (optional)",
+        state.form.focus == Field::Username,
+    );
+    draw_text_field(
+        f,
+        rows[9],
+        &state.form.username,
+        state.form.focus == Field::Username,
+    );
+
+    let password_label = if state.form.had_stored_password {
+        "Password (•••• stored — leave blank to keep)"
+    } else {
+        "Password (optional, masked)"
+    };
+    draw_field_label(
+        f,
+        rows[10],
+        password_label,
+        state.form.focus == Field::Password,
+    );
+    draw_text_field(
+        f,
+        rows[11],
+        &state.form.password,
+        state.form.focus == Field::Password,
     );
 }
 
@@ -691,6 +863,10 @@ fn position_cursor_in_form(f: &mut Frame, state: &PickerState, area: Rect) {
             Constraint::Length(3),
             Constraint::Length(1),
             Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(3),
             Constraint::Min(0),
         ])
         .split(inner);
@@ -699,6 +875,8 @@ fn position_cursor_in_form(f: &mut Frame, state: &PickerState, area: Rect) {
         Field::Name => (&state.form.name, 1),
         Field::Url => (&state.form.url, 5),
         Field::Subject => (&state.form.subject, 7),
+        Field::Username => (&state.form.username, 9),
+        Field::Password => (&state.form.password, 11),
         Field::Transport => return,
     };
 
