@@ -78,6 +78,9 @@ pub struct App {
     pub scroll_offset: u16,
     /// Whether to include archived conversations in the list.
     pub show_archived: bool,
+    /// Set when the user asks to switch to a different connection. Causes
+    /// the chat loop to exit cleanly so the picker can run again.
+    pub switch_requested: bool,
 }
 
 impl App {
@@ -96,6 +99,7 @@ impl App {
             should_quit: false,
             scroll_offset: 0,
             show_archived: false,
+            switch_requested: false,
         }
     }
 
@@ -774,6 +778,11 @@ mod tests {
         assert!(!app.should_quit);
         app.quit();
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn switch_requested_default_false() {
+        assert!(!App::new().switch_requested);
     }
 
     // --- Scroll tests ---
