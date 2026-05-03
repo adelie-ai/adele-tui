@@ -39,5 +39,9 @@ ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+oauth2 = "5"
+open = "5"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tui-textarea = "0.7"
+url = "2"
 desktop-assistant-client-common.workspace = true

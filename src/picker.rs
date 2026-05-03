@@ -7,7 +7,7 @@
 
 use std::io;
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use desktop_assistant_client_common::TransportMode;
 use futures::StreamExt;
 use ratatui::{
@@ -75,11 +75,19 @@ struct PickerState {
     mode: Mode,
     error: Option<String>,
     form: FormState,
+    /// Set when the user triggers OAuth from the form. The outer event
+    /// loop drains this flag and awaits the async flow.
+    oauth_pending: bool,
+    /// Transient status line shown during OAuth flows.
+    busy: Option<String>,
 }
 
 struct FormState {
     /// `Some(id)` when editing an existing profile; `None` for a new one.
     editing_id: Option<String>,
+    /// Stable id for this form. For new profiles this is generated up
+    /// front so OAuth flows can store tokens against it before save.
+    form_id: String,
     focus: Field,
     name: TextArea<'static>,
     url: TextArea<'static>,
@@ -92,6 +100,8 @@ struct FormState {
     /// editing). Drives the placeholder hint and decides whether to
     /// preserve or clear.
     had_stored_password: bool,
+    /// Whether OAuth tokens are currently stored for this form's id.
+    has_oauth_tokens: bool,
     transport: TransportMode,
 }
 
@@ -109,8 +119,17 @@ impl FormState {
         password.set_mask_char('•');
         // Default focus on Name so users can just start typing.
         name.move_cursor(CursorMove::Head);
+        // Pre-allocate an id so OAuth tokens (if any) can be written before
+        // the user presses save.
+        let seed = crate::profile::Profile::new(
+            String::new(),
+            TransportMode::Ws,
+            String::new(),
+            String::new(),
+        );
         Self {
             editing_id: None,
+            form_id: seed.id,
             focus: Field::Name,
             name,
             url,
@@ -118,6 +137,7 @@ impl FormState {
             username,
             password,
             had_stored_password: false,
+            has_oauth_tokens: false,
             transport: TransportMode::Ws,
         }
     }
@@ -125,6 +145,7 @@ impl FormState {
     fn from_profile(profile: &Profile) -> Self {
         let mut form = Self::empty();
         form.editing_id = Some(profile.id.clone());
+        form.form_id = profile.id.clone();
         form.name = single_line_textarea();
         form.name.insert_str(&profile.name);
         form.name.move_cursor(CursorMove::End);
@@ -143,6 +164,7 @@ impl FormState {
         // submit logic preserve the existing secret unless the user types
         // a replacement.
         form.had_stored_password = profile.has_password;
+        form.has_oauth_tokens = profile.has_jwt;
         form.transport = profile.transport;
         form
     }
@@ -186,24 +208,15 @@ impl FormState {
             PasswordAction::Set(password_raw)
         };
 
-        let id = self.editing_id.clone().unwrap_or_else(|| {
-            // Sourced from time-since-epoch in profile::new_id; reuse its format.
-            crate::profile::Profile::new(
-                String::new(),
-                TransportMode::Ws,
-                String::new(),
-                String::new(),
-            )
-            .id
-        });
         Ok(SubmittedProfile {
-            id,
+            id: self.form_id.clone(),
             name,
             transport: self.transport,
             ws_url,
             ws_subject,
             username,
             password_action,
+            has_oauth_tokens: self.has_oauth_tokens,
         })
     }
 }
@@ -227,6 +240,7 @@ struct SubmittedProfile {
     ws_subject: String,
     username: Option<String>,
     password_action: PasswordAction,
+    has_oauth_tokens: bool,
 }
 
 fn single_line_textarea() -> TextArea<'static> {
@@ -252,6 +266,8 @@ pub async fn run(
         mode: initial_mode,
         error: None,
         form: FormState::empty(),
+        oauth_pending: false,
+        busy: None,
     };
     if state.selected >= state.store.profiles.len() {
         state.selected = state.store.profiles.len().saturating_sub(1);
@@ -260,6 +276,12 @@ pub async fn run(
     let mut events = crossterm::event::EventStream::new();
     loop {
         terminal.draw(|f| draw(f, &state))?;
+
+        if state.oauth_pending {
+            state.oauth_pending = false;
+            run_oauth_for_form(&mut state, terminal).await;
+            continue;
+        }
 
         let evt = match events.next().await {
             Some(Ok(e)) => e,
@@ -343,6 +365,20 @@ fn advance_selection(state: &mut PickerState, delta: i32) {
 }
 
 fn handle_form_key(state: &mut PickerState, key: KeyEvent) {
+    // Ctrl+L: launch OAuth flow against the URL currently in the form.
+    if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        let url = state.form.url.lines().join(" ").trim().to_string();
+        if matches!(state.form.transport, TransportMode::Ws) && !url.is_empty() {
+            state.oauth_pending = true;
+            state.error = None;
+        } else {
+            state.error = Some(
+                "OAuth requires a WebSocket URL — fill in the URL field first".into(),
+            );
+        }
+        return;
+    }
+
     match (key.code, key.modifiers) {
         (KeyCode::Esc, _) => {
             state.error = None;
@@ -406,6 +442,77 @@ fn handle_form_key(state: &mut PickerState, key: KeyEvent) {
     }
 }
 
+/// Run the OAuth flow for the form currently being edited. Updates the
+/// busy status line as it progresses; the outer loop redraws each step.
+async fn run_oauth_for_form(
+    state: &mut PickerState,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) {
+    let url = state.form.url.lines().join(" ").trim().to_string();
+
+    state.busy = Some("Discovering auth config...".into());
+    let _ = terminal.draw(|f| draw(f, state));
+
+    let discovery = match crate::oauth::discover_auth_config(&url).await {
+        Ok(d) => d,
+        Err(e) => {
+            state.busy = None;
+            state.error = Some(format!("Auth discovery failed: {e}"));
+            return;
+        }
+    };
+
+    let oidc = match discovery.oidc {
+        Some(o) if crate::oauth::supports_oauth(&crate::oauth::AuthDiscovery {
+            methods: discovery.methods.clone(),
+            oidc: Some(o.clone()),
+        }) =>
+        {
+            o
+        }
+        _ => {
+            state.busy = None;
+            state.error = Some("Server does not advertise OAuth/OIDC support".into());
+            return;
+        }
+    };
+
+    state.busy = Some("Browser opened — complete sign-in to continue...".into());
+    let _ = terminal.draw(|f| draw(f, state));
+
+    let tokens = match crate::oauth::run_oauth_flow(&oidc).await {
+        Ok(t) => t,
+        Err(e) => {
+            state.busy = None;
+            state.error = Some(format!("Sign-in failed: {e}"));
+            return;
+        }
+    };
+
+    let id = state.form.form_id.clone();
+    if let Err(e) = credentials::store(&id, CredentialKind::Jwt, &tokens.access_token) {
+        state.busy = None;
+        state.error = Some(format!("Could not store access token: {e}"));
+        return;
+    }
+    if let Some(refresh) = tokens.refresh_token.as_deref() {
+        if let Err(e) = credentials::store(&id, CredentialKind::OauthRefresh, refresh) {
+            // Non-fatal — access token works for now, but warn so the user
+            // knows refresh is unavailable.
+            state.error = Some(format!("Stored access token but refresh failed: {e}"));
+        }
+    } else {
+        // No refresh token offered — clear any stale entry.
+        let _ = credentials::delete(&id, CredentialKind::OauthRefresh);
+    }
+
+    state.form.has_oauth_tokens = true;
+    state.busy = None;
+    if state.error.is_none() {
+        state.error = Some("Signed in — save the profile to keep these tokens".into());
+    }
+}
+
 /// Persist a submitted profile: update keyring, write profile, save store,
 /// reselect. Returns an error string suitable for the UI on failure.
 fn apply_submission(state: &mut PickerState, submitted: SubmittedProfile) -> Result<(), String> {
@@ -446,15 +553,7 @@ fn apply_submission(state: &mut PickerState, submitted: SubmittedProfile) -> Res
         ws_subject: submitted.ws_subject,
         username: submitted.username,
         has_password,
-        // JWT is managed by #14 OAuth flow — preserve any existing flag
-        // when editing, default to false on create.
-        has_jwt: state
-            .store
-            .profiles
-            .iter()
-            .find(|p| p.id == submitted.id)
-            .map(|p| p.has_jwt)
-            .unwrap_or(false),
+        has_jwt: submitted.has_oauth_tokens,
     };
 
     if editing {
@@ -802,7 +901,15 @@ fn draw_delete_overlay(f: &mut Frame, state: &PickerState, area: Rect) {
 }
 
 fn draw_error(f: &mut Frame, state: &PickerState, area: Rect) {
-    if let Some(err) = &state.error {
+    if let Some(busy) = &state.busy {
+        let style = Style::default()
+            .fg(Color::Rgb(178, 220, 245))
+            .add_modifier(Modifier::ITALIC);
+        f.render_widget(
+            Paragraph::new(Span::styled(format!(" ● {busy}"), style)),
+            area,
+        );
+    } else if let Some(err) = &state.error {
         let style = Style::default().fg(COLOR_ERROR);
         f.render_widget(
             Paragraph::new(Span::styled(format!(" • {err}"), style)),
@@ -823,6 +930,7 @@ fn draw_hints(f: &mut Frame, state: &PickerState, area: Rect) {
         Mode::Form => &[
             ("Tab", "next field"),
             ("Enter", "save"),
+            ("Ctrl+L", "OAuth sign-in"),
             ("Esc", "back"),
         ],
         Mode::DeleteConfirm => &[("y/Enter", "confirm"), ("any", "cancel")],
@@ -913,6 +1021,8 @@ mod tests {
             mode: Mode::List,
             error: None,
             form: FormState::empty(),
+            oauth_pending: false,
+            busy: None,
         }
     }
 

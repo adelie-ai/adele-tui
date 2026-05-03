@@ -1,6 +1,7 @@
 mod app;
 mod credentials;
 mod keys;
+mod oauth;
 mod picker;
 mod profile;
 mod ui;
