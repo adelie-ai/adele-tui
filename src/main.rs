@@ -463,6 +463,14 @@ async fn handle_action(
                 };
             }
         }
+        Action::ToggleSidebar => {
+            app.show_sidebar = !app.show_sidebar;
+            app.status_message = if app.show_sidebar {
+                "Conversation list shown".into()
+            } else {
+                "Conversation list hidden (Ctrl+B to show)".into()
+            };
+        }
     }
 }
 
