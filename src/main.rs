@@ -1,4 +1,5 @@
 mod app;
+mod credentials;
 mod keys;
 mod picker;
 mod profile;
