@@ -62,6 +62,7 @@ fn map_cursor_col_to_wrapped_segments(segments: &[String], cursor_col: usize) ->
 pub enum InputMode {
     Normal,
     Editing,
+    Renaming,
 }
 
 pub struct App {
@@ -78,6 +79,10 @@ pub struct App {
     pub scroll_offset: u16,
     /// Whether to include archived conversations in the list.
     pub show_archived: bool,
+    /// Single-line input used during InputMode::Renaming.
+    pub rename_textarea: TextArea<'static>,
+    /// Conversation id being renamed; `None` outside InputMode::Renaming.
+    pub renaming_id: Option<String>,
 }
 
 impl App {
@@ -96,6 +101,8 @@ impl App {
             should_quit: false,
             scroll_offset: 0,
             show_archived: false,
+            rename_textarea: new_textarea(),
+            renaming_id: None,
         }
     }
 
@@ -328,6 +335,60 @@ impl App {
     pub fn selected_conversation_id(&self) -> Option<&str> {
         let idx = self.selected_conversation?;
         self.conversations.get(idx).map(|c| c.id.as_str())
+    }
+
+    // --- Rename ---
+
+    /// Enter rename mode for the selected conversation, prepopulating the
+    /// rename buffer with its current title. No-op if nothing is selected.
+    pub fn begin_rename(&mut self) {
+        let Some(idx) = self.selected_conversation else {
+            return;
+        };
+        let Some(conv) = self.conversations.get(idx) else {
+            return;
+        };
+        let mut ta = new_textarea();
+        ta.insert_str(&conv.title);
+        ta.move_cursor(CursorMove::End);
+        self.rename_textarea = ta;
+        self.renaming_id = Some(conv.id.clone());
+        self.mode = InputMode::Renaming;
+    }
+
+    /// Trim the rename buffer and return `(id, new_title)` if the title is
+    /// non-empty and differs from the current one. Always exits rename mode.
+    pub fn submit_rename(&mut self) -> Option<(String, String)> {
+        let new_title = self.rename_textarea.lines().join(" ").trim().to_string();
+        let id = self.renaming_id.take();
+        self.rename_textarea = new_textarea();
+        self.mode = InputMode::Normal;
+
+        let id = id?;
+        if new_title.is_empty() {
+            return None;
+        }
+        let unchanged = self
+            .conversations
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.title == new_title)
+            .unwrap_or(false);
+        if unchanged {
+            return None;
+        }
+        Some((id, new_title))
+    }
+
+    pub fn cancel_rename(&mut self) {
+        self.renaming_id = None;
+        self.rename_textarea = new_textarea();
+        self.mode = InputMode::Normal;
+    }
+
+    /// Apply a renamed title locally (call after the daemon confirms).
+    pub fn apply_rename(&mut self, conversation_id: &str, title: &str) {
+        self.update_conversation_title(conversation_id, title);
     }
 
     pub fn delete_selected_conversation(&mut self) -> Option<String> {
@@ -780,6 +841,93 @@ mod tests {
         assert!(!app.should_quit);
         app.quit();
         assert!(app.should_quit);
+    }
+
+    // --- Rename tests ---
+
+    #[test]
+    fn begin_rename_without_selection_is_noop() {
+        let mut app = app_with_conversations();
+        assert!(app.selected_conversation.is_none());
+        app.begin_rename();
+        assert_eq!(app.mode, InputMode::Normal);
+        assert!(app.renaming_id.is_none());
+    }
+
+    #[test]
+    fn begin_rename_prepopulates_buffer_and_enters_mode() {
+        let mut app = app_with_conversations();
+        app.selected_conversation = Some(1); // "Second"
+        app.begin_rename();
+        assert_eq!(app.mode, InputMode::Renaming);
+        assert_eq!(app.renaming_id.as_deref(), Some("2"));
+        assert_eq!(app.rename_textarea.lines(), ["Second"]);
+    }
+
+    #[test]
+    fn submit_rename_returns_id_and_trimmed_title() {
+        let mut app = app_with_conversations();
+        app.selected_conversation = Some(0);
+        app.begin_rename();
+        // Replace contents
+        app.rename_textarea = TextArea::from(vec!["  Renamed Chat  ".to_string()]);
+
+        let result = app.submit_rename();
+        assert_eq!(result, Some(("1".to_string(), "Renamed Chat".to_string())));
+        assert_eq!(app.mode, InputMode::Normal);
+        assert!(app.renaming_id.is_none());
+    }
+
+    #[test]
+    fn submit_rename_with_unchanged_title_returns_none() {
+        let mut app = app_with_conversations();
+        app.selected_conversation = Some(0); // "First"
+        app.begin_rename();
+        // Buffer still equals current title
+        let result = app.submit_rename();
+        assert_eq!(result, None);
+        assert_eq!(app.mode, InputMode::Normal);
+    }
+
+    #[test]
+    fn submit_rename_with_empty_title_returns_none() {
+        let mut app = app_with_conversations();
+        app.selected_conversation = Some(0);
+        app.begin_rename();
+        app.rename_textarea = TextArea::from(vec!["   ".to_string()]);
+
+        let result = app.submit_rename();
+        assert_eq!(result, None);
+        assert_eq!(app.mode, InputMode::Normal);
+    }
+
+    #[test]
+    fn cancel_rename_clears_state() {
+        let mut app = app_with_conversations();
+        app.selected_conversation = Some(0);
+        app.begin_rename();
+        app.rename_textarea = TextArea::from(vec!["scratch".to_string()]);
+
+        app.cancel_rename();
+        assert_eq!(app.mode, InputMode::Normal);
+        assert!(app.renaming_id.is_none());
+    }
+
+    #[test]
+    fn apply_rename_updates_sidebar_and_current() {
+        let mut app = app_with_conversations();
+        app.current_conversation = Some(ConversationDetail {
+            id: "2".into(),
+            title: "Second".into(),
+            messages: vec![],
+            model_selection: None,
+        });
+        app.apply_rename("2", "Renamed");
+        assert_eq!(app.conversations[1].title, "Renamed");
+        assert_eq!(
+            app.current_conversation.as_ref().unwrap().title,
+            "Renamed"
+        );
     }
 
     // --- Scroll tests ---

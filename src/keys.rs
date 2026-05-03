@@ -19,6 +19,9 @@ pub enum Action {
     ScrollDown,
     ScrollToBottom,
     ToggleShowArchived,
+    BeginRename,
+    SubmitRename,
+    CancelRename,
 }
 
 /// Handle key events that we intercept before passing to textarea.
@@ -27,8 +30,10 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
-    // Ctrl+u / Ctrl+d / Ctrl+e for scrolling — works in all modes
-    if ctrl {
+    // Ctrl+u / Ctrl+d / Ctrl+e for scrolling — works in Normal/Editing only.
+    // In Renaming mode we forward all Ctrl combos to the rename textarea
+    // (Ctrl+a/e/u/k word/line edits).
+    if ctrl && !matches!(mode, InputMode::Renaming) {
         if matches!(mode, InputMode::Editing) && matches!(key.code, KeyCode::Char('j')) {
             return Some(Action::InsertNewline);
         }
@@ -57,6 +62,7 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
                 KeyCode::Char('n') => Some(Action::NewConversation),
                 KeyCode::Char('a') => Some(Action::ToggleShowArchived),
                 KeyCode::Char('A') => Some(Action::ArchiveConversation),
+                KeyCode::Char('r') => Some(Action::BeginRename),
                 KeyCode::Char('i') => Some(Action::EnterEditMode),
                 KeyCode::PageUp => Some(Action::ScrollUp),
                 KeyCode::PageDown => Some(Action::ScrollDown),
@@ -64,6 +70,13 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
                 _ => None,
             }
         }
+        InputMode::Renaming => match key.code {
+            KeyCode::Enter => Some(Action::SubmitRename),
+            KeyCode::Esc => Some(Action::CancelRename),
+            // All other keys (chars, backspace, arrows, home/end, ctrl-a/e/u/k)
+            // forward to the rename textarea.
+            _ => None,
+        },
         InputMode::Editing => {
             // Shift+Enter inserts a newline while plain Enter submits.
             match key.code {
@@ -407,6 +420,65 @@ mod tests {
         assert_eq!(
             handle_key_event(key(KeyCode::PageDown), &InputMode::Normal),
             Some(Action::ScrollDown)
+        );
+    }
+
+    // --- Renaming mode tests ---
+
+    #[test]
+    fn normal_r_begins_rename() {
+        assert_eq!(
+            handle_key_event(key(KeyCode::Char('r')), &InputMode::Normal),
+            Some(Action::BeginRename)
+        );
+    }
+
+    #[test]
+    fn renaming_enter_submits() {
+        assert_eq!(
+            handle_key_event(key(KeyCode::Enter), &InputMode::Renaming),
+            Some(Action::SubmitRename)
+        );
+    }
+
+    #[test]
+    fn renaming_esc_cancels() {
+        assert_eq!(
+            handle_key_event(key(KeyCode::Esc), &InputMode::Renaming),
+            Some(Action::CancelRename)
+        );
+    }
+
+    #[test]
+    fn renaming_chars_forwarded_to_textarea() {
+        // Regular chars and editing keys must reach the rename textarea.
+        assert_eq!(
+            handle_key_event(key(KeyCode::Char('a')), &InputMode::Renaming),
+            None
+        );
+        assert_eq!(
+            handle_key_event(key(KeyCode::Backspace), &InputMode::Renaming),
+            None
+        );
+    }
+
+    #[test]
+    fn renaming_ctrl_combos_forwarded_to_textarea() {
+        // Ctrl+a/e/u/k are textarea editing shortcuts in rename mode and
+        // must NOT be intercepted as scroll commands.
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('u'), KeyModifiers::CONTROL),
+                &InputMode::Renaming
+            ),
+            None
+        );
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('a'), KeyModifiers::CONTROL),
+                &InputMode::Renaming
+            ),
+            None
         );
     }
 }

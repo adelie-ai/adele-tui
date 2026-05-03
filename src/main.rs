@@ -168,9 +168,16 @@ async fn run(
                     }
                     if let Some(action) = handle_key_event(key, &app.mode) {
                         handle_action(&mut app, &client, action).await;
-                    } else if matches!(app.mode, InputMode::Editing) {
-                        // Forward unhandled keys to textarea
-                        app.textarea.input(key);
+                    } else {
+                        match app.mode {
+                            InputMode::Editing => {
+                                app.textarea.input(key);
+                            }
+                            InputMode::Renaming => {
+                                app.rename_textarea.input(key);
+                            }
+                            InputMode::Normal => {}
+                        }
                     }
                 }
             }
@@ -336,6 +343,27 @@ async fn handle_action(
         Action::ScrollUp => app.scroll_up(5),
         Action::ScrollDown => app.scroll_down(5),
         Action::ScrollToBottom => app.scroll_to_bottom(),
+        Action::BeginRename => {
+            if app.selected_conversation_id().is_some() {
+                app.begin_rename();
+            } else {
+                app.status_message = "Select a conversation to rename".into();
+            }
+        }
+        Action::SubmitRename => {
+            if let Some((id, title)) = app.submit_rename()
+                && let Some(client) = client.as_ref()
+            {
+                match client.rename_conversation(&id, &title).await {
+                    Ok(()) => {
+                        app.apply_rename(&id, &title);
+                        app.status_message = format!("Renamed to \"{title}\"");
+                    }
+                    Err(e) => app.status_message = format!("Rename error: {e}"),
+                }
+            }
+        }
+        Action::CancelRename => app.cancel_rename(),
     }
 }
 
