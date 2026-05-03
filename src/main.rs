@@ -1,5 +1,6 @@
 mod app;
 mod keys;
+mod markdown;
 mod ui;
 
 use std::io;

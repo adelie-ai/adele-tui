@@ -125,50 +125,68 @@ fn draw_chat_panel(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     draw_status_bar(f, app, chunks[2]);
 }
 
+fn push_user_message(lines: &mut Vec<Line<'static>>, content: &str, style: Style) {
+    let mut first = true;
+    for text_line in split_display_lines(content) {
+        if first {
+            lines.push(Line::from(vec![
+                Span::styled("You: ", style.add_modifier(Modifier::BOLD)),
+                Span::styled(text_line, style),
+            ]));
+            first = false;
+        } else {
+            lines.push(Line::from(Span::styled(text_line, style)));
+        }
+    }
+}
+
+fn push_assistant_markdown(lines: &mut Vec<Line<'static>>, content: &str, style: Style) {
+    let mut rendered = crate::markdown::render(content, style);
+    if rendered.is_empty() {
+        rendered.push(Line::from(""));
+    }
+    // Prepend "Adele: " to the first non-empty line so the prefix sits with
+    // the response rather than on its own row.
+    let prefix_pos = rendered
+        .iter()
+        .position(|l| !l.spans.is_empty())
+        .unwrap_or(0);
+    let prefix_span = Span::styled("Adele: ", style.add_modifier(Modifier::BOLD));
+    if let Some(first) = rendered.get_mut(prefix_pos) {
+        first.spans.insert(0, prefix_span);
+    } else {
+        rendered.push(Line::from(prefix_span));
+    }
+    lines.extend(rendered);
+}
+
 fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let mut lines: Vec<Line> = Vec::new();
 
     if let Some(conv) = &app.current_conversation {
         for msg in &conv.messages {
-            let (prefix, style) = match msg.role.as_str() {
-                "user" => ("You: ", Style::default().fg(COLOR_USER_PREFIX)),
+            match msg.role.as_str() {
+                "user" => {
+                    let style = Style::default().fg(COLOR_USER_PREFIX);
+                    push_user_message(&mut lines, &msg.content, style);
+                    lines.push(Line::from(""));
+                }
                 "assistant" if !msg.content.trim().is_empty() => {
-                    ("Adele: ", Style::default().fg(COLOR_ASSISTANT_PREFIX))
+                    let style = Style::default().fg(COLOR_ASSISTANT_PREFIX);
+                    push_assistant_markdown(&mut lines, &msg.content, style);
+                    lines.push(Line::from(""));
                 }
                 // Skip tool, system, and empty assistant messages
                 _ => continue,
-            };
-            // Split content on newlines so ratatui renders them as separate lines
-            let mut first = true;
-            for text_line in split_display_lines(&msg.content) {
-                if first {
-                    lines.push(Line::from(vec![
-                        Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
-                        Span::styled(text_line, style),
-                    ]));
-                    first = false;
-                } else {
-                    lines.push(Line::from(Span::styled(text_line, style)));
-                }
             }
-            lines.push(Line::from("")); // spacing
         }
 
-        // Show streaming buffer as in-progress assistant message
+        // Show streaming buffer as in-progress assistant message. Markdown is
+        // applied to the partial buffer too — unclosed fences just show
+        // their literal backticks until the stream catches up.
         if !app.streaming_buffer.is_empty() {
             let style = Style::default().fg(COLOR_ASSISTANT_STREAMING);
-            let mut first = true;
-            for text_line in split_display_lines(&app.streaming_buffer) {
-                if first {
-                    lines.push(Line::from(vec![
-                        Span::styled("Adele: ", style.add_modifier(Modifier::BOLD)),
-                        Span::styled(text_line, style),
-                    ]));
-                    first = false;
-                } else {
-                    lines.push(Line::from(Span::styled(text_line, style)));
-                }
-            }
+            push_assistant_markdown(&mut lines, &app.streaming_buffer, style);
             // Cursor on last line
             if let Some(last) = lines.last_mut() {
                 last.spans.push(Span::styled("▌", style));
@@ -356,5 +374,27 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn assistant_markdown_strips_emphasis_markers() {
+        // `**strong**` should render as `strong` (markdown punctuation
+        // consumed by the parser), not literal `**strong**`.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.current_conversation = Some(ConversationDetail {
+            id: "1".into(),
+            title: "Test".into(),
+            messages: vec![ChatMessage {
+                role: "assistant".into(),
+                content: "answer with **strong** word".into(),
+            }],
+        });
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(dump.contains("strong"));
+        assert!(!dump.contains("**strong**"));
     }
 }
