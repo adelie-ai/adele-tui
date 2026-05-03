@@ -86,6 +86,11 @@ pub struct App {
     /// When true, render tool/system/empty-assistant messages dimly inline
     /// instead of filtering them out. Persisted via `settings.json`.
     pub show_debug: bool,
+    /// Transient indicator from AssistantStatus events ("Searching knowledge
+    /// base…", tool-call progress). Cleared when streaming completes or
+    /// errors. Distinct from `status_message`, which is sticky user-facing
+    /// feedback.
+    pub assistant_status: Option<String>,
 }
 
 impl App {
@@ -107,6 +112,16 @@ impl App {
             rename_textarea: new_textarea(),
             renaming_id: None,
             show_debug: false,
+            assistant_status: None,
+        }
+    }
+
+    pub fn set_assistant_status(&mut self, message: impl Into<String>) {
+        let msg = message.into();
+        if msg.trim().is_empty() {
+            self.assistant_status = None;
+        } else {
+            self.assistant_status = Some(msg);
         }
     }
 
@@ -292,6 +307,7 @@ impl App {
         }
         self.streaming_buffer.clear();
         self.pending_request_id = None;
+        self.assistant_status = None;
     }
 
     pub fn streaming_error(&mut self, request_id: &str, error: &str) {
@@ -301,6 +317,7 @@ impl App {
         self.status_message = format!("Error: {error}");
         self.streaming_buffer.clear();
         self.pending_request_id = None;
+        self.assistant_status = None;
     }
 
     // --- Conversation management ---
@@ -708,6 +725,43 @@ mod tests {
         assert_eq!(app.status_message, "Error: LLM timeout");
         assert_eq!(app.pending_request_id, None);
         assert_eq!(app.streaming_buffer, "");
+    }
+
+    #[test]
+    fn assistant_status_set_and_cleared_on_complete() {
+        let mut app = App::new();
+        app.current_conversation = Some(ConversationDetail {
+            id: "c1".into(),
+            title: "Test".into(),
+            messages: vec![],
+            model_selection: None,
+        });
+        app.start_streaming("req1".into());
+        app.set_assistant_status("Searching knowledge base...");
+        assert_eq!(
+            app.assistant_status.as_deref(),
+            Some("Searching knowledge base...")
+        );
+
+        app.complete_streaming("req1", "done");
+        assert!(app.assistant_status.is_none());
+    }
+
+    #[test]
+    fn assistant_status_cleared_on_error() {
+        let mut app = App::new();
+        app.start_streaming("req1".into());
+        app.set_assistant_status("Calling tool...");
+        app.streaming_error("req1", "boom");
+        assert!(app.assistant_status.is_none());
+    }
+
+    #[test]
+    fn assistant_status_empty_string_clears() {
+        let mut app = App::new();
+        app.set_assistant_status("something");
+        app.set_assistant_status("");
+        assert!(app.assistant_status.is_none());
     }
 
     #[test]

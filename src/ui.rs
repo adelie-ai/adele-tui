@@ -23,6 +23,7 @@ const COLOR_STATUS_DIM: Color = Color::Rgb(143, 153, 174);
 const COLOR_COUNT_DIM: Color = Color::Rgb(124, 132, 148);
 const COLOR_DEBUG_TOOL: Color = Color::Rgb(178, 138, 220);
 const COLOR_DEBUG_SYSTEM: Color = Color::Rgb(140, 156, 196);
+const COLOR_ASSISTANT_INDICATOR: Color = Color::Rgb(178, 220, 245);
 
 fn mode_chip_style(mode: &InputMode) -> Style {
     match mode {
@@ -154,18 +155,46 @@ fn draw_conversation_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect)
 }
 
 fn draw_chat_panel(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let show_status = app.assistant_status.is_some();
+    let status_height: u16 = if show_status { 1 } else { 0 };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
+            Constraint::Length(status_height),
             Constraint::Length(INPUT_TOTAL_HEIGHT),
             Constraint::Length(1),
         ])
         .split(area);
 
     draw_messages(f, app, chunks[0]);
-    draw_input(f, app, chunks[1]);
-    draw_status_bar(f, app, chunks[2]);
+    if show_status {
+        draw_assistant_status(f, app, chunks[1]);
+    }
+    draw_input(f, app, chunks[2]);
+    draw_status_bar(f, app, chunks[3]);
+}
+
+fn draw_assistant_status(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let Some(message) = app.assistant_status.as_deref() else {
+        return;
+    };
+    let indicator = Paragraph::new(Line::from(vec![
+        Span::styled(
+            "● ",
+            Style::default()
+                .fg(COLOR_ASSISTANT_INDICATOR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            message,
+            Style::default()
+                .fg(COLOR_ASSISTANT_INDICATOR)
+                .add_modifier(Modifier::ITALIC),
+        ),
+    ]));
+    f.render_widget(indicator, area);
 }
 
 fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -502,5 +531,35 @@ mod tests {
         assert!(dump.contains("system:"));
         assert!(dump.contains("ran search"));
         assert!(dump.contains("context updated"));
+    }
+
+    #[test]
+    fn draw_with_assistant_status_renders_indicator() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.current_conversation = Some(ConversationDetail {
+            id: "1".into(),
+            title: "Test".into(),
+            messages: vec![],
+            model_selection: None,
+        });
+        app.set_assistant_status("Searching knowledge base...");
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(dump.contains("Searching knowledge base"));
+    }
+
+    #[test]
+    fn draw_without_assistant_status_omits_indicator() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content.iter().map(|c| c.symbol()).collect();
+        // The bullet glyph used by the indicator should not appear when no status.
+        assert!(!dump.contains("● "));
     }
 }

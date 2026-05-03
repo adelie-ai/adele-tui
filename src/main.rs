@@ -192,14 +192,13 @@ async fn run(
                     }
                     SignalEvent::Complete { request_id, full_response } => {
                         app.complete_streaming(&request_id, &full_response);
-                        app.status_message.clear();
                     }
                     SignalEvent::Error { request_id, error } => {
                         app.streaming_error(&request_id, &error);
                         app.status_message = format!("Error: {error}");
                     }
                     SignalEvent::Status { request_id: _, message } => {
-                        app.status_message = message;
+                        app.set_assistant_status(message);
                     }
                     SignalEvent::TitleChanged { conversation_id, title } => {
                         app.update_conversation_title(&conversation_id, &title);
