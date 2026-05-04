@@ -97,6 +97,9 @@ pub struct App {
     /// Set when the user asks to switch to a different connection. Causes
     /// the chat loop to exit cleanly so the picker can run again.
     pub switch_requested: bool,
+    /// Set when the user asks to open the knowledge base. The chat loop
+    /// hands the screen to `kb::run` and resets this flag when KB exits.
+    pub kb_requested: bool,
 }
 
 impl App {
@@ -121,6 +124,7 @@ impl App {
             assistant_status: None,
             show_sidebar: true,
             switch_requested: false,
+            kb_requested: false,
         }
     }
 
