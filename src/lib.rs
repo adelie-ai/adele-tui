@@ -1,5 +1,6 @@
 pub mod app;
 pub mod credentials;
+pub mod kb;
 pub mod keys;
 pub mod markdown;
 pub mod oauth;

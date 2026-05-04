@@ -25,6 +25,7 @@ pub enum Action {
     ToggleDebug,
     ToggleSidebar,
     SwitchConnection,
+    OpenKnowledgeBase,
 }
 
 /// Handle key events that we intercept before passing to textarea.
@@ -53,6 +54,7 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
             KeyCode::Char('e') => Some(Action::ScrollToBottom),
             KeyCode::Char('t') => Some(Action::ToggleDebug),
             KeyCode::Char('b') => Some(Action::ToggleSidebar),
+            KeyCode::Char('k') => Some(Action::OpenKnowledgeBase),
             _ => None,
         };
     }
@@ -557,6 +559,30 @@ mod tests {
         assert_eq!(
             handle_key_event(key(KeyCode::F(2)), &InputMode::Editing),
             Some(Action::SwitchConnection)
+        );
+    }
+
+    // --- Ctrl+K opens KB ---
+
+    #[test]
+    fn ctrl_k_opens_kb_in_normal() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('k'), KeyModifiers::CONTROL),
+                &InputMode::Normal
+            ),
+            Some(Action::OpenKnowledgeBase)
+        );
+    }
+
+    #[test]
+    fn ctrl_k_opens_kb_in_editing() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('k'), KeyModifiers::CONTROL),
+                &InputMode::Editing
+            ),
+            Some(Action::OpenKnowledgeBase)
         );
     }
 }
