@@ -559,6 +559,7 @@ mod tests {
             id: "1".into(),
             title: "Test".into(),
             messages: vec![],
+            model_selection: None,
         });
         assert!(app.submit_prompt().is_none());
     }
@@ -570,6 +571,7 @@ mod tests {
             id: "conv1".into(),
             title: "Test".into(),
             messages: vec![],
+            model_selection: None,
         });
         app.textarea.insert_str("What is Rust?");
 
@@ -595,6 +597,7 @@ mod tests {
             id: "c1".into(),
             title: "Test".into(),
             messages: vec![],
+            model_selection: None,
         });
 
         app.start_streaming("req1".into());
@@ -621,6 +624,7 @@ mod tests {
             id: "c1".into(),
             title: "Test".into(),
             messages: vec![],
+            model_selection: None,
         });
 
         app.start_streaming("req1".into());
@@ -648,6 +652,7 @@ mod tests {
             id: "c1".into(),
             title: "Test".into(),
             messages: vec![],
+            model_selection: None,
         });
 
         app.start_streaming_without_request_id();
@@ -727,6 +732,7 @@ mod tests {
             id: "2".into(),
             title: "Second".into(),
             messages: vec![],
+            model_selection: None,
         });
 
         let deleted = app.delete_selected_conversation();
@@ -816,6 +822,7 @@ mod tests {
             id: "c1".into(),
             title: "Test".into(),
             messages: vec![],
+            model_selection: None,
         });
         app.scroll_up(10);
         app.textarea.insert_str("hello");

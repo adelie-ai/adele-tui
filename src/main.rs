@@ -196,6 +196,13 @@ async fn run(
                     SignalEvent::Disconnected { reason } => {
                         app.status_message = format!("Disconnected: {reason}");
                     }
+                    SignalEvent::ConversationWarning { warning, .. } => {
+                        // Currently only the dangling-model-selection warning is
+                        // emitted. Surface a hint in the status bar; richer
+                        // handling (auto-pick fallback, etc.) belongs upstream
+                        // with the per-conversation model selector (#1).
+                        app.status_message = format!("Warning: {warning:?}");
+                    }
                 }
             }
         }
