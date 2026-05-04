@@ -83,6 +83,9 @@ pub struct App {
     pub rename_textarea: TextArea<'static>,
     /// Conversation id being renamed; `None` outside InputMode::Renaming.
     pub renaming_id: Option<String>,
+    /// When true, render tool/system/empty-assistant messages dimly inline
+    /// instead of filtering them out. Persisted via `settings.json`.
+    pub show_debug: bool,
 }
 
 impl App {
@@ -103,6 +106,7 @@ impl App {
             show_archived: false,
             rename_textarea: new_textarea(),
             renaming_id: None,
+            show_debug: false,
         }
     }
 

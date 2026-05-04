@@ -21,6 +21,8 @@ const COLOR_ASSISTANT_PREFIX: Color = Color::Rgb(92, 206, 154);
 const COLOR_ASSISTANT_STREAMING: Color = Color::Rgb(132, 218, 193);
 const COLOR_STATUS_DIM: Color = Color::Rgb(143, 153, 174);
 const COLOR_COUNT_DIM: Color = Color::Rgb(124, 132, 148);
+const COLOR_DEBUG_TOOL: Color = Color::Rgb(178, 138, 220);
+const COLOR_DEBUG_SYSTEM: Color = Color::Rgb(140, 156, 196);
 
 fn mode_chip_style(mode: &InputMode) -> Style {
     match mode {
@@ -171,12 +173,32 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     if let Some(conv) = &app.current_conversation {
         for msg in &conv.messages {
+            // Roles fall into three buckets: user/assistant render normally;
+            // tool/system render only with debug view; empty assistant content
+            // is debug-only too (it usually carries tool-call metadata).
             let (prefix, style) = match msg.role.as_str() {
                 "user" => ("You: ", Style::default().fg(COLOR_USER_PREFIX)),
                 "assistant" if !msg.content.trim().is_empty() => {
                     ("Adele: ", Style::default().fg(COLOR_ASSISTANT_PREFIX))
                 }
-                // Skip tool, system, and empty assistant messages
+                "tool" if app.show_debug => (
+                    "tool: ",
+                    Style::default()
+                        .fg(COLOR_DEBUG_TOOL)
+                        .add_modifier(Modifier::DIM | Modifier::ITALIC),
+                ),
+                "system" if app.show_debug => (
+                    "system: ",
+                    Style::default()
+                        .fg(COLOR_DEBUG_SYSTEM)
+                        .add_modifier(Modifier::DIM | Modifier::ITALIC),
+                ),
+                "assistant" if app.show_debug => (
+                    "Adele (empty): ",
+                    Style::default()
+                        .fg(COLOR_ASSISTANT_PREFIX)
+                        .add_modifier(Modifier::DIM | Modifier::ITALIC),
+                ),
                 _ => continue,
             };
             // Split content on newlines so ratatui renders them as separate lines
@@ -417,5 +439,68 @@ mod tests {
         app.selected_conversation = Some(0);
         app.begin_rename();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
+    }
+
+    fn app_with_debug_messages(show_debug: bool) -> App {
+        let mut app = App::new();
+        app.show_debug = show_debug;
+        app.current_conversation = Some(ConversationDetail {
+            id: "1".into(),
+            title: "Test".into(),
+            messages: vec![
+                ChatMessage {
+                    role: "user".into(),
+                    content: "Hello".into(),
+                },
+                ChatMessage {
+                    role: "tool".into(),
+                    content: "ran search(foo)".into(),
+                },
+                ChatMessage {
+                    role: "system".into(),
+                    content: "context updated".into(),
+                },
+                ChatMessage {
+                    role: "assistant".into(),
+                    content: "".into(), // empty — only shown in debug
+                },
+                ChatMessage {
+                    role: "assistant".into(),
+                    content: "Hi there!".into(),
+                },
+            ],
+            model_selection: None,
+        });
+        app
+    }
+
+    #[test]
+    fn draw_with_debug_off_hides_tool_and_system() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app_with_debug_messages(false);
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(dump.contains("Hello"));
+        assert!(dump.contains("Hi there!"));
+        assert!(!dump.contains("ran search"));
+        assert!(!dump.contains("context updated"));
+        assert!(!dump.contains("tool:"));
+        assert!(!dump.contains("system:"));
+    }
+
+    #[test]
+    fn draw_with_debug_on_reveals_tool_and_system() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app_with_debug_messages(true);
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(dump.contains("tool:"));
+        assert!(dump.contains("system:"));
+        assert!(dump.contains("ran search"));
+        assert!(dump.contains("context updated"));
     }
 }
