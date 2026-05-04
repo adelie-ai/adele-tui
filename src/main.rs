@@ -1,6 +1,7 @@
 mod app;
 mod keys;
 mod settings;
+mod toolbar;
 mod ui;
 
 use std::io;
