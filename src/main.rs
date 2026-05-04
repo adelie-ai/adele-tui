@@ -1,5 +1,6 @@
 mod app;
 mod keys;
+mod markdown;
 mod settings;
 mod toolbar;
 mod ui;
