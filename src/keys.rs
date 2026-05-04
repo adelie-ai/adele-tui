@@ -28,6 +28,7 @@ pub enum Action {
     OpenKnowledgeBase,
     OpenConnections,
     OpenPurposes,
+    OpenModelPicker,
 }
 
 /// Handle key events that we intercept before passing to textarea.
@@ -65,6 +66,7 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
             KeyCode::Char('t') => Some(Action::ToggleDebug),
             KeyCode::Char('b') => Some(Action::ToggleSidebar),
             KeyCode::Char('k') => Some(Action::OpenKnowledgeBase),
+            KeyCode::Char('m') => Some(Action::OpenModelPicker),
             _ => None,
         };
     }
@@ -627,6 +629,30 @@ mod tests {
         assert_eq!(
             handle_key_event(key(KeyCode::F(4)), &InputMode::Editing),
             Some(Action::OpenPurposes)
+        );
+    }
+
+    // --- Ctrl+M opens model picker ---
+
+    #[test]
+    fn ctrl_m_opens_model_picker_in_normal() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('m'), KeyModifiers::CONTROL),
+                &InputMode::Normal
+            ),
+            Some(Action::OpenModelPicker)
+        );
+    }
+
+    #[test]
+    fn ctrl_m_opens_model_picker_in_editing() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('m'), KeyModifiers::CONTROL),
+                &InputMode::Editing
+            ),
+            Some(Action::OpenModelPicker)
         );
     }
 }

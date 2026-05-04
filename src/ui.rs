@@ -353,10 +353,16 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .as_ref()
         .map(|conv| conv.title.as_str())
         .unwrap_or("Chat");
+    let model_suffix = app
+        .current_conversation
+        .as_ref()
+        .and_then(|conv| conv.model_selection.as_ref())
+        .map(|sel| format!("  ·  {} · {}", sel.connection_id, sel.model_id))
+        .unwrap_or_default();
     let title = if app.scroll_offset > 0 {
-        format!("{chat_title} (Ctrl+u/d scroll, Ctrl+e bottom)")
+        format!("{chat_title}{model_suffix} (Ctrl+u/d scroll, Ctrl+e bottom)")
     } else {
-        chat_title.to_string()
+        format!("{chat_title}{model_suffix}")
     };
 
     let block = Block::default()
