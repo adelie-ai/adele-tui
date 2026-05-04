@@ -7,6 +7,7 @@ mod markdown;
 mod oauth;
 mod picker;
 mod profile;
+mod purposes;
 mod settings;
 mod toolbar;
 mod ui;
@@ -310,6 +311,16 @@ async fn run(
             continue;
         }
 
+        if app.purposes_requested {
+            app.purposes_requested = false;
+            if let Some(client) = client.as_ref() {
+                if let Err(e) = purposes::run(terminal, client).await {
+                    app.status_message = format!("Purposes error: {e}");
+                }
+            }
+            continue;
+        }
+
         tokio::select! {
             Some(Ok(evt)) = event_stream.next() => {
                 if let Event::Key(key) = evt {
@@ -588,6 +599,13 @@ async fn handle_action(
                 app.connections_requested = true;
             } else {
                 app.status_message = "Not connected — connections manager unavailable".into();
+            }
+        }
+        Action::OpenPurposes => {
+            if client.is_some() {
+                app.purposes_requested = true;
+            } else {
+                app.status_message = "Not connected — purposes manager unavailable".into();
             }
         }
     }

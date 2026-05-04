@@ -103,6 +103,8 @@ pub struct App {
     /// Set when the user asks to open the LLM-provider connections manager.
     /// Mirrors `kb_requested`'s screen-handoff pattern.
     pub connections_requested: bool,
+    /// Set when the user asks to open the purposes manager.
+    pub purposes_requested: bool,
 }
 
 impl App {
@@ -129,6 +131,7 @@ impl App {
             switch_requested: false,
             kb_requested: false,
             connections_requested: false,
+            purposes_requested: false,
         }
     }
 
