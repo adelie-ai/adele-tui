@@ -185,32 +185,60 @@ fn any_explicit_connection_arg(matches: &clap::ArgMatches) -> bool {
         })
 }
 
-/// Decide between picker-driven and CLI-driven connection, then hand off
-/// to the chat loop.
+/// Outcome of a single chat session loop. `Switch` re-enters the picker;
+/// `Quit` exits the program.
+enum RunOutcome {
+    Quit,
+    Switch,
+}
+
+/// Decide between picker-driven and CLI-driven connection, then run the
+/// chat loop. Loops back into the picker when the user requests a
+/// connection switch.
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     cli: CliArgs,
     cli_explicit: bool,
 ) -> Result<()> {
-    let store = ProfileStore::load();
-
-    let config = if cli_explicit || store.profiles.is_empty() {
+    // First connection: respect explicit CLI/env args; otherwise picker if
+    // we have profiles, else fall back to CLI defaults.
+    let mut config = if cli_explicit {
         ConnectionConfig::from(cli)
     } else {
-        let (outcome, _store) = picker::run(terminal, store).await?;
-        match outcome {
-            PickerOutcome::Selected(profile) => profile.to_connection_config(),
-            PickerOutcome::Cancelled => return Ok(()),
+        let store = ProfileStore::load();
+        if store.profiles.is_empty() {
+            ConnectionConfig::from(cli)
+        } else {
+            match picker::run(terminal, store).await?.0 {
+                PickerOutcome::Selected(profile) => profile.to_connection_config(),
+                PickerOutcome::Cancelled => return Ok(()),
+            }
         }
     };
 
-    run(terminal, &config).await
+    loop {
+        match run(terminal, &config).await? {
+            RunOutcome::Quit => return Ok(()),
+            RunOutcome::Switch => {
+                // Always show the picker on switch — even if CLI args were
+                // used initially, the user is opting into profile-based
+                // selection now.
+                let store = ProfileStore::load();
+                match picker::run(terminal, store).await?.0 {
+                    PickerOutcome::Selected(profile) => {
+                        config = profile.to_connection_config();
+                    }
+                    PickerOutcome::Cancelled => return Ok(()),
+                }
+            }
+        }
+    }
 }
 
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     config: &ConnectionConfig,
-) -> Result<()> {
+) -> Result<RunOutcome> {
     let mut app = App::new();
     let settings = Settings::load();
     app.show_debug = settings.show_debug;
@@ -244,7 +272,10 @@ async fn run(
         terminal.draw(|f| ui::draw(f, &mut app))?;
 
         if app.should_quit {
-            return Ok(());
+            return Ok(RunOutcome::Quit);
+        }
+        if app.switch_requested {
+            return Ok(RunOutcome::Switch);
         }
 
         // The reconnect timer is built fresh each loop iteration so that it
@@ -515,6 +546,10 @@ async fn handle_action(
             } else {
                 "Conversation list hidden (Ctrl+B to show)".into()
             };
+        }
+        Action::SwitchConnection => {
+            app.switch_requested = true;
+            app.status_message = "Switching connection...".into();
         }
     }
 }

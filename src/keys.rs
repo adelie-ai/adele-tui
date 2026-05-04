@@ -24,6 +24,7 @@ pub enum Action {
     CancelRename,
     ToggleDebug,
     ToggleSidebar,
+    SwitchConnection,
 }
 
 /// Handle key events that we intercept before passing to textarea.
@@ -31,6 +32,12 @@ pub enum Action {
 pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    // F2 opens the connection picker from any mode. Chosen over Ctrl+Shift+C
+    // since terminal emulators commonly intercept that for clipboard copy.
+    if key.code == KeyCode::F(2) && key.modifiers.is_empty() {
+        return Some(Action::SwitchConnection);
+    }
 
     // Ctrl combos. Most apply across modes, but in Renaming we forward
     // all Ctrl combos to the rename textarea (Ctrl+a/e/u/k word/line edits).
@@ -532,6 +539,24 @@ mod tests {
                 &InputMode::Editing
             ),
             Some(Action::ToggleSidebar)
+        );
+    }
+
+    // --- F2 switch connection ---
+
+    #[test]
+    fn f2_triggers_switch_in_normal() {
+        assert_eq!(
+            handle_key_event(key(KeyCode::F(2)), &InputMode::Normal),
+            Some(Action::SwitchConnection)
+        );
+    }
+
+    #[test]
+    fn f2_triggers_switch_in_editing() {
+        assert_eq!(
+            handle_key_event(key(KeyCode::F(2)), &InputMode::Editing),
+            Some(Action::SwitchConnection)
         );
     }
 }

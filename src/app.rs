@@ -94,6 +94,9 @@ pub struct App {
     /// Whether the conversation list pane is visible. When `false`, the chat
     /// panel takes the full window width.
     pub show_sidebar: bool,
+    /// Set when the user asks to switch to a different connection. Causes
+    /// the chat loop to exit cleanly so the picker can run again.
+    pub switch_requested: bool,
 }
 
 impl App {
@@ -117,6 +120,7 @@ impl App {
             show_debug: false,
             assistant_status: None,
             show_sidebar: true,
+            switch_requested: false,
         }
     }
 
@@ -990,6 +994,11 @@ mod tests {
             app.current_conversation.as_ref().unwrap().title,
             "Renamed"
         );
+    }
+
+    #[test]
+    fn switch_requested_default_false() {
+        assert!(!App::new().switch_requested);
     }
 
     // --- Scroll tests ---
