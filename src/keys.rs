@@ -26,6 +26,7 @@ pub enum Action {
     ToggleSidebar,
     SwitchConnection,
     OpenKnowledgeBase,
+    OpenConnections,
 }
 
 /// Handle key events that we intercept before passing to textarea.
@@ -38,6 +39,10 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
     // since terminal emulators commonly intercept that for clipboard copy.
     if key.code == KeyCode::F(2) && key.modifiers.is_empty() {
         return Some(Action::SwitchConnection);
+    }
+    // F3 opens the LLM-provider connections manager.
+    if key.code == KeyCode::F(3) && key.modifiers.is_empty() {
+        return Some(Action::OpenConnections);
     }
 
     // Ctrl combos. Most apply across modes, but in Renaming we forward
@@ -583,6 +588,24 @@ mod tests {
                 &InputMode::Editing
             ),
             Some(Action::OpenKnowledgeBase)
+        );
+    }
+
+    // --- F3 opens connections ---
+
+    #[test]
+    fn f3_opens_connections_in_normal() {
+        assert_eq!(
+            handle_key_event(key(KeyCode::F(3)), &InputMode::Normal),
+            Some(Action::OpenConnections)
+        );
+    }
+
+    #[test]
+    fn f3_opens_connections_in_editing() {
+        assert_eq!(
+            handle_key_event(key(KeyCode::F(3)), &InputMode::Editing),
+            Some(Action::OpenConnections)
         );
     }
 }

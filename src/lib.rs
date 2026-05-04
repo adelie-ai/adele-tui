@@ -1,4 +1,5 @@
 pub mod app;
+pub mod connections;
 pub mod credentials;
 pub mod kb;
 pub mod keys;

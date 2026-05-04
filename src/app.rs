@@ -100,6 +100,9 @@ pub struct App {
     /// Set when the user asks to open the knowledge base. The chat loop
     /// hands the screen to `kb::run` and resets this flag when KB exits.
     pub kb_requested: bool,
+    /// Set when the user asks to open the LLM-provider connections manager.
+    /// Mirrors `kb_requested`'s screen-handoff pattern.
+    pub connections_requested: bool,
 }
 
 impl App {
@@ -125,6 +128,7 @@ impl App {
             show_sidebar: true,
             switch_requested: false,
             kb_requested: false,
+            connections_requested: false,
         }
     }
 
