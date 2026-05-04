@@ -52,13 +52,16 @@ fn split_display_lines(content: &str) -> Vec<String> {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(f.area());
-
-    draw_conversation_list(f, app, chunks[0]);
-    draw_chat_panel(f, app, chunks[1]);
+    if app.show_sidebar {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+            .split(f.area());
+        draw_conversation_list(f, app, chunks[0]);
+        draw_chat_panel(f, app, chunks[1]);
+    } else {
+        draw_chat_panel(f, app, f.area());
+    }
 
     if matches!(app.mode, InputMode::Renaming) {
         draw_rename_popup(f, app, f.area());
@@ -468,6 +471,42 @@ mod tests {
         app.selected_conversation = Some(0);
         app.begin_rename();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn draw_with_sidebar_hidden_does_not_render_list_title() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.set_conversations(vec![ConversationSummary {
+            id: "1".into(),
+            title: "Sidebar Title Probe".into(),
+            message_count: 0,
+            archived: false,
+        }]);
+        app.show_sidebar = false;
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(!dump.contains("Sidebar Title Probe"));
+        assert!(!dump.contains("Conversations"));
+    }
+
+    #[test]
+    fn draw_with_sidebar_visible_renders_conversation_titles() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.set_conversations(vec![ConversationSummary {
+            id: "1".into(),
+            title: "Visible Probe".into(),
+            message_count: 0,
+            archived: false,
+        }]);
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(dump.contains("Visible Probe"));
     }
 
     fn app_with_debug_messages(show_debug: bool) -> App {

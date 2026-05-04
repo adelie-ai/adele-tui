@@ -23,6 +23,7 @@ pub enum Action {
     SubmitRename,
     CancelRename,
     ToggleDebug,
+    ToggleSidebar,
 }
 
 /// Handle key events that we intercept before passing to textarea.
@@ -33,6 +34,8 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
 
     // Ctrl combos. Most apply across modes, but in Renaming we forward
     // all Ctrl combos to the rename textarea (Ctrl+a/e/u/k word/line edits).
+    // Note: this shadows tui-textarea's emacs-style Ctrl+B (back one char)
+    // in Editing mode — arrow keys cover that case.
     if ctrl && !matches!(mode, InputMode::Renaming) {
         if matches!(mode, InputMode::Editing) && matches!(key.code, KeyCode::Char('j')) {
             return Some(Action::InsertNewline);
@@ -42,6 +45,7 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
             KeyCode::Char('d') => Some(Action::ScrollDown),
             KeyCode::Char('e') => Some(Action::ScrollToBottom),
             KeyCode::Char('t') => Some(Action::ToggleDebug),
+            KeyCode::Char('b') => Some(Action::ToggleSidebar),
             _ => None,
         };
     }
@@ -504,6 +508,30 @@ mod tests {
                 &InputMode::Editing
             ),
             Some(Action::ToggleDebug)
+        );
+    }
+
+    // --- Sidebar toggle (Ctrl+B) ---
+
+    #[test]
+    fn ctrl_b_toggles_sidebar_in_normal() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('b'), KeyModifiers::CONTROL),
+                &InputMode::Normal
+            ),
+            Some(Action::ToggleSidebar)
+        );
+    }
+
+    #[test]
+    fn ctrl_b_toggles_sidebar_in_editing() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('b'), KeyModifiers::CONTROL),
+                &InputMode::Editing
+            ),
+            Some(Action::ToggleSidebar)
         );
     }
 }

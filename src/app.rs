@@ -91,6 +91,9 @@ pub struct App {
     /// errors. Distinct from `status_message`, which is sticky user-facing
     /// feedback.
     pub assistant_status: Option<String>,
+    /// Whether the conversation list pane is visible. When `false`, the chat
+    /// panel takes the full window width.
+    pub show_sidebar: bool,
 }
 
 impl App {
@@ -113,6 +116,7 @@ impl App {
             renaming_id: None,
             show_debug: false,
             assistant_status: None,
+            show_sidebar: true,
         }
     }
 
