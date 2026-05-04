@@ -24,6 +24,8 @@ const HINTS_NORMAL: &[(&str, &str)] = &[
     ("A", "archive"),
     ("a", "archived"),
     ("q", "quit"),
+    ("Ctrl+K", "kb"),
+    ("F3", "connections"),
     ("Ctrl+B", "sidebar"),
     ("Ctrl+T", "debug"),
 ];

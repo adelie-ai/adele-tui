@@ -1,4 +1,5 @@
 mod app;
+mod connections;
 mod credentials;
 mod kb;
 mod keys;
@@ -299,6 +300,16 @@ async fn run(
             continue;
         }
 
+        if app.connections_requested {
+            app.connections_requested = false;
+            if let Some(client) = client.as_ref() {
+                if let Err(e) = connections::run(terminal, client).await {
+                    app.status_message = format!("Connections error: {e}");
+                }
+            }
+            continue;
+        }
+
         tokio::select! {
             Some(Ok(evt)) = event_stream.next() => {
                 if let Event::Key(key) = evt {
@@ -570,6 +581,13 @@ async fn handle_action(
                 app.kb_requested = true;
             } else {
                 app.status_message = "Not connected — knowledge base unavailable".into();
+            }
+        }
+        Action::OpenConnections => {
+            if client.is_some() {
+                app.connections_requested = true;
+            } else {
+                app.status_message = "Not connected — connections manager unavailable".into();
             }
         }
     }
