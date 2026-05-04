@@ -51,10 +51,12 @@ cargo test
 
 ## Architecture
 
-This repo includes two library crates shared with other Adelie clients:
-
-- `crates/api-model` — Protocol-neutral API types (commands, results, events, WebSocket wire types)
-- `crates/client-common` — WebSocket and D-Bus transport clients, auth resolution, `AssistantClient` trait
+The shared protocol types and transport clients live in
+[`adelie-ai/desktop-assistant`](https://github.com/adelie-ai/desktop-assistant)
+under `crates/api-model` and `crates/client-common`. This repo pulls
+them in as git dependencies so all Adelie clients (TUI, GTK, KDE)
+share one source of truth. `Cargo.lock` pins the exact revision;
+`cargo update` advances it.
 
 ## License
 

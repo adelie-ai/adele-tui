@@ -312,6 +312,7 @@ mod tests {
                     content: "Hi there!".into(),
                 },
             ],
+            model_selection: None,
         });
         terminal.draw(|f| draw(f, &mut app)).unwrap();
     }
@@ -325,6 +326,7 @@ mod tests {
             id: "1".into(),
             title: "Test".into(),
             messages: vec![],
+            model_selection: None,
         });
         app.start_streaming("req1".into());
         app.receive_chunk("req1", "Partial response...");
