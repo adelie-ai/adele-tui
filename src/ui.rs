@@ -1,9 +1,9 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use crate::app::{App, InputMode};
@@ -32,6 +32,10 @@ fn mode_chip_style(mode: &InputMode) -> Style {
             .fg(Color::Black)
             .bg(Color::Rgb(120, 214, 118))
             .add_modifier(Modifier::BOLD),
+        InputMode::Renaming => Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(255, 189, 89))
+            .add_modifier(Modifier::BOLD),
     }
 }
 
@@ -52,6 +56,43 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     draw_conversation_list(f, app, chunks[0]);
     draw_chat_panel(f, app, chunks[1]);
+
+    if matches!(app.mode, InputMode::Renaming) {
+        draw_rename_popup(f, app, f.area());
+    }
+}
+
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
+}
+
+fn draw_rename_popup(f: &mut Frame, app: &mut App, area: Rect) {
+    let popup_width = area.width.saturating_sub(8).clamp(20, 72);
+    let popup = centered_rect(popup_width, 3, area);
+
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Rgb(255, 189, 89)))
+        .title(Line::from(Span::styled(
+            "Rename (Enter save, Esc cancel)",
+            Style::default()
+                .fg(Color::Rgb(255, 220, 160))
+                .add_modifier(Modifier::BOLD),
+        )));
+
+    app.rename_textarea.set_block(block);
+    f.render_widget(&app.rename_textarea, popup);
 }
 
 fn draw_conversation_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -224,6 +265,7 @@ fn draw_input(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             "Input (Esc cancel, Enter send, Shift+Enter/Ctrl+J newline)",
             COLOR_INPUT_BORDER_EDIT,
         ),
+        InputMode::Renaming => ("Input", COLOR_INPUT_BORDER_IDLE),
     };
 
     app.textarea.set_block(
@@ -243,6 +285,7 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let mode_str = match app.mode {
         InputMode::Normal => "NORMAL",
         InputMode::Editing => "EDITING",
+        InputMode::Renaming => "RENAME",
     };
 
     let status = Paragraph::new(Line::from(vec![
@@ -357,6 +400,22 @@ mod tests {
         let backend = TestBackend::new(20, 8);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn draw_rename_popup_does_not_panic() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.set_conversations(vec![ConversationSummary {
+            id: "1".into(),
+            title: "Chat 1".into(),
+            message_count: 0,
+            archived: false,
+        }]);
+        app.selected_conversation = Some(0);
+        app.begin_rename();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
     }
 }
