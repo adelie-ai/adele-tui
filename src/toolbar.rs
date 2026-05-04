@@ -26,6 +26,7 @@ const HINTS_NORMAL: &[(&str, &str)] = &[
     ("q", "quit"),
     ("Ctrl+K", "kb"),
     ("F3", "connections"),
+    ("F4", "purposes"),
     ("Ctrl+B", "sidebar"),
     ("Ctrl+T", "debug"),
 ];

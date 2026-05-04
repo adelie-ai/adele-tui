@@ -7,6 +7,7 @@ pub mod markdown;
 pub mod oauth;
 pub mod picker;
 pub mod profile;
+pub mod purposes;
 pub mod settings;
 pub mod toolbar;
 pub mod ui;

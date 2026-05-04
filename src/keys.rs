@@ -27,6 +27,7 @@ pub enum Action {
     SwitchConnection,
     OpenKnowledgeBase,
     OpenConnections,
+    OpenPurposes,
 }
 
 /// Handle key events that we intercept before passing to textarea.
@@ -43,6 +44,10 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
     // F3 opens the LLM-provider connections manager.
     if key.code == KeyCode::F(3) && key.modifiers.is_empty() {
         return Some(Action::OpenConnections);
+    }
+    // F4 opens the purposes manager.
+    if key.code == KeyCode::F(4) && key.modifiers.is_empty() {
+        return Some(Action::OpenPurposes);
     }
 
     // Ctrl combos. Most apply across modes, but in Renaming we forward
@@ -606,6 +611,22 @@ mod tests {
         assert_eq!(
             handle_key_event(key(KeyCode::F(3)), &InputMode::Editing),
             Some(Action::OpenConnections)
+        );
+    }
+
+    #[test]
+    fn f4_opens_purposes_in_normal() {
+        assert_eq!(
+            handle_key_event(key(KeyCode::F(4)), &InputMode::Normal),
+            Some(Action::OpenPurposes)
+        );
+    }
+
+    #[test]
+    fn f4_opens_purposes_in_editing() {
+        assert_eq!(
+            handle_key_event(key(KeyCode::F(4)), &InputMode::Editing),
+            Some(Action::OpenPurposes)
         );
     }
 }
