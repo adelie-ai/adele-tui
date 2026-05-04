@@ -44,7 +44,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
-use tui_textarea::{CursorMove, TextArea};
+use ratatui_textarea::{CursorMove, TextArea};
 
 const COLOR_BORDER: Color = Color::Rgb(82, 104, 173);
 const COLOR_BORDER_ACTIVE: Color = Color::Rgb(120, 183, 109);

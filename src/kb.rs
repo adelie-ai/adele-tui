@@ -44,7 +44,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use tokio::time::{Instant, sleep_until};
-use tui_textarea::{CursorMove, TextArea};
+use ratatui_textarea::{CursorMove, TextArea};
 
 const LIST_LIMIT: u32 = 100;
 const SEARCH_LIMIT: u32 = 50;

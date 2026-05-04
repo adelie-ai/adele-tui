@@ -1,6 +1,6 @@
 pub use desktop_assistant_client_common::{ChatMessage, ConversationDetail, ConversationSummary};
 use ratatui::style::Style;
-use tui_textarea::{CursorMove, TextArea};
+use ratatui_textarea::{CursorMove, DataCursor, TextArea};
 
 fn new_textarea() -> TextArea<'static> {
     let mut ta = TextArea::default();
@@ -264,7 +264,7 @@ impl App {
         }
 
         let original_lines = self.textarea.lines().to_vec();
-        let (cursor_row, cursor_col) = self.textarea.cursor();
+        let DataCursor(cursor_row, cursor_col) = self.textarea.cursor();
         let mut wrapped_lines: Vec<String> = Vec::new();
         let mut wrapped_cursor_row = 0usize;
         let mut wrapped_cursor_col = 0usize;

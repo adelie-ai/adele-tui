@@ -18,7 +18,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
-use tui_textarea::{CursorMove, TextArea};
+use ratatui_textarea::{CursorMove, DataCursor, TextArea};
 
 use crate::{
     credentials::{self, CredentialKind},
@@ -990,7 +990,7 @@ fn position_cursor_in_form(f: &mut Frame, state: &PickerState, area: Rect) {
 
     let row = rows[row_idx];
     let inner_row = Block::default().borders(Borders::ALL).inner(row);
-    let (cursor_row, cursor_col) = textarea.cursor();
+    let DataCursor(cursor_row, cursor_col) = textarea.cursor();
     let x = inner_row.x + cursor_col.min(inner_row.width.saturating_sub(1) as usize) as u16;
     let y = inner_row.y + cursor_row.min(inner_row.height.saturating_sub(1) as usize) as u16;
     f.set_cursor_position((x, y));
