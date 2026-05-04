@@ -105,6 +105,13 @@ pub struct App {
     pub connections_requested: bool,
     /// Set when the user asks to open the purposes manager.
     pub purposes_requested: bool,
+    /// Set when the user asks to open the per-conversation model picker.
+    pub model_picker_requested: bool,
+    /// One-shot override staged by the model picker. Applied to the next
+    /// `SendPrompt` and then cleared — the daemon persists it as the
+    /// conversation's `last_model_selection`, so subsequent prompts pick
+    /// it up automatically.
+    pub pending_model_override: Option<desktop_assistant_api_model::SendPromptOverride>,
 }
 
 impl App {
@@ -132,7 +139,35 @@ impl App {
             kb_requested: false,
             connections_requested: false,
             purposes_requested: false,
+            model_picker_requested: false,
+            pending_model_override: None,
         }
+    }
+
+    /// Apply the user's model picker selection to local state so the
+    /// chat title/status reflects it immediately. The override is staged
+    /// for the next prompt; once that prompt fires the daemon persists it
+    /// as `last_model_selection`.
+    pub fn apply_model_override(
+        &mut self,
+        override_selection: desktop_assistant_api_model::SendPromptOverride,
+    ) {
+        if let Some(conv) = self.current_conversation.as_mut() {
+            conv.model_selection =
+                Some(desktop_assistant_api_model::ConversationModelSelectionView {
+                    connection_id: override_selection.connection_id.clone(),
+                    model_id: override_selection.model_id.clone(),
+                    effort: override_selection.effort,
+                });
+        }
+        self.pending_model_override = Some(override_selection);
+    }
+
+    /// Take and clear the pending override. Called once per `SendPrompt`.
+    pub fn take_pending_override(
+        &mut self,
+    ) -> Option<desktop_assistant_api_model::SendPromptOverride> {
+        self.pending_model_override.take()
     }
 
     pub fn set_assistant_status(&mut self, message: impl Into<String>) {
@@ -1010,6 +1045,46 @@ mod tests {
     #[test]
     fn switch_requested_default_false() {
         assert!(!App::new().switch_requested);
+    }
+
+    #[test]
+    fn apply_model_override_updates_current_conversation_and_stages_pending() {
+        let mut app = App::new();
+        app.current_conversation = Some(ConversationDetail {
+            id: "c1".into(),
+            title: "Chat".into(),
+            messages: vec![],
+            model_selection: None,
+        });
+        let ovr = desktop_assistant_api_model::SendPromptOverride {
+            connection_id: "work".into(),
+            model_id: "claude-3-5".into(),
+            effort: None,
+        };
+        app.apply_model_override(ovr.clone());
+        assert!(app.pending_model_override.is_some());
+        let sel = app
+            .current_conversation
+            .as_ref()
+            .unwrap()
+            .model_selection
+            .as_ref()
+            .unwrap();
+        assert_eq!(sel.connection_id, "work");
+        assert_eq!(sel.model_id, "claude-3-5");
+    }
+
+    #[test]
+    fn take_pending_override_clears_after_first_take() {
+        let mut app = App::new();
+        let ovr = desktop_assistant_api_model::SendPromptOverride {
+            connection_id: "a".into(),
+            model_id: "b".into(),
+            effort: None,
+        };
+        app.pending_model_override = Some(ovr);
+        assert!(app.take_pending_override().is_some());
+        assert!(app.take_pending_override().is_none());
     }
 
     // --- Scroll tests ---

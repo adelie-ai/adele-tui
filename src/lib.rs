@@ -6,6 +6,7 @@ pub mod keys;
 pub mod markdown;
 pub mod oauth;
 pub mod picker;
+pub mod model_selector;
 pub mod profile;
 pub mod purposes;
 pub mod settings;

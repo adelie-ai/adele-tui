@@ -6,6 +6,7 @@ mod keys;
 mod markdown;
 mod oauth;
 mod picker;
+mod model_selector;
 mod profile;
 mod purposes;
 mod settings;
@@ -321,6 +322,26 @@ async fn run(
             continue;
         }
 
+        if app.model_picker_requested {
+            app.model_picker_requested = false;
+            if let Some(client) = client.as_ref() {
+                let current = app
+                    .current_conversation
+                    .as_ref()
+                    .and_then(|c| c.model_selection.clone());
+                match model_selector::run(terminal, client, current).await {
+                    Ok(model_selector::Outcome::Selected(picked)) => {
+                        let label = format!("{} · {}", picked.connection_id, picked.model_id);
+                        app.apply_model_override(picked);
+                        app.status_message = format!("Model: {label} (applies to next message)");
+                    }
+                    Ok(model_selector::Outcome::Cancelled) => {}
+                    Err(e) => app.status_message = format!("Model picker error: {e}"),
+                }
+            }
+            continue;
+        }
+
         tokio::select! {
             Some(Ok(evt)) = event_stream.next() => {
                 if let Event::Key(key) = evt {
@@ -481,7 +502,24 @@ async fn handle_action(
             if let Some((conv_id, prompt)) = app.submit_prompt()
                 && let Some(client) = client.as_ref()
             {
-                match client.send_prompt(&conv_id, &prompt).await {
+                let override_selection = app.take_pending_override();
+                // Use the WS override path when one was staged via the
+                // model picker; the trait-level `send_prompt` only takes
+                // the bare prompt. D-Bus + override isn't supported yet —
+                // we fall back to plain send and warn.
+                let result = match (override_selection, client.as_ws()) {
+                    (Some(ovr), Some(ws)) => {
+                        ws.send_prompt_with_override(&conv_id, &prompt, Some(ovr)).await
+                    }
+                    (Some(_), None) => {
+                        app.status_message =
+                            "Model override only works over WebSocket — sent without override"
+                                .into();
+                        client.send_prompt(&conv_id, &prompt).await
+                    }
+                    (None, _) => client.send_prompt(&conv_id, &prompt).await,
+                };
+                match result {
                     Ok(request_id) if request_id.is_empty() => {
                         app.start_streaming_without_request_id()
                     }
@@ -606,6 +644,13 @@ async fn handle_action(
                 app.purposes_requested = true;
             } else {
                 app.status_message = "Not connected — purposes manager unavailable".into();
+            }
+        }
+        Action::OpenModelPicker => {
+            if client.is_some() {
+                app.model_picker_requested = true;
+            } else {
+                app.status_message = "Not connected — model picker unavailable".into();
             }
         }
     }
