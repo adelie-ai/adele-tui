@@ -78,6 +78,9 @@ pub struct App {
     pub scroll_offset: u16,
     /// Whether to include archived conversations in the list.
     pub show_archived: bool,
+    /// Set when the user asks to open the knowledge base. The chat loop
+    /// hands the screen to `kb::run` and resets this flag when KB exits.
+    pub kb_requested: bool,
 }
 
 impl App {
@@ -96,6 +99,7 @@ impl App {
             should_quit: false,
             scroll_offset: 0,
             show_archived: false,
+            kb_requested: false,
         }
     }
 

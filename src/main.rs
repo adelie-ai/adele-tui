@@ -1,4 +1,5 @@
 mod app;
+mod kb;
 mod keys;
 mod ui;
 
@@ -158,6 +159,18 @@ async fn run(
 
         if app.should_quit {
             break;
+        }
+
+        if app.kb_requested {
+            app.kb_requested = false;
+            if let Some(client) = client.as_ref() {
+                if let Err(e) = kb::run(terminal, client).await {
+                    app.status_message = format!("KB error: {e}");
+                }
+            }
+            // Force a redraw on the next iteration so the chat reappears
+            // immediately instead of waiting for the next event.
+            continue;
         }
 
         tokio::select! {
@@ -336,6 +349,13 @@ async fn handle_action(
         Action::ScrollUp => app.scroll_up(5),
         Action::ScrollDown => app.scroll_down(5),
         Action::ScrollToBottom => app.scroll_to_bottom(),
+        Action::OpenKnowledgeBase => {
+            if client.is_some() {
+                app.kb_requested = true;
+            } else {
+                app.status_message = "Not connected — knowledge base unavailable".into();
+            }
+        }
     }
 }
 

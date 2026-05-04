@@ -19,6 +19,7 @@ pub enum Action {
     ScrollDown,
     ScrollToBottom,
     ToggleShowArchived,
+    OpenKnowledgeBase,
 }
 
 /// Handle key events that we intercept before passing to textarea.
@@ -27,7 +28,7 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
-    // Ctrl+u / Ctrl+d / Ctrl+e for scrolling — works in all modes
+    // Ctrl-combos that work in all modes.
     if ctrl {
         if matches!(mode, InputMode::Editing) && matches!(key.code, KeyCode::Char('j')) {
             return Some(Action::InsertNewline);
@@ -36,6 +37,7 @@ pub fn handle_key_event(key: KeyEvent, mode: &InputMode) -> Option<Action> {
             KeyCode::Char('u') => Some(Action::ScrollUp),
             KeyCode::Char('d') => Some(Action::ScrollDown),
             KeyCode::Char('e') => Some(Action::ScrollToBottom),
+            KeyCode::Char('k') => Some(Action::OpenKnowledgeBase),
             _ => None,
         };
     }
@@ -407,6 +409,30 @@ mod tests {
         assert_eq!(
             handle_key_event(key(KeyCode::PageDown), &InputMode::Normal),
             Some(Action::ScrollDown)
+        );
+    }
+
+    // --- Ctrl+K opens KB ---
+
+    #[test]
+    fn ctrl_k_opens_kb_in_normal() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('k'), KeyModifiers::CONTROL),
+                &InputMode::Normal
+            ),
+            Some(Action::OpenKnowledgeBase)
+        );
+    }
+
+    #[test]
+    fn ctrl_k_opens_kb_in_editing() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('k'), KeyModifiers::CONTROL),
+                &InputMode::Editing
+            ),
+            Some(Action::OpenKnowledgeBase)
         );
     }
 }
