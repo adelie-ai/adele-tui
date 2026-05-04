@@ -1,8 +1,10 @@
 //! Saved connection profiles.
 //!
 //! A profile bundles the transport metadata needed to dial a specific
-//! daemon. Credentials are intentionally **not** stored here — those land
-//! in the keyring in #13.
+//! daemon. Credentials live in the system keyring (see
+//! [`crate::credentials`]); the profile only carries non-secret hints
+//! (username, "has a stored password" flags) so the UI can show what
+//! state to expect.
 //!
 //! Persisted to `$XDG_CONFIG_HOME/adele-tui/profiles.json` (or
 //! `~/.config/adele-tui/profiles.json`).
@@ -11,6 +13,8 @@ use std::{env, fs, io, path::PathBuf, time::SystemTime};
 
 use desktop_assistant_client_common::{ConnectionConfig, TransportMode};
 use serde::{Deserialize, Serialize};
+
+use crate::credentials::{self, CredentialKind};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Profile {
@@ -24,6 +28,18 @@ pub struct Profile {
     /// JWT subject claim. Only meaningful when `transport == Ws`.
     #[serde(default)]
     pub ws_subject: String,
+    /// Username for password-based login. `None` means no username/password
+    /// auth — fall back to JWT or anonymous.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// True when a password has been stored in the keyring under this
+    /// profile's id. The actual secret never leaves the keyring.
+    #[serde(default)]
+    pub has_password: bool,
+    /// True when a JWT token has been stored in the keyring under this
+    /// profile's id.
+    #[serde(default)]
+    pub has_jwt: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -42,19 +58,42 @@ impl Profile {
             transport,
             ws_url,
             ws_subject,
+            username: None,
+            has_password: false,
+            has_jwt: false,
         }
     }
 
+    /// Build a connection config, pulling stored credentials from the keyring.
+    /// Keyring failures are silently downgraded to "no credential" — callers
+    /// should still allow CLI/env fallback.
     pub fn to_connection_config(&self) -> ConnectionConfig {
+        let password = if self.has_password {
+            credentials::retrieve(&self.id, CredentialKind::Password).ok()
+        } else {
+            None
+        };
+        let jwt = if self.has_jwt {
+            credentials::retrieve(&self.id, CredentialKind::Jwt).ok()
+        } else {
+            None
+        };
         ConnectionConfig {
             transport_mode: self.transport,
             ws_url: self.ws_url.clone(),
             ws_subject: self.ws_subject.clone(),
-            ws_jwt: None,
-            ws_login_username: None,
-            ws_login_password: None,
+            ws_jwt: jwt,
+            ws_login_username: self.username.clone(),
+            ws_login_password: password,
             ..Default::default()
         }
+    }
+
+    /// Drop any keyring entries associated with this profile. Errors are
+    /// swallowed — there's nothing useful for a caller to do with them.
+    pub fn purge_credentials(&self) {
+        let _ = credentials::delete(&self.id, CredentialKind::Password);
+        let _ = credentials::delete(&self.id, CredentialKind::Jwt);
     }
 
     /// Short display label combining name and URL/transport.
@@ -104,6 +143,9 @@ impl ProfileStore {
         if self.last_used.as_deref() == Some(id) {
             self.last_used = None;
         }
+        // Drop the keyring entries — leaving orphaned secrets after a
+        // delete is a footgun, especially when re-adding under a new id.
+        removed.purge_credentials();
         Some(removed)
     }
 
