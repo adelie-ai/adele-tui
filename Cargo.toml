@@ -31,5 +31,5 @@ url = "2"
 # Shared protocol + transport crates live in the desktop-assistant repo.
 # Cargo resolves the package by name from that workspace; Cargo.lock pins
 # the exact revision for reproducibility.
-desktop-assistant-client-common = { git = "https://github.com/adelie-ai/desktop-assistant.git", branch = "feat/client-common-task-signals" }
-desktop-assistant-api-model = { git = "https://github.com/adelie-ai/desktop-assistant.git", branch = "feat/client-common-task-signals" }
+desktop-assistant-client-common = { git = "https://github.com/adelie-ai/desktop-assistant.git", branch = "main" }
+desktop-assistant-api-model = { git = "https://github.com/adelie-ai/desktop-assistant.git", branch = "main" }
