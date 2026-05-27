@@ -1,29 +1,42 @@
 # Adele TUI
 
-Terminal UI client for the Adelie Desktop Assistant, built with [ratatui](https://ratatui.rs/).
+Terminal UI client for the [Adelie AI Platform](https://github.com/adelie-ai/desktop-assistant),
+built with [ratatui](https://ratatui.rs/).
 
-Connects to the `desktop-assistant-daemon` over WebSocket or D-Bus to provide a full-featured chat interface in the terminal.
+Connects to the `desktop-assistant-daemon` over WebSocket or D-Bus and streams
+chat, tool calls, and background tasks.
+
+## What it does today
+
+- **Streaming chat** with markdown rendering and syntax-highlighted fenced
+  code blocks. Sidebar lists conversations; `Ctrl+B` toggles it.
+- **Per-conversation model selector** (`Ctrl+M`) and **connection switcher**
+  (`F2`) — no daemon restart required.
+- **Connection profiles**, **Connections view**, and **Purposes view** for
+  CRUD over LLM provider configs and assigning a connection/model/effort to
+  each purpose (chat, background, vector).
+- **OAuth2 + PKCE** authentication flow and credentials stored in the system
+  keyring (libsecret / kwallet via the OS).
+- **Knowledge base browser/editor** for the daemon's built-in KB.
+- **Process manager pane** (`Ctrl+P`) — inline overlay listing background
+  tasks streamed from the daemon via `SignalEvent::Task*`; status-bar
+  `(N running)` badge surfaces activity from anywhere in the UI.
+- **Debug view toggle** for tool and system messages, **conversation rename**,
+  **auto-reconnect** with backoff, and a **keybind hint toolbar** at the
+  bottom of the window.
 
 ## Requirements
 
 - Rust toolchain (edition 2024, Rust 1.85+)
 - A running `desktop-assistant-daemon` instance
+- For D-Bus transport, a Linux session bus (`DBUS_SESSION_BUS_ADDRESS`)
 
-For D-Bus transport, a Linux session bus is required (`DBUS_SESSION_BUS_ADDRESS`).
-
-## Build
+## Build and install
 
 ```sh
 cargo build
+cargo install --path .   # installs `adele` to ~/.cargo/bin
 ```
-
-## Install
-
-```sh
-cargo install --path .
-```
-
-This installs the `adele` binary to `~/.cargo/bin/`.
 
 ## Run
 
@@ -53,11 +66,10 @@ cargo test
 
 The shared protocol types and transport clients live in
 [`adelie-ai/desktop-assistant`](https://github.com/adelie-ai/desktop-assistant)
-under `crates/api-model` and `crates/client-common`. This repo pulls
-them in as git dependencies so all Adelie clients (TUI, GTK, KDE)
-share one source of truth. `Cargo.lock` pins the exact revision;
-`cargo update` advances it.
+under `crates/api-model` and `crates/client-common`. This repo pulls them in
+as git dependencies so all Adele clients (TUI, GTK, KDE) share one source of
+truth. `Cargo.lock` pins the exact revision; `cargo update` advances it.
 
 ## License
 
-Licensed under **GNU Affero General Public License v3.0 or later** (`AGPL-3.0-or-later`).
+GNU Affero General Public License v3.0 or later (`AGPL-3.0-or-later`).
