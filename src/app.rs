@@ -1,6 +1,9 @@
 pub use desktop_assistant_client_common::{ChatMessage, ConversationDetail, ConversationSummary};
+use desktop_assistant_api_model::TaskId;
 use ratatui::style::Style;
 use ratatui_textarea::{CursorMove, DataCursor, TextArea};
+
+use crate::tasks::TaskPane;
 
 fn new_textarea() -> TextArea<'static> {
     let mut ta = TextArea::default();
@@ -112,6 +115,16 @@ pub struct App {
     /// conversation's `last_model_selection`, so subsequent prompts pick
     /// it up automatically.
     pub pending_model_override: Option<desktop_assistant_api_model::SendPromptOverride>,
+    /// Process-manager (background tasks) state. Always present but
+    /// only rendered when `tasks.visible == true`. Populated at connect
+    /// time via `ListBackgroundTasks` + `SubscribeBackgroundTasks` and
+    /// kept fresh by `SignalEvent::Task*` variants in the main loop.
+    pub tasks: TaskPane,
+    /// Pending request id of an in-flight `CancelBackgroundTask`. The
+    /// terminal `TaskCompleted { status: Cancelled }` event is what
+    /// actually closes the loop; this is purely so the status bar can
+    /// say "cancelling t-1..." while we wait.
+    pub pending_task_cancel: Option<TaskId>,
 }
 
 impl App {
@@ -141,7 +154,62 @@ impl App {
             purposes_requested: false,
             model_picker_requested: false,
             pending_model_override: None,
+            tasks: TaskPane::new(),
+            pending_task_cancel: None,
         }
+    }
+
+    // --- Tasks-pane glue ---
+    //
+    // The actual mutation logic lives in `TaskPane`; these methods exist
+    // so main.rs can drive UI actions ("toggle the pane", "switch to the
+    // conversation linked to the selected task") without having to reach
+    // through `app.tasks` for every operation.
+
+    /// Toggle the process-manager overlay.
+    pub fn toggle_tasks_pane(&mut self) {
+        self.tasks.toggle();
+    }
+
+    /// Select the conversation linked to the currently-highlighted task,
+    /// closing the pane on success. Returns the conversation id so the
+    /// caller can fetch the conversation detail from the daemon. `None`
+    /// when the selected task has no linked conversation (or nothing is
+    /// selected).
+    pub fn jump_to_selected_task_conversation(&mut self) -> Option<String> {
+        let row = self.tasks.selected_row()?;
+        let conv_id = row.conversation_id.clone()?;
+        // Move sidebar selection to the linked conversation if it's
+        // present in the local list. Loading the detail itself is
+        // main's responsibility (it needs the WS client).
+        if let Some(idx) = self.conversations.iter().position(|c| c.id == conv_id) {
+            self.selected_conversation = Some(idx);
+        }
+        self.tasks.visible = false;
+        Some(conv_id)
+    }
+
+    /// Stage a `CancelBackgroundTask` for the highlighted task. Returns
+    /// the task id so the caller can fire the command. `None` when
+    /// nothing is selected or the task is already terminal.
+    pub fn request_cancel_selected_task(&mut self) -> Option<TaskId> {
+        let row = self.tasks.selected_row()?;
+        // Don't fire cancellations against terminal states — the
+        // daemon would reject them anyway and we'd spin in the status
+        // bar.
+        if matches!(
+            row.status,
+            desktop_assistant_api_model::TaskStatus::Completed
+                | desktop_assistant_api_model::TaskStatus::Failed
+                | desktop_assistant_api_model::TaskStatus::Cancelled
+        ) {
+            self.status_message = format!("Task {} is already terminal", row.id);
+            return None;
+        }
+        let id = row.id.clone();
+        self.pending_task_cancel = Some(id.clone());
+        self.status_message = format!("Cancelling {id}...");
+        Some(id)
     }
 
     /// Apply the user's model picker selection to local state so the
@@ -1133,5 +1201,144 @@ mod tests {
         app.textarea.insert_str("hello");
         app.submit_prompt();
         assert_eq!(app.scroll_offset, 0);
+    }
+
+    // --- Tasks pane integration ---
+
+    fn standalone_view(id: &str, conv_id: &str, title: &str) -> desktop_assistant_api_model::TaskView {
+        desktop_assistant_api_model::TaskView {
+            id: desktop_assistant_api_model::TaskId(id.into()),
+            kind: desktop_assistant_api_model::TaskKind::Standalone {
+                name: title.into(),
+                conversation_id: conv_id.into(),
+            },
+            status: desktop_assistant_api_model::TaskStatus::Running,
+            started_at: 1,
+            ended_at: None,
+            last_error: None,
+            parent: None,
+            children: Vec::new(),
+            title: title.into(),
+            progress_hint: None,
+        }
+    }
+
+    #[test]
+    fn keybind_toggles_pane_visibility() {
+        let mut app = App::new();
+        assert!(!app.tasks.visible);
+        app.toggle_tasks_pane();
+        assert!(app.tasks.visible);
+        app.toggle_tasks_pane();
+        assert!(!app.tasks.visible);
+    }
+
+    #[test]
+    fn pressing_enter_on_selection_switches_to_linked_conversation() {
+        let mut app = App::new();
+        app.set_conversations(vec![
+            ConversationSummary {
+                id: "conv-1".into(),
+                title: "Other".into(),
+                message_count: 0,
+                archived: false,
+            },
+            ConversationSummary {
+                id: "conv-x".into(),
+                title: "Linked".into(),
+                message_count: 0,
+                archived: false,
+            },
+        ]);
+        app.tasks
+            .apply_task_started(standalone_view("t-1", "conv-x", "Researcher"));
+        app.tasks.visible = true;
+        app.tasks.selected = Some(desktop_assistant_api_model::TaskId("t-1".into()));
+
+        let conv = app.jump_to_selected_task_conversation();
+        assert_eq!(conv.as_deref(), Some("conv-x"));
+        assert_eq!(app.selected_conversation, Some(1));
+        assert!(!app.tasks.visible);
+    }
+
+    #[test]
+    fn jump_to_selected_task_conversation_returns_id_even_when_not_in_sidebar() {
+        // The conversation may have been archived out of the visible
+        // sidebar list. We still return its id so main.rs can fetch the
+        // detail; the sidebar selection just stays where it was.
+        let mut app = App::new();
+        app.tasks
+            .apply_task_started(standalone_view("t-1", "archived-conv", "Researcher"));
+        app.tasks.selected = Some(desktop_assistant_api_model::TaskId("t-1".into()));
+
+        let conv = app.jump_to_selected_task_conversation();
+        assert_eq!(conv.as_deref(), Some("archived-conv"));
+        assert_eq!(app.selected_conversation, None);
+    }
+
+    #[test]
+    fn pressing_c_on_selection_requests_cancel_command() {
+        let mut app = App::new();
+        app.tasks
+            .apply_task_started(standalone_view("t-1", "conv-x", "Researcher"));
+        app.tasks.selected = Some(desktop_assistant_api_model::TaskId("t-1".into()));
+
+        let id = app.request_cancel_selected_task();
+        assert_eq!(
+            id,
+            Some(desktop_assistant_api_model::TaskId("t-1".into()))
+        );
+        assert_eq!(
+            app.pending_task_cancel,
+            Some(desktop_assistant_api_model::TaskId("t-1".into()))
+        );
+        assert!(app.status_message.starts_with("Cancelling"));
+    }
+
+    #[test]
+    fn cancelling_a_terminal_task_is_a_noop() {
+        let mut app = App::new();
+        app.tasks
+            .apply_task_started(standalone_view("t-1", "conv-x", "Researcher"));
+        app.tasks
+            .apply_task_completed("t-1", desktop_assistant_api_model::TaskStatus::Completed, None);
+        app.tasks.selected = Some(desktop_assistant_api_model::TaskId("t-1".into()));
+
+        let id = app.request_cancel_selected_task();
+        assert!(id.is_none());
+        assert!(app.pending_task_cancel.is_none());
+        assert!(app.status_message.contains("already terminal"));
+    }
+
+    #[test]
+    fn cancel_with_no_selection_is_a_noop() {
+        let mut app = App::new();
+        let id = app.request_cancel_selected_task();
+        assert!(id.is_none());
+    }
+
+    #[test]
+    fn business_outcome_user_sees_their_spawned_standalone_agent_in_the_list_with_correct_title() {
+        // End-to-end happy path: the daemon emits a `TaskStarted` event
+        // for a user-initiated standalone agent. The TUI's pane must
+        // contain a row with the agent's title, its conversation id,
+        // and Running status — without any further round-trip.
+        let mut app = App::new();
+        let view = standalone_view("t-42", "spawned-conv", "Researcher: pricing data");
+        app.tasks.apply_task_started(view);
+
+        let row = app
+            .tasks
+            .tasks
+            .get(&desktop_assistant_api_model::TaskId("t-42".into()))
+            .expect("row should be present after TaskStarted");
+        assert_eq!(row.title, "Researcher: pricing data");
+        assert_eq!(row.conversation_id.as_deref(), Some("spawned-conv"));
+        assert!(matches!(
+            row.status,
+            desktop_assistant_api_model::TaskStatus::Running
+        ));
+        // The running badge should now reflect the count.
+        assert_eq!(crate::tasks::running_badge(&app.tasks), "(1 running)");
     }
 }
