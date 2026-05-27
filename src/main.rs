@@ -10,6 +10,7 @@ mod model_selector;
 mod profile;
 mod purposes;
 mod settings;
+mod tasks;
 mod toolbar;
 mod ui;
 
@@ -267,6 +268,7 @@ async fn run(
                 Ok(convs) => app.set_conversations(convs),
                 Err(e) => app.status_message = format!("Error loading conversations: {e}"),
             }
+            init_background_tasks(&mut app, &transport_client).await;
             app.status_message = transport_label(config);
             client = Some(transport_client);
             signal_rx = rx;
@@ -355,7 +357,7 @@ async fn run(
                     if key.kind == KeyEventKind::Release {
                         continue;
                     }
-                    if let Some(action) = handle_key_event(key, &app.mode) {
+                    if let Some(action) = handle_key_event(key, &app.mode, app.tasks.visible) {
                         handle_action(&mut app, &client, action).await;
                     } else {
                         match app.mode {
@@ -403,6 +405,29 @@ async fn run(
                         // with the per-conversation model selector (#1).
                         app.status_message = format!("Warning: {warning:?}");
                     }
+                    // --- Background task events (issue #45 / desktop-assistant#114) ---
+                    //
+                    // Each event is forwarded verbatim into `app.tasks`. The
+                    // map's invariants are enforced inside `TaskPane` so this
+                    // call site stays one-liner-thin.
+                    SignalEvent::TaskStarted { task } => {
+                        app.tasks.apply_task_started(task);
+                    }
+                    SignalEvent::TaskProgress { id, progress_hint } => {
+                        app.tasks.apply_task_progress(&id, progress_hint);
+                    }
+                    SignalEvent::TaskLogAppended { id, entry } => {
+                        app.tasks.apply_task_log_appended(&id, entry);
+                    }
+                    SignalEvent::TaskCompleted { id, status, last_error } => {
+                        // Clear the cancel spinner if we were waiting on this
+                        // task. The terminal status (`Cancelled`/`Completed`/
+                        // `Failed`) is the authoritative resolution.
+                        if app.pending_task_cancel.as_ref().map(|t| t.0.as_str()) == Some(id.as_str()) {
+                            app.pending_task_cancel = None;
+                        }
+                        app.tasks.apply_task_completed(&id, status, last_error);
+                    }
                 }
             }
             _ = async {
@@ -422,6 +447,7 @@ async fn run(
                             Ok(convs) => app.set_conversations(convs),
                             Err(e) => app.status_message = format!("Error loading conversations: {e}"),
                         }
+                        init_background_tasks(&mut app, &transport_client).await;
                         client = Some(transport_client);
                         signal_rx = rx;
                         reconnect = ReconnectState::Connected;
@@ -660,6 +686,85 @@ async fn handle_action(
                 app.status_message = "Not connected — model picker unavailable".into();
             }
         }
+        Action::ToggleTasksPane => {
+            app.toggle_tasks_pane();
+            app.status_message = if app.tasks.visible {
+                "Tasks pane open (j/k navigate · c cancel · Enter open conv · Ctrl+P close)"
+                    .into()
+            } else {
+                "Tasks pane closed".into()
+            };
+        }
+        Action::NextTask => app.tasks.move_selection(1),
+        Action::PreviousTask => app.tasks.move_selection(-1),
+        Action::CancelSelectedTask => {
+            if let Some(id) = app.request_cancel_selected_task()
+                && let Some(client) = client.as_ref()
+                && let Some(ws) = client.as_ws()
+            {
+                let cmd = desktop_assistant_api_model::Command::CancelBackgroundTask {
+                    id: id.0.clone(),
+                };
+                match ws.send_command(cmd).await {
+                    Ok(_) => {
+                        // Status will move to "Cancelling..." then resolve
+                        // when `TaskCompleted { status: Cancelled }` arrives.
+                    }
+                    Err(e) => {
+                        app.status_message = format!("Cancel failed: {e}");
+                        app.pending_task_cancel = None;
+                    }
+                }
+            }
+        }
+        Action::OpenSelectedTaskConversation => {
+            if let Some(conv_id) = app.jump_to_selected_task_conversation()
+                && let Some(client) = client.as_ref()
+            {
+                match client.get_conversation(&conv_id).await {
+                    Ok(detail) => {
+                        app.load_conversation(detail);
+                    }
+                    Err(e) => app.status_message = format!("Open conversation error: {e}"),
+                }
+            }
+        }
+    }
+}
+
+/// Populate the tasks pane with a daemon snapshot and subscribe to live
+/// events. Failure is non-fatal — the chat still works without the
+/// process-manager pane, so we surface a status hint and move on.
+///
+/// Both commands only exist over WS today. Over D-Bus the call quietly
+/// no-ops; the pane will simply stay empty.
+async fn init_background_tasks(
+    app: &mut App,
+    client: &desktop_assistant_client_common::TransportClient,
+) {
+    let Some(ws) = client.as_ws() else {
+        return;
+    };
+    let list = desktop_assistant_api_model::Command::ListBackgroundTasks {
+        include_finished: false,
+        limit: None,
+    };
+    match ws.send_command(list).await {
+        Ok(desktop_assistant_api_model::CommandResult::BackgroundTasks(tasks)) => {
+            app.tasks.set_initial(tasks);
+        }
+        Ok(other) => {
+            app.status_message = format!("Unexpected ListBackgroundTasks response: {other:?}");
+        }
+        Err(e) => {
+            app.status_message = format!("Tasks snapshot failed: {e}");
+        }
+    }
+    if let Err(e) = ws
+        .send_command(desktop_assistant_api_model::Command::SubscribeBackgroundTasks)
+        .await
+    {
+        app.status_message = format!("Tasks subscribe failed: {e}");
     }
 }
 

@@ -10,5 +10,6 @@ pub mod model_selector;
 pub mod profile;
 pub mod purposes;
 pub mod settings;
+pub mod tasks;
 pub mod toolbar;
 pub mod ui;

@@ -66,6 +66,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if matches!(app.mode, InputMode::Renaming) {
         draw_rename_popup(f, app, f.area());
     }
+
+    // Tasks pane overlays on top of the chat (and any rename popup —
+    // it's strictly modal). Rendered last so it's on top.
+    if app.tasks.visible {
+        crate::tasks::draw_overlay(f, &app.tasks, f.area());
+    }
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -417,16 +423,30 @@ fn draw_input(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
 }
 
 fn draw_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    if app.status_message.is_empty() {
+    let badge = if app.tasks.visible {
+        String::new()
+    } else {
+        crate::tasks::running_badge(&app.tasks)
+    };
+    if app.status_message.is_empty() && badge.is_empty() {
         return;
     }
-    let status = Paragraph::new(Line::from(vec![
-        Span::styled(" • ", Style::default().fg(COLOR_STATUS_DIM)),
-        Span::styled(
-            app.status_message.as_str(),
-            Style::default().fg(Color::White),
-        ),
-    ]));
+    let mut spans: Vec<Span> = Vec::with_capacity(4);
+    spans.push(Span::styled(" • ", Style::default().fg(COLOR_STATUS_DIM)));
+    spans.push(Span::styled(
+        app.status_message.as_str(),
+        Style::default().fg(Color::White),
+    ));
+    if !badge.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            badge,
+            Style::default()
+                .fg(Color::Rgb(122, 163, 255))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let status = Paragraph::new(Line::from(spans));
     f.render_widget(status, area);
 }
 
