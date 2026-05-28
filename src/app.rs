@@ -191,21 +191,10 @@ impl App {
 
     /// Stage a `CancelBackgroundTask` for the highlighted task. Returns
     /// the task id so the caller can fire the command. `None` when
-    /// nothing is selected or the task is already terminal.
+    /// nothing is selected — terminal rows are evicted from the pane,
+    /// so a selected row is always cancellable.
     pub fn request_cancel_selected_task(&mut self) -> Option<TaskId> {
         let row = self.tasks.selected_row()?;
-        // Don't fire cancellations against terminal states — the
-        // daemon would reject them anyway and we'd spin in the status
-        // bar.
-        if matches!(
-            row.status,
-            desktop_assistant_api_model::TaskStatus::Completed
-                | desktop_assistant_api_model::TaskStatus::Failed
-                | desktop_assistant_api_model::TaskStatus::Cancelled
-        ) {
-            self.status_message = format!("Task {} is already terminal", row.id);
-            return None;
-        }
         let id = row.id.clone();
         self.pending_task_cancel = Some(id.clone());
         self.status_message = format!("Cancelling {id}...");
@@ -1349,18 +1338,25 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_a_terminal_task_is_a_noop() {
+    fn cancelling_after_task_completes_finds_nothing_because_row_was_evicted() {
+        // With terminal-row eviction, a completed task disappears from
+        // the pane. A subsequent cancel request finds no selected row
+        // and returns silently — there is no "already terminal" branch
+        // to hit because terminal rows can't exist.
         let mut app = App::new();
         app.tasks
             .apply_task_started(standalone_view("t-1", "conv-x", "Researcher"));
-        app.tasks
-            .apply_task_completed("t-1", desktop_assistant_api_model::TaskStatus::Completed, None);
         app.tasks.selected = Some(desktop_assistant_api_model::TaskId("t-1".into()));
+        app.tasks.apply_task_completed("t-1");
 
+        assert!(
+            !app.tasks
+                .tasks
+                .contains_key(&desktop_assistant_api_model::TaskId("t-1".into()))
+        );
         let id = app.request_cancel_selected_task();
         assert!(id.is_none());
         assert!(app.pending_task_cancel.is_none());
-        assert!(app.status_message.contains("already terminal"));
     }
 
     #[test]

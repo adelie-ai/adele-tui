@@ -419,14 +419,14 @@ async fn run(
                     SignalEvent::TaskLogAppended { id, entry } => {
                         app.tasks.apply_task_log_appended(&id, entry);
                     }
-                    SignalEvent::TaskCompleted { id, status, last_error } => {
+                    SignalEvent::TaskCompleted { id, .. } => {
                         // Clear the cancel spinner if we were waiting on this
-                        // task. The terminal status (`Cancelled`/`Completed`/
-                        // `Failed`) is the authoritative resolution.
+                        // task; the terminal event is the authoritative
+                        // resolution.
                         if app.pending_task_cancel.as_ref().map(|t| t.0.as_str()) == Some(id.as_str()) {
                             app.pending_task_cancel = None;
                         }
-                        app.tasks.apply_task_completed(&id, status, last_error);
+                        app.tasks.apply_task_completed(&id);
                     }
                 }
             }
