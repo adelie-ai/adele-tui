@@ -403,16 +403,11 @@ impl App {
     /// The wire value is either a `task_id` (post-desktop-assistant #114
     /// `SendMessageAck`) or an empty string (legacy `Ack`). Neither is the
     /// chunk-stream `request_id` — that is server-generated and arrives
-    /// embedded in the first `AssistantDelta`. See issue #52.
-    pub fn apply_prompt_ack(&mut self, task_id: String) {
-        // BUG (#52): we currently store the ack value as if it were the
-        // chunk-stream request_id. The failing test below proves chunks
-        // with the real (different) server request_id get dropped.
-        if task_id.is_empty() {
-            self.start_streaming_without_request_id();
-        } else {
-            self.start_streaming(task_id);
-        }
+    /// embedded in the first `AssistantDelta`. We therefore ignore the
+    /// ack payload and seed the sentinel; the first chunk claims it via
+    /// `stream_matches_or_claims_request_id`. See issue #52.
+    pub fn apply_prompt_ack(&mut self, _task_id: String) {
+        self.start_streaming_without_request_id();
     }
 
     fn stream_matches_or_claims_request_id(&mut self, request_id: &str) -> bool {
