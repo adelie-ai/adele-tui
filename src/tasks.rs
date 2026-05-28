@@ -585,22 +585,66 @@ mod tests {
     }
 
     #[test]
-    fn task_completed_event_updates_status_badge() {
+    fn task_completed_event_removes_row() {
         let mut pane = TaskPane::new();
         pane.apply_task_started(view("t-1", "Researcher", TaskStatus::Running));
         pane.apply_task_completed("t-1", TaskStatus::Completed, None);
-        let row = pane.tasks.get(&TaskId("t-1".into())).unwrap();
-        assert!(matches!(row.status, TaskStatus::Completed));
+        assert!(!pane.tasks.contains_key(&TaskId("t-1".into())));
     }
 
     #[test]
-    fn task_completed_with_failure_records_last_error() {
+    fn task_failed_event_removes_row() {
         let mut pane = TaskPane::new();
         pane.apply_task_started(view("t-1", "Researcher", TaskStatus::Running));
         pane.apply_task_completed("t-1", TaskStatus::Failed, Some("LLM timed out".into()));
-        let row = pane.tasks.get(&TaskId("t-1".into())).unwrap();
-        assert!(matches!(row.status, TaskStatus::Failed));
-        assert_eq!(row.last_error.as_deref(), Some("LLM timed out"));
+        assert!(!pane.tasks.contains_key(&TaskId("t-1".into())));
+    }
+
+    #[test]
+    fn task_cancelled_event_removes_row() {
+        let mut pane = TaskPane::new();
+        pane.apply_task_started(view("t-1", "Researcher", TaskStatus::Running));
+        pane.apply_task_completed("t-1", TaskStatus::Cancelled, None);
+        assert!(!pane.tasks.contains_key(&TaskId("t-1".into())));
+    }
+
+    #[test]
+    fn task_completed_drops_log_buffer() {
+        let mut pane = TaskPane::new();
+        pane.apply_task_started(view("t-1", "Researcher", TaskStatus::Running));
+        pane.apply_task_log_appended("t-1", log(1, "hello"));
+        pane.apply_task_log_appended("t-1", log(2, "world"));
+        pane.apply_task_completed("t-1", TaskStatus::Completed, None);
+        assert!(!pane.task_logs.contains_key(&TaskId("t-1".into())));
+    }
+
+    #[test]
+    fn task_completed_advances_selection_when_selected_row_evicted() {
+        let mut pane = TaskPane::new();
+        pane.apply_task_started(view("t-1", "Alpha", TaskStatus::Running));
+        pane.apply_task_started(view("t-2", "Beta", TaskStatus::Running));
+        pane.selected = Some(TaskId("t-1".into()));
+        pane.apply_task_completed("t-1", TaskStatus::Completed, None);
+        assert_eq!(pane.selected.as_ref(), Some(&TaskId("t-2".into())));
+    }
+
+    #[test]
+    fn task_completed_clears_selection_when_last_row_evicted() {
+        let mut pane = TaskPane::new();
+        pane.apply_task_started(view("t-1", "Solo", TaskStatus::Running));
+        pane.selected = Some(TaskId("t-1".into()));
+        pane.apply_task_completed("t-1", TaskStatus::Completed, None);
+        assert!(pane.selected.is_none());
+    }
+
+    #[test]
+    fn task_completed_leaves_other_selection_alone() {
+        let mut pane = TaskPane::new();
+        pane.apply_task_started(view("t-1", "Alpha", TaskStatus::Running));
+        pane.apply_task_started(view("t-2", "Beta", TaskStatus::Running));
+        pane.selected = Some(TaskId("t-2".into()));
+        pane.apply_task_completed("t-1", TaskStatus::Completed, None);
+        assert_eq!(pane.selected.as_ref(), Some(&TaskId("t-2".into())));
     }
 
     #[test]

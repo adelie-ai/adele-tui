@@ -1349,18 +1349,26 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_a_terminal_task_is_a_noop() {
+    fn cancelling_after_task_completes_finds_nothing_because_row_was_evicted() {
+        // With terminal-row eviction, a completed task disappears from
+        // the pane. A subsequent cancel request finds no selected row
+        // and returns silently — there is no "already terminal" branch
+        // to hit because terminal rows can't exist.
         let mut app = App::new();
         app.tasks
             .apply_task_started(standalone_view("t-1", "conv-x", "Researcher"));
+        app.tasks.selected = Some(desktop_assistant_api_model::TaskId("t-1".into()));
         app.tasks
             .apply_task_completed("t-1", desktop_assistant_api_model::TaskStatus::Completed, None);
-        app.tasks.selected = Some(desktop_assistant_api_model::TaskId("t-1".into()));
 
+        assert!(
+            !app.tasks
+                .tasks
+                .contains_key(&desktop_assistant_api_model::TaskId("t-1".into()))
+        );
         let id = app.request_cancel_selected_task();
         assert!(id.is_none());
         assert!(app.pending_task_cancel.is_none());
-        assert!(app.status_message.contains("already terminal"));
     }
 
     #[test]
