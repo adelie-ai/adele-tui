@@ -164,19 +164,12 @@ impl TaskPane {
         }
     }
 
-    pub fn apply_task_completed(
-        &mut self,
-        id: &str,
-        status: TaskStatus,
-        last_error: Option<String>,
-    ) {
+    pub fn apply_task_completed(&mut self, id: &str) {
         let key = TaskId(id.to_string());
-        if let Some(row) = self.tasks.get_mut(&key) {
-            row.status = status;
-            row.last_error = last_error;
-            // `ended_at` is set lazily on the next snapshot; the daemon
-            // is the authoritative source. We don't fabricate a
-            // timestamp here.
+        let removed = self.tasks.remove(&key).is_some();
+        self.task_logs.remove(&key);
+        if removed && self.selected.as_ref() == Some(&key) {
+            self.normalize_selection();
         }
     }
 
@@ -588,7 +581,7 @@ mod tests {
     fn task_completed_event_removes_row() {
         let mut pane = TaskPane::new();
         pane.apply_task_started(view("t-1", "Researcher", TaskStatus::Running));
-        pane.apply_task_completed("t-1", TaskStatus::Completed, None);
+        pane.apply_task_completed("t-1");
         assert!(!pane.tasks.contains_key(&TaskId("t-1".into())));
     }
 
@@ -596,7 +589,7 @@ mod tests {
     fn task_failed_event_removes_row() {
         let mut pane = TaskPane::new();
         pane.apply_task_started(view("t-1", "Researcher", TaskStatus::Running));
-        pane.apply_task_completed("t-1", TaskStatus::Failed, Some("LLM timed out".into()));
+        pane.apply_task_completed("t-1");
         assert!(!pane.tasks.contains_key(&TaskId("t-1".into())));
     }
 
@@ -604,7 +597,7 @@ mod tests {
     fn task_cancelled_event_removes_row() {
         let mut pane = TaskPane::new();
         pane.apply_task_started(view("t-1", "Researcher", TaskStatus::Running));
-        pane.apply_task_completed("t-1", TaskStatus::Cancelled, None);
+        pane.apply_task_completed("t-1");
         assert!(!pane.tasks.contains_key(&TaskId("t-1".into())));
     }
 
@@ -614,7 +607,7 @@ mod tests {
         pane.apply_task_started(view("t-1", "Researcher", TaskStatus::Running));
         pane.apply_task_log_appended("t-1", log(1, "hello"));
         pane.apply_task_log_appended("t-1", log(2, "world"));
-        pane.apply_task_completed("t-1", TaskStatus::Completed, None);
+        pane.apply_task_completed("t-1");
         assert!(!pane.task_logs.contains_key(&TaskId("t-1".into())));
     }
 
@@ -624,7 +617,7 @@ mod tests {
         pane.apply_task_started(view("t-1", "Alpha", TaskStatus::Running));
         pane.apply_task_started(view("t-2", "Beta", TaskStatus::Running));
         pane.selected = Some(TaskId("t-1".into()));
-        pane.apply_task_completed("t-1", TaskStatus::Completed, None);
+        pane.apply_task_completed("t-1");
         assert_eq!(pane.selected.as_ref(), Some(&TaskId("t-2".into())));
     }
 
@@ -633,7 +626,7 @@ mod tests {
         let mut pane = TaskPane::new();
         pane.apply_task_started(view("t-1", "Solo", TaskStatus::Running));
         pane.selected = Some(TaskId("t-1".into()));
-        pane.apply_task_completed("t-1", TaskStatus::Completed, None);
+        pane.apply_task_completed("t-1");
         assert!(pane.selected.is_none());
     }
 
@@ -643,7 +636,7 @@ mod tests {
         pane.apply_task_started(view("t-1", "Alpha", TaskStatus::Running));
         pane.apply_task_started(view("t-2", "Beta", TaskStatus::Running));
         pane.selected = Some(TaskId("t-2".into()));
-        pane.apply_task_completed("t-1", TaskStatus::Completed, None);
+        pane.apply_task_completed("t-1");
         assert_eq!(pane.selected.as_ref(), Some(&TaskId("t-2".into())));
     }
 
@@ -679,7 +672,7 @@ mod tests {
     #[test]
     fn task_completed_for_unknown_id_is_benign() {
         let mut pane = TaskPane::new();
-        pane.apply_task_completed("missing", TaskStatus::Completed, None);
+        pane.apply_task_completed("missing");
         assert!(pane.tasks.is_empty());
     }
 
