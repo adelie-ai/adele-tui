@@ -553,10 +553,7 @@ async fn handle_action(
                     (None, _) => client.send_prompt(&conv_id, &prompt).await,
                 };
                 match result {
-                    Ok(request_id) if request_id.is_empty() => {
-                        app.start_streaming_without_request_id()
-                    }
-                    Ok(request_id) => app.start_streaming(request_id),
+                    Ok(task_id) => app.apply_prompt_ack(task_id),
                     Err(e) => app.status_message = format!("Send error: {e}"),
                 }
             }

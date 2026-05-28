@@ -398,6 +398,23 @@ impl App {
         self.start_streaming(Self::PENDING_STREAM_REQUEST_ID.to_string());
     }
 
+    /// Apply the result of a `send_prompt` ack from the daemon.
+    ///
+    /// The wire value is either a `task_id` (post-desktop-assistant #114
+    /// `SendMessageAck`) or an empty string (legacy `Ack`). Neither is the
+    /// chunk-stream `request_id` — that is server-generated and arrives
+    /// embedded in the first `AssistantDelta`. See issue #52.
+    pub fn apply_prompt_ack(&mut self, task_id: String) {
+        // BUG (#52): we currently store the ack value as if it were the
+        // chunk-stream request_id. The failing test below proves chunks
+        // with the real (different) server request_id get dropped.
+        if task_id.is_empty() {
+            self.start_streaming_without_request_id();
+        } else {
+            self.start_streaming(task_id);
+        }
+    }
+
     fn stream_matches_or_claims_request_id(&mut self, request_id: &str) -> bool {
         match self.pending_request_id.as_deref() {
             Some(Self::PENDING_STREAM_REQUEST_ID) => {
@@ -917,6 +934,47 @@ mod tests {
 
         assert_eq!(app.streaming_buffer, "good");
         assert_eq!(app.pending_request_id, Some("ws-req-1".to_string()));
+    }
+
+    /// Regression test for issue #52.
+    ///
+    /// `WsClient::send_prompt` returns the daemon's `task_id`
+    /// (post-desktop-assistant #114 `SendMessageAck`). That value is
+    /// distinct from the chunk-stream `request_id` embedded in
+    /// `AssistantDelta` events — the latter is server-generated per
+    /// streaming response. Treating the ack value as the stream's
+    /// request_id makes every chunk get filtered out by
+    /// `stream_matches_or_claims_request_id`, so the assistant's
+    /// streaming reply never appears.
+    ///
+    /// After `apply_prompt_ack(task_id)` the next chunk — carrying the
+    /// real, different server request_id — must still be accepted.
+    #[test]
+    fn apply_prompt_ack_accepts_chunks_with_distinct_server_request_id() {
+        let mut app = App::new();
+        app.current_conversation = Some(ConversationDetail {
+            id: "c1".into(),
+            title: "Test".into(),
+            messages: vec![],
+            model_selection: None,
+        });
+
+        // Daemon ack carries a task_id (post-#114 wire protocol).
+        app.apply_prompt_ack("task-abc123".to_string());
+
+        // Streaming chunks then arrive with a *different* server-generated
+        // request_id. They must be accepted, not filtered out.
+        app.receive_chunk("server-req-xyz789", "Hello ");
+        app.receive_chunk("server-req-xyz789", "world!");
+
+        assert_eq!(app.streaming_buffer, "Hello world!");
+
+        app.complete_streaming("server-req-xyz789", "Hello world!");
+        assert_eq!(app.pending_request_id, None);
+        let msgs = &app.current_conversation.as_ref().unwrap().messages;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "assistant");
+        assert_eq!(msgs[0].content, "Hello world!");
     }
 
     // --- Mode transition tests ---
