@@ -34,7 +34,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use desktop_assistant_api_model::{
     Command, CommandResult, ConnectionAvailability, ConnectionConfigView, ConnectionView,
 };
-use desktop_assistant_client_common::TransportClient;
+use desktop_assistant_client_common::{AssistantCommands, TransportClient};
 use futures::StreamExt;
 use ratatui::{
     Frame, Terminal,

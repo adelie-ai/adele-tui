@@ -28,6 +28,11 @@ pub struct Profile {
     /// JWT subject claim. Only meaningful when `transport == Ws`.
     #[serde(default)]
     pub ws_subject: String,
+    /// Unix-domain-socket path. Only meaningful when `transport == Uds`;
+    /// `None` uses the daemon's default socket
+    /// (`$XDG_RUNTIME_DIR/adelie/sock`).
+    #[serde(default)]
+    pub socket_path: Option<PathBuf>,
     /// Username for password-based login. `None` means no username/password
     /// auth — fall back to JWT or anonymous.
     #[serde(default)]
@@ -58,6 +63,7 @@ impl Profile {
             transport,
             ws_url,
             ws_subject,
+            socket_path: None,
             username: None,
             has_password: false,
             has_jwt: false,
@@ -85,6 +91,7 @@ impl Profile {
             ws_jwt: jwt,
             ws_login_username: self.username.clone(),
             ws_login_password: password,
+            socket_path: self.socket_path.clone(),
             ..Default::default()
         }
     }
@@ -102,6 +109,10 @@ impl Profile {
         let detail = match self.transport {
             TransportMode::Ws => self.ws_url.clone(),
             TransportMode::Dbus => "D-Bus".to_string(),
+            TransportMode::Uds => match &self.socket_path {
+                Some(path) => format!("local · {}", path.display()),
+                None => "Local socket".to_string(),
+            },
         };
         if detail.is_empty() {
             self.name.clone()
@@ -189,6 +200,7 @@ mod transport_mode_serde {
         let token = match value {
             TransportMode::Ws => "ws",
             TransportMode::Dbus => "dbus",
+            TransportMode::Uds => "local",
         };
         s.serialize_str(token)
     }
@@ -198,6 +210,7 @@ mod transport_mode_serde {
         match token.as_str() {
             "ws" => Ok(TransportMode::Ws),
             "dbus" => Ok(TransportMode::Dbus),
+            "local" | "uds" => Ok(TransportMode::Uds),
             other => Err(serde::de::Error::custom(format!(
                 "unknown transport mode {other:?}"
             ))),
@@ -286,5 +299,47 @@ mod tests {
         assert!(cfg.ws_jwt.is_none());
         assert!(cfg.ws_login_username.is_none());
         assert!(cfg.ws_login_password.is_none());
+    }
+
+    #[test]
+    fn uds_transport_serializes_as_local_token_and_round_trips() {
+        let mut p = Profile::new(
+            "Home".into(),
+            TransportMode::Uds,
+            String::new(),
+            String::new(),
+        );
+        p.socket_path = Some(PathBuf::from("/run/user/1000/adelie/sock"));
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"transport\":\"local\""));
+        let back: Profile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn uds_token_accepts_both_local_and_uds_spellings() {
+        for token in ["local", "uds"] {
+            let json = format!(
+                r#"{{"id":"1","name":"X","transport":"{token}","ws_url":"","ws_subject":""}}"#
+            );
+            let p: Profile = serde_json::from_str(&json).unwrap();
+            assert_eq!(p.transport, TransportMode::Uds);
+            // Absent socket_path defaults to None (use the daemon's default).
+            assert!(p.socket_path.is_none());
+        }
+    }
+
+    #[test]
+    fn to_connection_config_carries_socket_path_for_uds() {
+        let mut p = Profile::new(
+            "Home".into(),
+            TransportMode::Uds,
+            String::new(),
+            String::new(),
+        );
+        p.socket_path = Some(PathBuf::from("/tmp/custom.sock"));
+        let cfg = p.to_connection_config();
+        assert_eq!(cfg.transport_mode, TransportMode::Uds);
+        assert_eq!(cfg.socket_path, Some(PathBuf::from("/tmp/custom.sock")));
     }
 }

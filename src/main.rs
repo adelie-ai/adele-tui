@@ -15,6 +15,7 @@ mod toolbar;
 mod ui;
 
 use std::io;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches, Parser, parser::ValueSource};
@@ -27,8 +28,8 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use desktop_assistant_client_common::{
-    AssistantClient, ConnectionConfig, SignalEvent, TransportClient, TransportMode,
-    connect_transport, transport::transport_label,
+    AssistantClient, AssistantCommands, ConnectionConfig, SignalEvent, TransportClient,
+    TransportMode, connect_transport, transport::transport_label,
 };
 use futures::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
@@ -49,6 +50,8 @@ const DEFAULT_WS_SUBJECT: &str = desktop_assistant_client_common::config::DEFAUL
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[value(rename_all = "lower")]
 enum CliTransportMode {
+    /// Local Unix domain socket (the default).
+    Local,
     Ws,
     Dbus,
 }
@@ -56,13 +59,23 @@ enum CliTransportMode {
 #[derive(Debug, Parser)]
 #[command(name = "adele")]
 struct CliArgs {
+    /// Transport used when neither --socket nor --ws is given. Defaults to
+    /// the daemon's local Unix socket.
     #[arg(
         long,
         env = "DESKTOP_ASSISTANT_TUI_TRANSPORT",
         value_enum,
-        default_value_t = CliTransportMode::Ws
+        default_value_t = CliTransportMode::Local
     )]
     transport: CliTransportMode,
+    /// Connect over the daemon's local Unix socket. An optional PATH overrides
+    /// the default ($XDG_RUNTIME_DIR/adelie/sock). Mutually exclusive with --ws.
+    #[arg(long, value_name = "PATH", num_args = 0..=1, conflicts_with = "ws")]
+    socket: Option<Option<PathBuf>>,
+    /// Connect over WebSocket. An optional URL overrides --ws-url. Mutually
+    /// exclusive with --socket.
+    #[arg(long, value_name = "URL", num_args = 0..=1, conflicts_with = "socket")]
+    ws: Option<Option<String>>,
     #[arg(
         long = "ws-url",
         env = "DESKTOP_ASSISTANT_TUI_WS_URL",
@@ -97,9 +110,24 @@ impl From<CliArgs> for ConnectionConfig {
             }
         };
 
-        let transport_mode = match cli.transport {
-            CliTransportMode::Ws => TransportMode::Ws,
-            CliTransportMode::Dbus => TransportMode::Dbus,
+        // `--socket` and `--ws` are explicit selectors that override the
+        // (always-defaulted) `--transport`. clap makes them mutually
+        // exclusive, so at most one is `Some` here.
+        let (transport_mode, socket_path, ws_url) = if let Some(path) = cli.socket {
+            (TransportMode::Uds, path, ws_url)
+        } else if let Some(url) = cli.ws {
+            let resolved = match url {
+                Some(u) if !u.trim().is_empty() => u.trim().to_string(),
+                _ => ws_url,
+            };
+            (TransportMode::Ws, None, resolved)
+        } else {
+            let mode = match cli.transport {
+                CliTransportMode::Local => TransportMode::Uds,
+                CliTransportMode::Ws => TransportMode::Ws,
+                CliTransportMode::Dbus => TransportMode::Dbus,
+            };
+            (mode, None, ws_url)
         };
 
         Self {
@@ -109,6 +137,7 @@ impl From<CliArgs> for ConnectionConfig {
             ws_login_username: None,
             ws_login_password: None,
             ws_subject,
+            socket_path,
             ..Default::default()
         }
     }
@@ -188,7 +217,7 @@ fn schedule_reconnect(prev: Option<u64>) -> ReconnectState {
 /// flag or env var, in which case we skip the profile picker and connect
 /// using the provided values (matching pre-profile-picker behavior).
 fn any_explicit_connection_arg(matches: &clap::ArgMatches) -> bool {
-    ["transport", "ws_url", "ws_subject"]
+    ["transport", "socket", "ws", "ws_url", "ws_subject"]
         .iter()
         .any(|name| {
             matches!(
@@ -804,15 +833,74 @@ mod tests {
     }
 
     #[test]
-    fn clap_defaults_map_to_runtime_defaults() {
+    fn clap_default_with_no_flags_is_local_uds() {
         let cli = CliArgs::try_parse_from(args(&[])).unwrap();
         let config = ConnectionConfig::from(cli);
-        assert_eq!(config.transport_mode, TransportMode::Ws);
-        assert_eq!(config.ws_url, DEFAULT_WS_URL);
+        // UDS is now the default connector.
+        assert_eq!(config.transport_mode, TransportMode::Uds);
+        assert_eq!(config.socket_path, None); // None => daemon default socket
         assert_eq!(config.ws_subject, DEFAULT_WS_SUBJECT);
         assert_eq!(config.ws_jwt, None);
         assert_eq!(config.ws_login_username, None);
         assert_eq!(config.ws_login_password, None);
+    }
+
+    #[test]
+    fn socket_flag_without_value_selects_uds_default_path() {
+        let cli = CliArgs::try_parse_from(args(&["--socket"])).unwrap();
+        let config = ConnectionConfig::from(cli);
+        assert_eq!(config.transport_mode, TransportMode::Uds);
+        assert_eq!(config.socket_path, None);
+    }
+
+    #[test]
+    fn socket_flag_with_path_sets_socket_path() {
+        let cli = CliArgs::try_parse_from(args(&["--socket=/tmp/custom.sock"])).unwrap();
+        let config = ConnectionConfig::from(cli);
+        assert_eq!(config.transport_mode, TransportMode::Uds);
+        assert_eq!(config.socket_path, Some(PathBuf::from("/tmp/custom.sock")));
+    }
+
+    #[test]
+    fn ws_flag_with_url_selects_websocket() {
+        let cli = CliArgs::try_parse_from(args(&["--ws=wss://host/ws"])).unwrap();
+        let config = ConnectionConfig::from(cli);
+        assert_eq!(config.transport_mode, TransportMode::Ws);
+        assert_eq!(config.ws_url, "wss://host/ws");
+        assert_eq!(config.socket_path, None);
+    }
+
+    #[test]
+    fn ws_flag_without_value_falls_back_to_default_ws_url() {
+        let cli = CliArgs::try_parse_from(args(&["--ws"])).unwrap();
+        let config = ConnectionConfig::from(cli);
+        assert_eq!(config.transport_mode, TransportMode::Ws);
+        assert_eq!(config.ws_url, DEFAULT_WS_URL);
+    }
+
+    #[test]
+    fn socket_and_ws_are_mutually_exclusive() {
+        let error = CliArgs::try_parse_from(args(&["--socket", "--ws=wss://x/ws"]))
+            .expect_err("--socket and --ws must conflict");
+        assert!(error.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn dbus_transport_still_selectable() {
+        // No regression: --transport dbus continues to map to D-Bus.
+        let cli = CliArgs::try_parse_from(args(&["--transport", "dbus"])).unwrap();
+        let config = ConnectionConfig::from(cli);
+        assert_eq!(config.transport_mode, TransportMode::Dbus);
+    }
+
+    #[test]
+    fn transport_ws_with_ws_url_still_works() {
+        // No regression: the explicit ws transport + --ws-url path.
+        let cli = CliArgs::try_parse_from(args(&["--transport", "ws", "--ws-url", "wss://h/ws"]))
+            .unwrap();
+        let config = ConnectionConfig::from(cli);
+        assert_eq!(config.transport_mode, TransportMode::Ws);
+        assert_eq!(config.ws_url, "wss://h/ws");
     }
 
     #[test]
