@@ -1,3 +1,9 @@
+//! `adele` terminal UI client binary.
+//!
+//! Parses CLI arguments, establishes the transport connection to the Adelie
+//! daemon, and runs the interactive TUI event loop (chat plus the knowledge
+//! base, connections, and purposes management screens).
+
 mod app;
 mod connections;
 mod credentials;
@@ -330,10 +336,10 @@ async fn run(
 
         if app.kb_requested {
             app.kb_requested = false;
-            if let Some(client) = client.as_ref() {
-                if let Err(e) = kb::run(terminal, client).await {
-                    app.status_message = format!("KB error: {e}");
-                }
+            if let Some(client) = client.as_ref()
+                && let Err(e) = kb::run(terminal, client).await
+            {
+                app.status_message = format!("KB error: {e}");
             }
             // Force a redraw on the next iteration so the chat reappears
             // immediately instead of waiting for the next event.
@@ -342,20 +348,20 @@ async fn run(
 
         if app.connections_requested {
             app.connections_requested = false;
-            if let Some(client) = client.as_ref() {
-                if let Err(e) = connections::run(terminal, client).await {
-                    app.status_message = format!("Connections error: {e}");
-                }
+            if let Some(client) = client.as_ref()
+                && let Err(e) = connections::run(terminal, client).await
+            {
+                app.status_message = format!("Connections error: {e}");
             }
             continue;
         }
 
         if app.purposes_requested {
             app.purposes_requested = false;
-            if let Some(client) = client.as_ref() {
-                if let Err(e) = purposes::run(terminal, client).await {
-                    app.status_message = format!("Purposes error: {e}");
-                }
+            if let Some(client) = client.as_ref()
+                && let Err(e) = purposes::run(terminal, client).await
+            {
+                app.status_message = format!("Purposes error: {e}");
             }
             continue;
         }
@@ -905,8 +911,7 @@ mod tests {
     #[test]
     fn clap_rejects_invalid_transport_value() {
         let error = CliArgs::try_parse_from(args(&["--transport", "http"]))
-            .err()
-            .expect("transport should be validated by clap");
+            .expect_err("transport should be validated by clap");
         let rendered = error.to_string();
         assert!(rendered.contains("ws"));
         assert!(rendered.contains("dbus"));

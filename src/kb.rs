@@ -112,7 +112,7 @@ impl EditForm {
         content_trim_trailing_newline(&mut content);
 
         let mut tags = single_line_textarea();
-        tags.insert_str(&entry.tags.join(", "));
+        tags.insert_str(entry.tags.join(", "));
         tags.move_cursor(CursorMove::End);
 
         let mut metadata = new_textarea();
@@ -306,10 +306,8 @@ async fn handle_list_key(state: &mut State, key: KeyEvent, client: &TransportCli
             state.error = None;
             state.mode = Mode::Edit;
         }
-        (KeyCode::Char('d'), m) if m.is_empty() => {
-            if state.entries.get(state.selected).is_some() {
-                state.mode = Mode::DeleteConfirm;
-            }
+        (KeyCode::Char('d'), m) if m.is_empty() && state.entries.get(state.selected).is_some() => {
+            state.mode = Mode::DeleteConfirm;
         }
         (KeyCode::Char('/'), m) if m.is_empty() => {
             state.mode = Mode::Search;

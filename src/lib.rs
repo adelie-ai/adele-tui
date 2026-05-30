@@ -1,3 +1,10 @@
+//! Terminal UI client library for the Adelie AI platform.
+//!
+//! Exposes the screens and widgets that make up the `adele` TUI (chat, task
+//! pane, knowledge base, connections, purposes, model selection, key bindings,
+//! and supporting credential/OAuth helpers) so they can be reused and tested
+//! independently of the binary entry point.
+
 pub mod app;
 pub mod connections;
 pub mod credentials;

@@ -302,10 +302,10 @@ async fn handle_list_key(state: &mut State, key: KeyEvent, client: &TransportCli
             state.error = None;
             state.mode = Mode::Edit;
         }
-        (KeyCode::Char('d'), m) if m.is_empty() => {
-            if state.connections.get(state.selected).is_some() {
-                state.mode = Mode::DeleteConfirm;
-            }
+        (KeyCode::Char('d'), m)
+            if m.is_empty() && state.connections.get(state.selected).is_some() =>
+        {
+            state.mode = Mode::DeleteConfirm;
         }
         (KeyCode::Char('r'), m) if m.is_empty() => refresh_list(state, client).await,
         _ => {}
