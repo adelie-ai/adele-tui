@@ -138,7 +138,8 @@ impl FormState {
             password,
             had_stored_password: false,
             has_oauth_tokens: false,
-            transport: TransportMode::Ws,
+            // UDS is the default connector for local use.
+            transport: TransportMode::Uds,
         }
     }
 
@@ -247,6 +248,24 @@ fn single_line_textarea() -> TextArea<'static> {
     let mut ta = TextArea::default();
     ta.set_cursor_line_style(Style::default());
     ta
+}
+
+/// Forward cycle for the transport toggle: Local → WebSocket → D-Bus → Local.
+fn transport_next(t: TransportMode) -> TransportMode {
+    match t {
+        TransportMode::Uds => TransportMode::Ws,
+        TransportMode::Ws => TransportMode::Dbus,
+        TransportMode::Dbus => TransportMode::Uds,
+    }
+}
+
+/// Backward cycle (the reverse of [`transport_next`]).
+fn transport_prev(t: TransportMode) -> TransportMode {
+    match t {
+        TransportMode::Uds => TransportMode::Dbus,
+        TransportMode::Ws => TransportMode::Uds,
+        TransportMode::Dbus => TransportMode::Ws,
+    }
 }
 
 /// Run the picker until the user selects, creates, or quits.
@@ -412,14 +431,13 @@ fn handle_form_key(state: &mut PickerState, key: KeyEvent) {
                 Err(msg) => state.error = Some(msg),
             }
         }
-        // Transport field uses left/right or space to flip the toggle.
-        (KeyCode::Left | KeyCode::Right | KeyCode::Char(' '), _)
-            if state.form.focus == Field::Transport =>
-        {
-            state.form.transport = match state.form.transport {
-                TransportMode::Ws => TransportMode::Dbus,
-                TransportMode::Dbus => TransportMode::Ws,
-            };
+        // Transport field cycles Local → WebSocket → D-Bus with left/right
+        // (space steps forward).
+        (KeyCode::Right | KeyCode::Char(' '), _) if state.form.focus == Field::Transport => {
+            state.form.transport = transport_next(state.form.transport);
+        }
+        (KeyCode::Left, _) if state.form.focus == Field::Transport => {
+            state.form.transport = transport_prev(state.form.transport);
         }
         _ => match state.form.focus {
             Field::Name => {
@@ -551,6 +569,9 @@ fn apply_submission(state: &mut PickerState, submitted: SubmittedProfile) -> Res
         transport: submitted.transport,
         ws_url: submitted.ws_url,
         ws_subject: submitted.ws_subject,
+        // Saved Local profiles use the daemon's default socket; custom socket
+        // paths are a CLI-only concern (`adele --socket <path>`).
+        socket_path: None,
         username: submitted.username,
         has_password,
         has_jwt: submitted.has_oauth_tokens,
@@ -852,6 +873,8 @@ fn draw_transport_toggle(f: &mut Frame, area: Rect, state: &PickerState) {
     };
 
     let line = Line::from(vec![
+        render_chip("Local", state.form.transport == TransportMode::Uds),
+        Span::styled("  ", Style::default()),
         render_chip("WebSocket", state.form.transport == TransportMode::Ws),
         Span::styled("  ", Style::default()),
         render_chip("D-Bus", state.form.transport == TransportMode::Dbus),
@@ -1065,15 +1088,27 @@ mod tests {
     }
 
     #[test]
-    fn form_transport_toggles_with_arrow() {
+    fn new_form_defaults_to_local_transport() {
+        let state = make_state(vec![]);
+        assert_eq!(state.form.transport, TransportMode::Uds);
+    }
+
+    #[test]
+    fn form_transport_cycles_through_all_three_with_arrows() {
         let mut state = make_state(vec![]);
         state.mode = Mode::Form;
         state.form.focus = Field::Transport;
+        // Default is Local (UDS); Right steps forward through the cycle.
+        assert_eq!(state.form.transport, TransportMode::Uds);
+        handle_form_key(&mut state, key(KeyCode::Right));
         assert_eq!(state.form.transport, TransportMode::Ws);
         handle_form_key(&mut state, key(KeyCode::Right));
         assert_eq!(state.form.transport, TransportMode::Dbus);
+        handle_form_key(&mut state, key(KeyCode::Right));
+        assert_eq!(state.form.transport, TransportMode::Uds);
+        // Left steps backward.
         handle_form_key(&mut state, key(KeyCode::Left));
-        assert_eq!(state.form.transport, TransportMode::Ws);
+        assert_eq!(state.form.transport, TransportMode::Dbus);
     }
 
     #[test]

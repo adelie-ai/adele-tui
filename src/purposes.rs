@@ -32,7 +32,7 @@ use desktop_assistant_api_model::{
     Command, CommandResult, ConnectionView, EffortLevel, ModelListing, PurposeConfigView,
     PurposeKindApi, PurposesView,
 };
-use desktop_assistant_client_common::TransportClient;
+use desktop_assistant_client_common::{AssistantCommands, TransportClient};
 use futures::StreamExt;
 use ratatui::{
     Frame, Terminal,
