@@ -43,8 +43,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
-use tokio::time::{Instant, sleep_until};
 use ratatui_textarea::{CursorMove, TextArea};
+use tokio::time::{Instant, sleep_until};
 
 const LIST_LIMIT: u32 = 100;
 const SEARCH_LIMIT: u32 = 50;
@@ -112,7 +112,7 @@ impl EditForm {
         content_trim_trailing_newline(&mut content);
 
         let mut tags = single_line_textarea();
-        tags.insert_str(&entry.tags.join(", "));
+        tags.insert_str(entry.tags.join(", "));
         tags.move_cursor(CursorMove::End);
 
         let mut metadata = new_textarea();
@@ -182,7 +182,10 @@ fn content_trim_trailing_newline(ta: &mut TextArea<'static>) {
         && lines.len() > 1
     {
         // tui-textarea has no direct truncate; rebuild without the trailing line.
-        let kept: Vec<String> = lines[..lines.len() - 1].iter().map(|s| s.to_string()).collect();
+        let kept: Vec<String> = lines[..lines.len() - 1]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let mut replacement = TextArea::from(kept);
         replacement.set_cursor_line_style(Style::default());
         replacement.move_cursor(CursorMove::End);
@@ -303,10 +306,8 @@ async fn handle_list_key(state: &mut State, key: KeyEvent, client: &TransportCli
             state.error = None;
             state.mode = Mode::Edit;
         }
-        (KeyCode::Char('d'), m) if m.is_empty() => {
-            if state.entries.get(state.selected).is_some() {
-                state.mode = Mode::DeleteConfirm;
-            }
+        (KeyCode::Char('d'), m) if m.is_empty() && state.entries.get(state.selected).is_some() => {
+            state.mode = Mode::DeleteConfirm;
         }
         (KeyCode::Char('/'), m) if m.is_empty() => {
             state.mode = Mode::Search;
@@ -415,9 +416,7 @@ fn advance_selection(state: &mut State, delta: i32) {
 
 async fn refresh_list(state: &mut State, client: &TransportClient) {
     state.busy = Some("Loading entries...".into());
-    let result = client
-        .list_knowledge_entries(LIST_LIMIT, 0, None)
-        .await;
+    let result = client.list_knowledge_entries(LIST_LIMIT, 0, None).await;
     state.busy = None;
     match result {
         Ok(entries) => {
@@ -690,14 +689,14 @@ fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
         focus == EditField::Content,
         "Content",
     );
-    draw_field_label(f, rows[2], "Tags (comma-separated)", focus == EditField::Tags);
-    draw_text_field(f, rows[3], &state.edit.tags, focus == EditField::Tags);
     draw_field_label(
         f,
-        rows[4],
-        "Metadata (JSON)",
-        focus == EditField::Metadata,
+        rows[2],
+        "Tags (comma-separated)",
+        focus == EditField::Tags,
     );
+    draw_text_field(f, rows[3], &state.edit.tags, focus == EditField::Tags);
+    draw_field_label(f, rows[4], "Metadata (JSON)", focus == EditField::Metadata);
     draw_text_field(
         f,
         rows[5],
@@ -786,11 +785,7 @@ fn draw_hints(f: &mut Frame, state: &State, area: Rect) {
             ("Esc", "back to chat"),
         ],
         Mode::Search => &[("Enter", "search"), ("Esc", "clear & back")],
-        Mode::Edit => &[
-            ("Tab", "next field"),
-            ("Ctrl+S", "save"),
-            ("Esc", "cancel"),
-        ],
+        Mode::Edit => &[("Tab", "next field"), ("Ctrl+S", "save"), ("Esc", "cancel")],
         Mode::DeleteConfirm => &[("y/Enter", "confirm"), ("any", "cancel")],
     };
 

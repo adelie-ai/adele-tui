@@ -171,12 +171,18 @@ impl FormState {
     }
 
     fn next_field(&mut self) {
-        let pos = FIELD_ORDER.iter().position(|f| *f == self.focus).unwrap_or(0);
+        let pos = FIELD_ORDER
+            .iter()
+            .position(|f| *f == self.focus)
+            .unwrap_or(0);
         self.focus = FIELD_ORDER[(pos + 1) % FIELD_ORDER.len()];
     }
 
     fn prev_field(&mut self) {
-        let pos = FIELD_ORDER.iter().position(|f| *f == self.focus).unwrap_or(0);
+        let pos = FIELD_ORDER
+            .iter()
+            .position(|f| *f == self.focus)
+            .unwrap_or(0);
         self.focus = FIELD_ORDER[(pos + FIELD_ORDER.len() - 1) % FIELD_ORDER.len()];
     }
 
@@ -391,9 +397,8 @@ fn handle_form_key(state: &mut PickerState, key: KeyEvent) {
             state.oauth_pending = true;
             state.error = None;
         } else {
-            state.error = Some(
-                "OAuth requires a WebSocket URL — fill in the URL field first".into(),
-            );
+            state.error =
+                Some("OAuth requires a WebSocket URL — fill in the URL field first".into());
         }
         return;
     }
@@ -417,20 +422,18 @@ fn handle_form_key(state: &mut PickerState, key: KeyEvent) {
         (KeyCode::BackTab, _) => state.form.prev_field(),
         (KeyCode::Up, m) if m.is_empty() => state.form.prev_field(),
         (KeyCode::Down, m) if m.is_empty() => state.form.next_field(),
-        (KeyCode::Enter, m) if m.is_empty() => {
-            match state.form.submit() {
-                Ok(submitted) => {
-                    if let Err(e) = apply_submission(state, submitted) {
-                        state.error = Some(e);
-                    } else {
-                        state.error = None;
-                        state.mode = Mode::List;
-                        state.form = FormState::empty();
-                    }
+        (KeyCode::Enter, m) if m.is_empty() => match state.form.submit() {
+            Ok(submitted) => {
+                if let Err(e) = apply_submission(state, submitted) {
+                    state.error = Some(e);
+                } else {
+                    state.error = None;
+                    state.mode = Mode::List;
+                    state.form = FormState::empty();
                 }
-                Err(msg) => state.error = Some(msg),
             }
-        }
+            Err(msg) => state.error = Some(msg),
+        },
         // Transport field cycles Local → WebSocket → D-Bus with left/right
         // (space steps forward).
         (KeyCode::Right | KeyCode::Char(' '), _) if state.form.focus == Field::Transport => {
@@ -481,10 +484,11 @@ async fn run_oauth_for_form(
     };
 
     let oidc = match discovery.oidc {
-        Some(o) if crate::oauth::supports_oauth(&crate::oauth::AuthDiscovery {
-            methods: discovery.methods.clone(),
-            oidc: Some(o.clone()),
-        }) =>
+        Some(o)
+            if crate::oauth::supports_oauth(&crate::oauth::AuthDiscovery {
+                methods: discovery.methods.clone(),
+                oidc: Some(o.clone()),
+            }) =>
         {
             o
         }
@@ -534,11 +538,7 @@ async fn run_oauth_for_form(
 /// Persist a submitted profile: update keyring, write profile, save store,
 /// reselect. Returns an error string suitable for the UI on failure.
 fn apply_submission(state: &mut PickerState, submitted: SubmittedProfile) -> Result<(), String> {
-    let editing = state
-        .store
-        .profiles
-        .iter()
-        .any(|p| p.id == submitted.id);
+    let editing = state.store.profiles.iter().any(|p| p.id == submitted.id);
 
     let mut has_password = match &submitted.password_action {
         PasswordAction::Set(_) => true,
@@ -763,7 +763,12 @@ fn draw_form(f: &mut Frame, state: &PickerState, area: Rect) {
         .split(inner);
 
     draw_field_label(f, rows[0], "Name", state.form.focus == Field::Name);
-    draw_text_field(f, rows[1], &state.form.name, state.form.focus == Field::Name);
+    draw_text_field(
+        f,
+        rows[1],
+        &state.form.name,
+        state.form.focus == Field::Name,
+    );
 
     draw_field_label(
         f,
@@ -1058,7 +1063,12 @@ mod tests {
 
     #[test]
     fn list_enter_returns_selected_profile() {
-        let p = Profile::new("Local".into(), TransportMode::Ws, "ws://x".into(), "s".into());
+        let p = Profile::new(
+            "Local".into(),
+            TransportMode::Ws,
+            "ws://x".into(),
+            "s".into(),
+        );
         let id = p.id.clone();
         let mut state = make_state(vec![p]);
         let outcome = handle_list_key(&mut state, key(KeyCode::Enter));
@@ -1123,7 +1133,12 @@ mod tests {
 
     #[test]
     fn delete_confirm_y_removes_profile() {
-        let p = Profile::new("Local".into(), TransportMode::Ws, "ws://x".into(), "s".into());
+        let p = Profile::new(
+            "Local".into(),
+            TransportMode::Ws,
+            "ws://x".into(),
+            "s".into(),
+        );
         let mut state = make_state(vec![p]);
         state.mode = Mode::DeleteConfirm;
         handle_delete_key(&mut state, key(KeyCode::Char('y')));
@@ -1134,7 +1149,12 @@ mod tests {
 
     #[test]
     fn delete_confirm_other_key_cancels() {
-        let p = Profile::new("Local".into(), TransportMode::Ws, "ws://x".into(), "s".into());
+        let p = Profile::new(
+            "Local".into(),
+            TransportMode::Ws,
+            "ws://x".into(),
+            "s".into(),
+        );
         let mut state = make_state(vec![p]);
         state.mode = Mode::DeleteConfirm;
         handle_delete_key(&mut state, key(KeyCode::Char('n')));

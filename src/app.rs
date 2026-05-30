@@ -1,5 +1,5 @@
-pub use desktop_assistant_client_common::{ChatMessage, ConversationDetail, ConversationSummary};
 use desktop_assistant_api_model::TaskId;
+pub use desktop_assistant_client_common::{ChatMessage, ConversationDetail, ConversationSummary};
 use ratatui::style::Style;
 use ratatui_textarea::{CursorMove, DataCursor, TextArea};
 
@@ -210,12 +210,13 @@ impl App {
         override_selection: desktop_assistant_api_model::SendPromptOverride,
     ) {
         if let Some(conv) = self.current_conversation.as_mut() {
-            conv.model_selection =
-                Some(desktop_assistant_api_model::ConversationModelSelectionView {
+            conv.model_selection = Some(
+                desktop_assistant_api_model::ConversationModelSelectionView {
                     connection_id: override_selection.connection_id.clone(),
                     model_id: override_selection.model_id.clone(),
                     effort: override_selection.effort,
-                });
+                },
+            );
         }
         self.pending_model_override = Some(override_selection);
     }
@@ -1146,10 +1147,7 @@ mod tests {
         });
         app.apply_rename("2", "Renamed");
         assert_eq!(app.conversations[1].title, "Renamed");
-        assert_eq!(
-            app.current_conversation.as_ref().unwrap().title,
-            "Renamed"
-        );
+        assert_eq!(app.current_conversation.as_ref().unwrap().title, "Renamed");
     }
 
     #[test]
@@ -1247,7 +1245,11 @@ mod tests {
 
     // --- Tasks pane integration ---
 
-    fn standalone_view(id: &str, conv_id: &str, title: &str) -> desktop_assistant_api_model::TaskView {
+    fn standalone_view(
+        id: &str,
+        conv_id: &str,
+        title: &str,
+    ) -> desktop_assistant_api_model::TaskView {
         desktop_assistant_api_model::TaskView {
             id: desktop_assistant_api_model::TaskId(id.into()),
             kind: desktop_assistant_api_model::TaskKind::Standalone {
@@ -1326,10 +1328,7 @@ mod tests {
         app.tasks.selected = Some(desktop_assistant_api_model::TaskId("t-1".into()));
 
         let id = app.request_cancel_selected_task();
-        assert_eq!(
-            id,
-            Some(desktop_assistant_api_model::TaskId("t-1".into()))
-        );
+        assert_eq!(id, Some(desktop_assistant_api_model::TaskId("t-1".into())));
         assert_eq!(
             app.pending_task_cancel,
             Some(desktop_assistant_api_model::TaskId("t-1".into()))

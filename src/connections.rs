@@ -69,12 +69,8 @@ pub enum ConnectorKind {
 }
 
 impl ConnectorKind {
-    const ALL: &'static [ConnectorKind] = &[
-        Self::Anthropic,
-        Self::OpenAi,
-        Self::Bedrock,
-        Self::Ollama,
-    ];
+    const ALL: &'static [ConnectorKind] =
+        &[Self::Anthropic, Self::OpenAi, Self::Bedrock, Self::Ollama];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -160,7 +156,8 @@ impl EditForm {
         form.editing_id = Some(view.id.clone());
         form.id.insert_str(&view.id);
         form.id.move_cursor(CursorMove::End);
-        form.kind = ConnectorKind::from_tag(&view.connector_type).unwrap_or(ConnectorKind::Anthropic);
+        form.kind =
+            ConnectorKind::from_tag(&view.connector_type).unwrap_or(ConnectorKind::Anthropic);
         // Note: the daemon's `ConnectionView` doesn't echo the config back
         // (no secrets at rest, nothing to repopulate). The form starts blank
         // for the type-specific fields; if the user saves without filling
@@ -305,10 +302,10 @@ async fn handle_list_key(state: &mut State, key: KeyEvent, client: &TransportCli
             state.error = None;
             state.mode = Mode::Edit;
         }
-        (KeyCode::Char('d'), m) if m.is_empty() => {
-            if state.connections.get(state.selected).is_some() {
-                state.mode = Mode::DeleteConfirm;
-            }
+        (KeyCode::Char('d'), m)
+            if m.is_empty() && state.connections.get(state.selected).is_some() =>
+        {
+            state.mode = Mode::DeleteConfirm;
         }
         (KeyCode::Char('r'), m) if m.is_empty() => refresh_list(state, client).await,
         _ => {}
@@ -350,9 +347,8 @@ async fn handle_edit_key(state: &mut State, key: KeyEvent, client: &TransportCli
                     state.form.focus = fields[0];
                 }
             } else {
-                state.error = Some(
-                    "Type can't be changed on edit — delete and add a new connection".into(),
-                );
+                state.error =
+                    Some("Type can't be changed on edit — delete and add a new connection".into());
             }
         }
         _ => {
@@ -588,10 +584,7 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
                 let mut spans: Vec<Span<'static>> = vec![
                     availability_text,
                     Span::raw(" "),
-                    Span::styled(
-                        c.id.clone(),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(c.id.clone(), Style::default().add_modifier(Modifier::BOLD)),
                     Span::styled(
                         format!(" [{}]", c.connector_type),
                         Style::default().fg(COLOR_HINT_DESC),
@@ -700,12 +693,7 @@ fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
                 } else {
                     " (←/→ or Space to cycle)"
                 };
-                draw_field_label(
-                    f,
-                    label_row,
-                    &format!("Type{suffix}"),
-                    focused,
-                );
+                draw_field_label(f, label_row, &format!("Type{suffix}"), focused);
                 draw_type_toggle(f, input_row, state, focused);
             }
             Field::ApiKeyEnv => {
@@ -861,16 +849,8 @@ fn draw_hints(f: &mut Frame, state: &State, area: Rect) {
             ("r", "refresh"),
             ("Esc", "back to chat"),
         ],
-        Mode::Edit => &[
-            ("Tab", "next field"),
-            ("Ctrl+S", "save"),
-            ("Esc", "cancel"),
-        ],
-        Mode::DeleteConfirm => &[
-            ("y/Enter", "confirm"),
-            ("f", "force"),
-            ("any", "cancel"),
-        ],
+        Mode::Edit => &[("Tab", "next field"), ("Ctrl+S", "save"), ("Esc", "cancel")],
+        Mode::DeleteConfirm => &[("y/Enter", "confirm"), ("f", "force"), ("any", "cancel")],
     };
     let mut spans: Vec<Span> = Vec::new();
     for (idx, (key, desc)) in hints.iter().enumerate() {
@@ -962,7 +942,10 @@ mod tests {
         let (id, config) = form.submit().unwrap();
         assert_eq!(id, "work");
         match config {
-            ConnectionConfigView::Anthropic { api_key_env, base_url } => {
+            ConnectionConfigView::Anthropic {
+                api_key_env,
+                base_url,
+            } => {
                 assert_eq!(api_key_env.as_deref(), Some("WORK_KEY"));
                 assert!(base_url.is_none());
             }

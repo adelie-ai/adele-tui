@@ -1,12 +1,18 @@
+//! `adele` terminal UI client binary.
+//!
+//! Parses CLI arguments, establishes the transport connection to the Adelie
+//! daemon, and runs the interactive TUI event loop (chat plus the knowledge
+//! base, connections, and purposes management screens).
+
 mod app;
 mod connections;
 mod credentials;
 mod kb;
 mod keys;
 mod markdown;
+mod model_selector;
 mod oauth;
 mod picker;
-mod model_selector;
 mod profile;
 mod purposes;
 mod settings;
@@ -330,10 +336,10 @@ async fn run(
 
         if app.kb_requested {
             app.kb_requested = false;
-            if let Some(client) = client.as_ref() {
-                if let Err(e) = kb::run(terminal, client).await {
-                    app.status_message = format!("KB error: {e}");
-                }
+            if let Some(client) = client.as_ref()
+                && let Err(e) = kb::run(terminal, client).await
+            {
+                app.status_message = format!("KB error: {e}");
             }
             // Force a redraw on the next iteration so the chat reappears
             // immediately instead of waiting for the next event.
@@ -342,20 +348,20 @@ async fn run(
 
         if app.connections_requested {
             app.connections_requested = false;
-            if let Some(client) = client.as_ref() {
-                if let Err(e) = connections::run(terminal, client).await {
-                    app.status_message = format!("Connections error: {e}");
-                }
+            if let Some(client) = client.as_ref()
+                && let Err(e) = connections::run(terminal, client).await
+            {
+                app.status_message = format!("Connections error: {e}");
             }
             continue;
         }
 
         if app.purposes_requested {
             app.purposes_requested = false;
-            if let Some(client) = client.as_ref() {
-                if let Err(e) = purposes::run(terminal, client).await {
-                    app.status_message = format!("Purposes error: {e}");
-                }
+            if let Some(client) = client.as_ref()
+                && let Err(e) = purposes::run(terminal, client).await
+            {
+                app.status_message = format!("Purposes error: {e}");
             }
             continue;
         }
@@ -571,7 +577,8 @@ async fn handle_action(
                 // we fall back to plain send and warn.
                 let result = match (override_selection, client.as_ws()) {
                     (Some(ovr), Some(ws)) => {
-                        ws.send_prompt_with_override(&conv_id, &prompt, Some(ovr)).await
+                        ws.send_prompt_with_override(&conv_id, &prompt, Some(ovr))
+                            .await
                     }
                     (Some(_), None) => {
                         app.status_message =
@@ -715,8 +722,7 @@ async fn handle_action(
         Action::ToggleTasksPane => {
             app.toggle_tasks_pane();
             app.status_message = if app.tasks.visible {
-                "Tasks pane open (j/k navigate · c cancel · Enter open conv · Ctrl+P close)"
-                    .into()
+                "Tasks pane open (j/k navigate · c cancel · Enter open conv · Ctrl+P close)".into()
             } else {
                 "Tasks pane closed".into()
             };
@@ -728,9 +734,8 @@ async fn handle_action(
                 && let Some(client) = client.as_ref()
                 && let Some(ws) = client.as_ws()
             {
-                let cmd = desktop_assistant_api_model::Command::CancelBackgroundTask {
-                    id: id.0.clone(),
-                };
+                let cmd =
+                    desktop_assistant_api_model::Command::CancelBackgroundTask { id: id.0.clone() };
                 match ws.send_command(cmd).await {
                     Ok(_) => {
                         // Status will move to "Cancelling..." then resolve
@@ -906,8 +911,7 @@ mod tests {
     #[test]
     fn clap_rejects_invalid_transport_value() {
         let error = CliArgs::try_parse_from(args(&["--transport", "http"]))
-            .err()
-            .expect("transport should be validated by clap");
+            .expect_err("transport should be validated by clap");
         let rendered = error.to_string();
         assert!(rendered.contains("ws"));
         assert!(rendered.contains("dbus"));
