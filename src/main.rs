@@ -158,6 +158,8 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("install rustls ring crypto provider");
 
+    credentials::init_store();
+
     let matches = CliArgs::command().get_matches();
     let cli = CliArgs::from_arg_matches(&matches)?;
     let cli_explicit = any_explicit_connection_arg(&matches);
