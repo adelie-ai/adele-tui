@@ -227,10 +227,8 @@ impl Renderer {
                     Some(None) => "• ".to_string(),
                     None => "• ".to_string(),
                 };
-                self.current.push(Span::styled(
-                    format!("{indent}{marker}"),
-                    self.base_style,
-                ));
+                self.current
+                    .push(Span::styled(format!("{indent}{marker}"), self.base_style));
             }
             Tag::Emphasis => self.modifier.insert(Modifier::ITALIC),
             Tag::Strong => self.modifier.insert(Modifier::BOLD),
@@ -361,8 +359,7 @@ impl Renderer {
     fn push_inline_code(&mut self, code: &str) {
         let style = Style::default().fg(COLOR_CODE_FG).bg(COLOR_CODE_BG);
         self.in_code_span = true;
-        self.current
-            .push(Span::styled(format!("`{code}`"), style));
+        self.current.push(Span::styled(format!("`{code}`"), style));
         self.in_code_span = false;
     }
 
@@ -394,14 +391,10 @@ impl Renderer {
             style = style.fg(COLOR_HEADING).add_modifier(extra);
         }
         if self.blockquote_depth > 0 {
-            style = style
-                .fg(COLOR_BLOCKQUOTE)
-                .add_modifier(Modifier::ITALIC);
+            style = style.fg(COLOR_BLOCKQUOTE).add_modifier(Modifier::ITALIC);
         }
         if self.link_target.is_some() {
-            style = style
-                .fg(COLOR_LINK)
-                .add_modifier(Modifier::UNDERLINED);
+            style = style.fg(COLOR_LINK).add_modifier(Modifier::UNDERLINED);
         }
         if !self.modifier.is_empty() {
             style = style.add_modifier(self.modifier);
@@ -410,10 +403,8 @@ impl Renderer {
     }
 
     fn start_blockquote_line(&mut self) {
-        self.current.push(Span::styled(
-            "│ ",
-            Style::default().fg(COLOR_BLOCKQUOTE),
-        ));
+        self.current
+            .push(Span::styled("│ ", Style::default().fg(COLOR_BLOCKQUOTE)));
     }
 
     fn flush_line(&mut self) {
@@ -453,10 +444,7 @@ impl Renderer {
                     let trimmed_line = raw_line.trim_end_matches('\n');
                     let mut spans: Vec<Span<'static>> = Vec::with_capacity(regions.len() + 2);
                     // Leading gutter so the bg covers a small left margin.
-                    spans.push(Span::styled(
-                        " ",
-                        Style::default().bg(COLOR_CODE_BG),
-                    ));
+                    spans.push(Span::styled(" ", Style::default().bg(COLOR_CODE_BG)));
                     if regions.is_empty() {
                         spans.push(Span::styled(
                             trimmed_line.to_string(),
@@ -473,10 +461,7 @@ impl Renderer {
                             spans.push(Span::styled(text, synstyle_to_ratatui(style)));
                         }
                     }
-                    spans.push(Span::styled(
-                        " ",
-                        Style::default().bg(COLOR_CODE_BG),
-                    ));
+                    spans.push(Span::styled(" ", Style::default().bg(COLOR_CODE_BG)));
                     self.lines.push(Line::from(spans));
                 }
             }
@@ -484,10 +469,8 @@ impl Renderer {
                 // Unknown language — fall back to the muted plain code style.
                 let style = Style::default().fg(COLOR_CODE_FG).bg(COLOR_CODE_BG);
                 for raw_line in source.split('\n') {
-                    self.lines.push(Line::from(Span::styled(
-                        format!(" {raw_line} "),
-                        style,
-                    )));
+                    self.lines
+                        .push(Line::from(Span::styled(format!(" {raw_line} "), style)));
                 }
                 // Drop the trailing empty line caused by the source ending in '\n'.
                 if source.ends_with('\n')
@@ -543,10 +526,8 @@ impl Renderer {
             if row_idx == 0 {
                 let total_width: usize =
                     widths.iter().sum::<usize>() + 3 * widths.len().saturating_sub(1);
-                self.lines.push(Line::from(Span::styled(
-                    "─".repeat(total_width),
-                    border,
-                )));
+                self.lines
+                    .push(Line::from(Span::styled("─".repeat(total_width), border)));
             }
         }
         self.lines.push(Line::from(""));
@@ -564,7 +545,12 @@ mod tests {
     fn flatten(lines: &[Line]) -> String {
         lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -611,10 +597,14 @@ mod tests {
         assert!(flat.contains("let x = 1;"));
         assert!(flat.contains("let y = 2;"));
         // Code-block spans should carry the code background color.
-        let any_code_styled = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
-            s.style.bg == Some(COLOR_CODE_BG) && s.content.contains("let x = 1;")
-        });
-        assert!(any_code_styled, "expected a span with code bg on the code line");
+        let any_code_styled = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.style.bg == Some(COLOR_CODE_BG) && s.content.contains("let x = 1;"));
+        assert!(
+            any_code_styled,
+            "expected a span with code bg on the code line"
+        );
     }
 
     #[test]
@@ -637,9 +627,10 @@ mod tests {
     #[test]
     fn heading_styles_with_bold() {
         let lines = render_test("# Heading text\n\nbody");
-        let any_heading_bold = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
-            s.content == "Heading text" && s.style.add_modifier.contains(Modifier::BOLD)
-        });
+        let any_heading_bold = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.content == "Heading text" && s.style.add_modifier.contains(Modifier::BOLD));
         assert!(any_heading_bold);
     }
 
@@ -649,9 +640,10 @@ mod tests {
         let flat = flatten(&lines);
         assert!(flat.contains("docs"));
         assert!(flat.contains("https://example.com"));
-        let any_link = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
-            s.content == "docs" && s.style.add_modifier.contains(Modifier::UNDERLINED)
-        });
+        let any_link = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.content == "docs" && s.style.add_modifier.contains(Modifier::UNDERLINED));
         assert!(any_link);
     }
 
@@ -697,9 +689,10 @@ mod tests {
     fn unknown_language_falls_back_to_plain_code_style() {
         let src = "```not-a-real-lang\nliteral content\n```\n";
         let lines = render_test(src);
-        let plain_span = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
-            s.style.bg == Some(COLOR_CODE_BG) && s.content.contains("literal content")
-        });
+        let plain_span = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.style.bg == Some(COLOR_CODE_BG) && s.content.contains("literal content"));
         assert!(plain_span);
     }
 

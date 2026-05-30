@@ -222,7 +222,10 @@ fn draw_toolbar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     let separator_after_chip = "  ";
     let after_chip_width = separator_after_chip.chars().count() as u16;
-    let hints_budget = area.width.saturating_sub(chip_width).saturating_sub(after_chip_width);
+    let hints_budget = area
+        .width
+        .saturating_sub(chip_width)
+        .saturating_sub(after_chip_width);
     if hints_budget > 0 {
         spans.push(Span::raw(separator_after_chip));
         let (hint_spans, _) = crate::toolbar::render_hints(&app.mode, hints_budget);

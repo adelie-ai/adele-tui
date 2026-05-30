@@ -21,7 +21,9 @@
 use std::io;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use desktop_assistant_api_model::{ConversationModelSelectionView, ModelListing, SendPromptOverride};
+use desktop_assistant_api_model::{
+    ConversationModelSelectionView, ModelListing, SendPromptOverride,
+};
 use desktop_assistant_client_common::TransportClient;
 use futures::StreamExt;
 use ratatui::{
@@ -169,7 +171,9 @@ async fn refresh(state: &mut State, client: &TransportClient, refresh_cache: boo
 
 /// Pre-highlight the row matching the conversation's current selection.
 fn seed_selection(state: &mut State) {
-    let Some(current) = &state.current else { return };
+    let Some(current) = &state.current else {
+        return;
+    };
     if let Some(idx) = state
         .models
         .iter()
@@ -226,10 +230,7 @@ fn draw_header(f: &mut Frame, state: &State, area: Rect) {
     ))];
     if let Some(current) = &state.current {
         lines.push(Line::from(Span::styled(
-            format!(
-                "Current: {} · {}",
-                current.connection_id, current.model_id
-            ),
+            format!("Current: {} · {}", current.connection_id, current.model_id),
             Style::default()
                 .fg(COLOR_CURRENT_PICK)
                 .add_modifier(Modifier::ITALIC),
@@ -255,15 +256,11 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
             .iter()
             .map(|listing| {
                 let mut spans: Vec<Span<'static>> = Vec::new();
-                let is_current = state
-                    .current
-                    .as_ref()
-                    .is_some_and(|c| c.connection_id == listing.connection_id && c.model_id == listing.model.id);
+                let is_current = state.current.as_ref().is_some_and(|c| {
+                    c.connection_id == listing.connection_id && c.model_id == listing.model.id
+                });
                 if is_current {
-                    spans.push(Span::styled(
-                        "★ ",
-                        Style::default().fg(COLOR_CURRENT_PICK),
-                    ));
+                    spans.push(Span::styled("★ ", Style::default().fg(COLOR_CURRENT_PICK)));
                 } else {
                     spans.push(Span::raw("  "));
                 }
@@ -271,10 +268,7 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
                     listing.connection_label.clone(),
                     Style::default().add_modifier(Modifier::BOLD),
                 ));
-                spans.push(Span::styled(
-                    "  ·  ",
-                    Style::default().fg(COLOR_HINT_SEP),
-                ));
+                spans.push(Span::styled("  ·  ", Style::default().fg(COLOR_HINT_SEP)));
                 spans.push(Span::styled(listing.model.id.clone(), Style::default()));
                 if listing.model.display_name != listing.model.id {
                     spans.push(Span::styled(
@@ -339,11 +333,7 @@ fn draw_status(f: &mut Frame, state: &State, area: Rect) {
 }
 
 fn draw_hints(f: &mut Frame, area: Rect) {
-    let hints: &[(&str, &str)] = &[
-        ("Enter", "confirm"),
-        ("r", "refresh"),
-        ("Esc", "cancel"),
-    ];
+    let hints: &[(&str, &str)] = &[("Enter", "confirm"), ("r", "refresh"), ("Esc", "cancel")];
     let mut spans: Vec<Span> = Vec::new();
     for (idx, (key, desc)) in hints.iter().enumerate() {
         if idx > 0 {

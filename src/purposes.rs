@@ -91,12 +91,18 @@ struct EditState {
 
 impl EditState {
     fn next_field(&mut self) {
-        let pos = FIELD_ORDER.iter().position(|f| *f == self.field).unwrap_or(0);
+        let pos = FIELD_ORDER
+            .iter()
+            .position(|f| *f == self.field)
+            .unwrap_or(0);
         self.field = FIELD_ORDER[(pos + 1) % FIELD_ORDER.len()];
     }
 
     fn prev_field(&mut self) {
-        let pos = FIELD_ORDER.iter().position(|f| *f == self.field).unwrap_or(0);
+        let pos = FIELD_ORDER
+            .iter()
+            .position(|f| *f == self.field)
+            .unwrap_or(0);
         self.field = FIELD_ORDER[(pos + FIELD_ORDER.len() - 1) % FIELD_ORDER.len()];
     }
 
@@ -231,7 +237,9 @@ async fn refresh_all(state: &mut State, client: &TransportClient) {
     match conns {
         Ok(CommandResult::Connections(c)) => state.connections = c,
         Ok(other) => {
-            state.error = Some(format!("Unexpected response listing connections: {other:?}"));
+            state.error = Some(format!(
+                "Unexpected response listing connections: {other:?}"
+            ));
             return;
         }
         Err(e) => {
@@ -318,11 +326,7 @@ fn cycle_field(state: &mut State, delta: i32) {
 }
 
 fn cycle_connection(state: &mut State, delta: i32) {
-    let mut options: Vec<String> = state
-        .connections
-        .iter()
-        .map(|c| c.id.clone())
-        .collect();
+    let mut options: Vec<String> = state.connections.iter().map(|c| c.id.clone()).collect();
     if !state.edit.is_interactive() {
         options.insert(0, PRIMARY.to_string());
     }
@@ -565,10 +569,7 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
                         cfg.model.clone()
                     };
                     spans.push(Span::styled(connection_text, Style::default()));
-                    spans.push(Span::styled(
-                        " · ",
-                        Style::default().fg(COLOR_HINT_SEP),
-                    ));
+                    spans.push(Span::styled(" · ", Style::default().fg(COLOR_HINT_SEP)));
                     spans.push(Span::styled(model_text, Style::default()));
                     if let Some(eff) = cfg.effort {
                         spans.push(Span::styled(
@@ -657,15 +658,24 @@ fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
     };
 
     let conn_focused = state.edit.field == EditField::Connection;
-    f.render_widget(label_for("Connection (←/→ or Space)", conn_focused), rows[0]);
-    f.render_widget(value_for(state.edit.connection.clone(), conn_focused), rows[1]);
+    f.render_widget(
+        label_for("Connection (←/→ or Space)", conn_focused),
+        rows[0],
+    );
+    f.render_widget(
+        value_for(state.edit.connection.clone(), conn_focused),
+        rows[1],
+    );
 
     let model_focused = state.edit.field == EditField::Model;
     f.render_widget(label_for("Model (←/→ or Space)", model_focused), rows[2]);
     f.render_widget(value_for(state.edit.model.clone(), model_focused), rows[3]);
 
     let effort_focused = state.edit.field == EditField::Effort;
-    f.render_widget(label_for("Effort (Anthropic-only; n/a elsewhere)", effort_focused), rows[4]);
+    f.render_widget(
+        label_for("Effort (Anthropic-only; n/a elsewhere)", effort_focused),
+        rows[4],
+    );
     f.render_widget(
         value_for(effort_label(state.edit.effort).to_string(), effort_focused),
         rows[5],
@@ -692,11 +702,7 @@ fn draw_status(f: &mut Frame, state: &State, area: Rect) {
 
 fn draw_hints(f: &mut Frame, state: &State, area: Rect) {
     let hints: &[(&str, &str)] = match state.mode {
-        Mode::List => &[
-            ("Enter", "edit"),
-            ("r", "refresh"),
-            ("Esc", "back to chat"),
-        ],
+        Mode::List => &[("Enter", "edit"), ("r", "refresh"), ("Esc", "back to chat")],
         Mode::Edit => &[
             ("Tab", "next field"),
             ("←/→", "cycle value"),

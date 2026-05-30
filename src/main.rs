@@ -4,9 +4,9 @@ mod credentials;
 mod kb;
 mod keys;
 mod markdown;
+mod model_selector;
 mod oauth;
 mod picker;
-mod model_selector;
 mod profile;
 mod purposes;
 mod settings;
@@ -571,7 +571,8 @@ async fn handle_action(
                 // we fall back to plain send and warn.
                 let result = match (override_selection, client.as_ws()) {
                     (Some(ovr), Some(ws)) => {
-                        ws.send_prompt_with_override(&conv_id, &prompt, Some(ovr)).await
+                        ws.send_prompt_with_override(&conv_id, &prompt, Some(ovr))
+                            .await
                     }
                     (Some(_), None) => {
                         app.status_message =
@@ -715,8 +716,7 @@ async fn handle_action(
         Action::ToggleTasksPane => {
             app.toggle_tasks_pane();
             app.status_message = if app.tasks.visible {
-                "Tasks pane open (j/k navigate · c cancel · Enter open conv · Ctrl+P close)"
-                    .into()
+                "Tasks pane open (j/k navigate · c cancel · Enter open conv · Ctrl+P close)".into()
             } else {
                 "Tasks pane closed".into()
             };
@@ -728,9 +728,8 @@ async fn handle_action(
                 && let Some(client) = client.as_ref()
                 && let Some(ws) = client.as_ws()
             {
-                let cmd = desktop_assistant_api_model::Command::CancelBackgroundTask {
-                    id: id.0.clone(),
-                };
+                let cmd =
+                    desktop_assistant_api_model::Command::CancelBackgroundTask { id: id.0.clone() };
                 match ws.send_command(cmd).await {
                     Ok(_) => {
                         // Status will move to "Cancelling..." then resolve

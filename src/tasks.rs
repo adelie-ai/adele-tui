@@ -34,9 +34,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use desktop_assistant_api_model::{
-    LogLevel, TaskId, TaskKind, TaskLogEntry, TaskStatus, TaskView,
-};
+use desktop_assistant_api_model::{LogLevel, TaskId, TaskKind, TaskLogEntry, TaskStatus, TaskView};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -391,10 +389,7 @@ fn draw_task_list(f: &mut Frame, pane: &TaskPane, area: Rect) {
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    format!("  {age:>4}"),
-                    Style::default().fg(COLOR_HINT_DESC),
-                ),
+                Span::styled(format!("  {age:>4}"), Style::default().fg(COLOR_HINT_DESC)),
                 parent_indicator,
                 Span::raw(" "),
                 Span::styled(row.title.clone(), Style::default().fg(Color::White)),
@@ -866,7 +861,11 @@ mod tests {
     #[test]
     fn tasks_pane_renders_at_small_widths_without_panic() {
         let mut pane = TaskPane::new();
-        pane.apply_task_started(view("t-1", "Title that is fairly long", TaskStatus::Running));
+        pane.apply_task_started(view(
+            "t-1",
+            "Title that is fairly long",
+            TaskStatus::Running,
+        ));
         let _ = render_to_buffer(&pane, 40, 12);
     }
 

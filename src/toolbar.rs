@@ -70,10 +70,7 @@ pub fn render_hints(mode: &InputMode, max_width: u16) -> (Vec<Span<'static>>, u1
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(chosen.len() * 4);
     for (idx, (key, desc)) in chosen.iter().enumerate() {
         if idx > 0 {
-            spans.push(Span::styled(
-                "  ·  ",
-                Style::default().fg(COLOR_HINT_SEP),
-            ));
+            spans.push(Span::styled("  ·  ", Style::default().fg(COLOR_HINT_SEP)));
         }
         spans.push(Span::styled(
             (*key).to_string(),

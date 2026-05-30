@@ -300,7 +300,11 @@ mod tests {
     #[test]
     fn normal_ctrl_modifier_ignored() {
         assert_eq!(
-            handle_key_event(key_with_mod(KeyCode::Char('q'), KeyModifiers::CONTROL), &InputMode::Normal, false),
+            handle_key_event(
+                key_with_mod(KeyCode::Char('q'), KeyModifiers::CONTROL),
+                &InputMode::Normal,
+                false
+            ),
             None
         );
     }
@@ -308,7 +312,11 @@ mod tests {
     #[test]
     fn normal_alt_modifier_ignored() {
         assert_eq!(
-            handle_key_event(key_with_mod(KeyCode::Char('j'), KeyModifiers::ALT), &InputMode::Normal, false),
+            handle_key_event(
+                key_with_mod(KeyCode::Char('j'), KeyModifiers::ALT),
+                &InputMode::Normal,
+                false
+            ),
             None
         );
     }
@@ -334,7 +342,11 @@ mod tests {
     #[test]
     fn editing_shift_enter_inserts_newline() {
         assert_eq!(
-            handle_key_event(key_with_mod(KeyCode::Enter, KeyModifiers::SHIFT), &InputMode::Editing, false),
+            handle_key_event(
+                key_with_mod(KeyCode::Enter, KeyModifiers::SHIFT),
+                &InputMode::Editing,
+                false
+            ),
             Some(Action::InsertNewline)
         );
     }
@@ -342,7 +354,11 @@ mod tests {
     #[test]
     fn editing_newline_char_is_forwarded_to_textarea() {
         assert_eq!(
-            handle_key_event(key_with_mod(KeyCode::Char('\n'), KeyModifiers::NONE), &InputMode::Editing, false),
+            handle_key_event(
+                key_with_mod(KeyCode::Char('\n'), KeyModifiers::NONE),
+                &InputMode::Editing,
+                false
+            ),
             Some(Action::InsertNewline)
         );
     }
@@ -350,7 +366,11 @@ mod tests {
     #[test]
     fn editing_carriage_return_char_is_forwarded_to_textarea() {
         assert_eq!(
-            handle_key_event(key_with_mod(KeyCode::Char('\r'), KeyModifiers::NONE), &InputMode::Editing, false),
+            handle_key_event(
+                key_with_mod(KeyCode::Char('\r'), KeyModifiers::NONE),
+                &InputMode::Editing,
+                false
+            ),
             Some(Action::InsertNewline)
         );
     }
@@ -358,7 +378,11 @@ mod tests {
     #[test]
     fn editing_ctrl_j_inserts_newline() {
         assert_eq!(
-            handle_key_event(key_with_mod(KeyCode::Char('j'), KeyModifiers::CONTROL), &InputMode::Editing, false),
+            handle_key_event(
+                key_with_mod(KeyCode::Char('j'), KeyModifiers::CONTROL),
+                &InputMode::Editing,
+                false
+            ),
             Some(Action::InsertNewline)
         );
     }
@@ -366,7 +390,11 @@ mod tests {
     #[test]
     fn editing_alt_enter_is_forwarded_to_textarea() {
         assert_eq!(
-            handle_key_event(key_with_mod(KeyCode::Enter, KeyModifiers::ALT), &InputMode::Editing, false),
+            handle_key_event(
+                key_with_mod(KeyCode::Enter, KeyModifiers::ALT),
+                &InputMode::Editing,
+                false
+            ),
             None
         );
     }
@@ -413,7 +441,11 @@ mod tests {
     #[test]
     fn ctrl_u_scrolls_up() {
         assert_eq!(
-            handle_key_event(key_with_mod(KeyCode::Char('u'), KeyModifiers::CONTROL), &InputMode::Normal, false),
+            handle_key_event(
+                key_with_mod(KeyCode::Char('u'), KeyModifiers::CONTROL),
+                &InputMode::Normal,
+                false
+            ),
             Some(Action::ScrollUp)
         );
     }
@@ -421,7 +453,11 @@ mod tests {
     #[test]
     fn ctrl_d_scrolls_down() {
         assert_eq!(
-            handle_key_event(key_with_mod(KeyCode::Char('d'), KeyModifiers::CONTROL), &InputMode::Normal, false),
+            handle_key_event(
+                key_with_mod(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                &InputMode::Normal,
+                false
+            ),
             Some(Action::ScrollDown)
         );
     }
@@ -429,7 +465,11 @@ mod tests {
     #[test]
     fn ctrl_e_scrolls_to_bottom() {
         assert_eq!(
-            handle_key_event(key_with_mod(KeyCode::Char('e'), KeyModifiers::CONTROL), &InputMode::Normal, false),
+            handle_key_event(
+                key_with_mod(KeyCode::Char('e'), KeyModifiers::CONTROL),
+                &InputMode::Normal,
+                false
+            ),
             Some(Action::ScrollToBottom)
         );
     }
@@ -437,7 +477,11 @@ mod tests {
     #[test]
     fn ctrl_u_works_in_editing_mode() {
         assert_eq!(
-            handle_key_event(key_with_mod(KeyCode::Char('u'), KeyModifiers::CONTROL), &InputMode::Editing, false),
+            handle_key_event(
+                key_with_mod(KeyCode::Char('u'), KeyModifiers::CONTROL),
+                &InputMode::Editing,
+                false
+            ),
             Some(Action::ScrollUp)
         );
     }
@@ -445,7 +489,11 @@ mod tests {
     #[test]
     fn ctrl_d_works_in_editing_mode() {
         assert_eq!(
-            handle_key_event(key_with_mod(KeyCode::Char('d'), KeyModifiers::CONTROL), &InputMode::Editing, false),
+            handle_key_event(
+                key_with_mod(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                &InputMode::Editing,
+                false
+            ),
             Some(Action::ScrollDown)
         );
     }
@@ -510,11 +558,19 @@ mod tests {
         // Ctrl+a/e/u/k are textarea editing shortcuts in rename mode and
         // must NOT be intercepted as scroll commands.
         assert_eq!(
-            handle_key_event(key_with_mod(KeyCode::Char('u'), KeyModifiers::CONTROL), &InputMode::Renaming, false),
+            handle_key_event(
+                key_with_mod(KeyCode::Char('u'), KeyModifiers::CONTROL),
+                &InputMode::Renaming,
+                false
+            ),
             None
         );
         assert_eq!(
-            handle_key_event(key_with_mod(KeyCode::Char('a'), KeyModifiers::CONTROL), &InputMode::Renaming, false),
+            handle_key_event(
+                key_with_mod(KeyCode::Char('a'), KeyModifiers::CONTROL),
+                &InputMode::Renaming,
+                false
+            ),
             None
         );
     }
@@ -524,7 +580,11 @@ mod tests {
     #[test]
     fn ctrl_t_toggles_debug_in_normal() {
         assert_eq!(
-            handle_key_event(key_with_mod(KeyCode::Char('t'), KeyModifiers::CONTROL), &InputMode::Normal, false),
+            handle_key_event(
+                key_with_mod(KeyCode::Char('t'), KeyModifiers::CONTROL),
+                &InputMode::Normal,
+                false
+            ),
             Some(Action::ToggleDebug)
         );
     }
@@ -532,7 +592,11 @@ mod tests {
     #[test]
     fn ctrl_t_toggles_debug_in_editing() {
         assert_eq!(
-            handle_key_event(key_with_mod(KeyCode::Char('t'), KeyModifiers::CONTROL), &InputMode::Editing, false),
+            handle_key_event(
+                key_with_mod(KeyCode::Char('t'), KeyModifiers::CONTROL),
+                &InputMode::Editing,
+                false
+            ),
             Some(Action::ToggleDebug)
         );
     }
@@ -542,7 +606,11 @@ mod tests {
     #[test]
     fn ctrl_b_toggles_sidebar_in_normal() {
         assert_eq!(
-            handle_key_event(key_with_mod(KeyCode::Char('b'), KeyModifiers::CONTROL), &InputMode::Normal, false),
+            handle_key_event(
+                key_with_mod(KeyCode::Char('b'), KeyModifiers::CONTROL),
+                &InputMode::Normal,
+                false
+            ),
             Some(Action::ToggleSidebar)
         );
     }
@@ -550,7 +618,11 @@ mod tests {
     #[test]
     fn ctrl_b_toggles_sidebar_in_editing() {
         assert_eq!(
-            handle_key_event(key_with_mod(KeyCode::Char('b'), KeyModifiers::CONTROL), &InputMode::Editing, false),
+            handle_key_event(
+                key_with_mod(KeyCode::Char('b'), KeyModifiers::CONTROL),
+                &InputMode::Editing,
+                false
+            ),
             Some(Action::ToggleSidebar)
         );
     }
@@ -578,7 +650,11 @@ mod tests {
     #[test]
     fn ctrl_k_opens_kb_in_normal() {
         assert_eq!(
-            handle_key_event(key_with_mod(KeyCode::Char('k'), KeyModifiers::CONTROL), &InputMode::Normal, false),
+            handle_key_event(
+                key_with_mod(KeyCode::Char('k'), KeyModifiers::CONTROL),
+                &InputMode::Normal,
+                false
+            ),
             Some(Action::OpenKnowledgeBase)
         );
     }
@@ -586,7 +662,11 @@ mod tests {
     #[test]
     fn ctrl_k_opens_kb_in_editing() {
         assert_eq!(
-            handle_key_event(key_with_mod(KeyCode::Char('k'), KeyModifiers::CONTROL), &InputMode::Editing, false),
+            handle_key_event(
+                key_with_mod(KeyCode::Char('k'), KeyModifiers::CONTROL),
+                &InputMode::Editing,
+                false
+            ),
             Some(Action::OpenKnowledgeBase)
         );
     }
@@ -630,7 +710,11 @@ mod tests {
     #[test]
     fn ctrl_m_opens_model_picker_in_normal() {
         assert_eq!(
-            handle_key_event(key_with_mod(KeyCode::Char('m'), KeyModifiers::CONTROL), &InputMode::Normal, false),
+            handle_key_event(
+                key_with_mod(KeyCode::Char('m'), KeyModifiers::CONTROL),
+                &InputMode::Normal,
+                false
+            ),
             Some(Action::OpenModelPicker)
         );
     }
@@ -638,7 +722,11 @@ mod tests {
     #[test]
     fn ctrl_m_opens_model_picker_in_editing() {
         assert_eq!(
-            handle_key_event(key_with_mod(KeyCode::Char('m'), KeyModifiers::CONTROL), &InputMode::Editing, false),
+            handle_key_event(
+                key_with_mod(KeyCode::Char('m'), KeyModifiers::CONTROL),
+                &InputMode::Editing,
+                false
+            ),
             Some(Action::OpenModelPicker)
         );
     }
