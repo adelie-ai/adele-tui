@@ -66,6 +66,22 @@ pub struct TaskRow {
     /// `TaskKind` variant (all three carry a conversation), but kept
     /// `Option<_>` so future variants can opt out.
     pub conversation_id: Option<String>,
+    /// Human-readable label for the task's `TaskKind` ("Chat" /
+    /// "Subagent" / "Agent"), rendered as a dim badge on the row.
+    /// Mirrors adele-gtk#58.
+    pub kind_label: &'static str,
+}
+
+/// Map a `TaskKind` to a short, human-readable label for the row badge.
+/// `Conversation` is a foreground chat turn, `Standalone` is a
+/// user-initiated background agent, and `Subagent` is a spawned child.
+/// Mirrors the labels adele-gtk#58 settled on.
+pub fn kind_label_for(kind: &TaskKind) -> &'static str {
+    match kind {
+        TaskKind::Conversation { .. } => "Chat",
+        TaskKind::Subagent { .. } => "Subagent",
+        TaskKind::Standalone { .. } => "Agent",
+    }
 }
 
 impl TaskRow {
@@ -89,6 +105,7 @@ impl TaskRow {
             parent: view.parent.clone(),
             progress_hint: view.progress_hint.clone(),
             conversation_id,
+            kind_label: kind_label_for(&view.kind),
         }
     }
 }
@@ -392,6 +409,12 @@ fn draw_task_list(f: &mut Frame, pane: &TaskPane, area: Rect) {
                 Span::styled(format!("  {age:>4}"), Style::default().fg(COLOR_HINT_DESC)),
                 parent_indicator,
                 Span::raw(" "),
+                Span::styled(
+                    format!("[{}] ", row.kind_label),
+                    Style::default()
+                        .fg(COLOR_HINT_DESC)
+                        .add_modifier(Modifier::DIM),
+                ),
                 Span::styled(row.title.clone(), Style::default().fg(Color::White)),
             ];
             if !progress.is_empty() {
@@ -804,6 +827,61 @@ mod tests {
     }
 
     #[test]
+    fn from_view_sets_kind_label_for_each_variant() {
+        // Standalone -> "Agent"
+        let standalone = TaskRow::from_view(&view("t-1", "Solo", TaskStatus::Running));
+        assert_eq!(standalone.kind_label, "Agent");
+
+        // Conversation -> "Chat"
+        let conv = TaskView {
+            id: TaskId("t-2".into()),
+            kind: TaskKind::Conversation {
+                conversation_id: "conv-2".into(),
+            },
+            status: TaskStatus::Running,
+            started_at: 1,
+            ended_at: None,
+            last_error: None,
+            parent: None,
+            children: Vec::new(),
+            title: "Chatting".into(),
+            progress_hint: None,
+        };
+        assert_eq!(TaskRow::from_view(&conv).kind_label, "Chat");
+
+        // Subagent -> "Subagent"
+        let sub = TaskView {
+            id: TaskId("t-3".into()),
+            kind: TaskKind::Subagent {
+                parent_task_id: TaskId("parent".into()),
+                conversation_id: "sub-conv".into(),
+                name: "child".into(),
+            },
+            status: TaskStatus::Running,
+            started_at: 1,
+            ended_at: None,
+            last_error: None,
+            parent: Some(TaskId("parent".into())),
+            children: Vec::new(),
+            title: "child".into(),
+            progress_hint: None,
+        };
+        assert_eq!(TaskRow::from_view(&sub).kind_label, "Subagent");
+    }
+
+    #[test]
+    fn tasks_pane_renders_kind_label_badge() {
+        let mut pane = TaskPane::new();
+        // `view(..)` builds a Standalone task -> "Agent" badge.
+        pane.apply_task_started(view("aaaaaaaa", "Solo", TaskStatus::Running));
+        let dump = render_to_buffer(&pane, 120, 24);
+        assert!(
+            dump.contains("[Agent]"),
+            "no [Agent] badge in dump:\n{dump}"
+        );
+    }
+
+    #[test]
     fn running_badge_empty_when_zero_running() {
         let pane = TaskPane::new();
         assert_eq!(running_badge(&pane), "");
@@ -882,6 +960,7 @@ mod tests {
             parent: None,
             progress_hint: None,
             conversation_id: None,
+            kind_label: "Agent",
         }
     }
 
