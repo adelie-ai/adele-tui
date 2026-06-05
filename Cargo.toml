@@ -27,8 +27,26 @@ syntect = { version = "5", default-features = false, features = ["default-fancy"
 ratatui-textarea = "0.9"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 url = "2"
+toml = "0.9"
+tracing = "0.1"
 # Shared protocol + transport crates live in the desktop-assistant repo.
 # Cargo resolves the package by name from that workspace; Cargo.lock pins
 # the exact revision for reproducibility.
 desktop-assistant-client-common = { git = "https://github.com/adelie-ai/desktop-assistant.git", branch = "main" }
 desktop-assistant-api-model = { git = "https://github.com/adelie-ai/desktop-assistant.git", branch = "main" }
+
+# Embeddable voice module (adelie-ai/voice phase 1) for in-app dictation +
+# reply playback with no voice daemon — see adele-tui#67 / voice#34. Path-dep
+# of the sibling `voice` checkout, mirroring how we path-dep desktop-assistant
+# from adele-gtk; revisit git-dep/publish once the module's API is stable. The
+# two adapter crates are named so we can spell the concrete pipeline type
+# `Dictation<SileroVad, WhisperStt>`; cargo resolves the rest of the module's
+# transitive deps from the voice workspace automatically.
+[dependencies.adele-voice-module]
+path = "../voice/crates/module"
+
+[dependencies.adele-voice-vad-silero]
+path = "../voice/crates/vad-silero"
+
+[dependencies.adele-voice-stt-whisper]
+path = "../voice/crates/stt-whisper"

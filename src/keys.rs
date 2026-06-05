@@ -42,6 +42,11 @@ pub enum Action {
     CancelSelectedTask,
     /// Jump to the conversation linked to the highlighted task.
     OpenSelectedTaskConversation,
+    /// Start one-shot embedded dictation: capture a single utterance from the
+    /// mic and drop the transcript into the prompt input. Bound to `Ctrl+G`
+    /// ("Go, voice") — free across modes and not intercepted by terminals or
+    /// the textarea. No-op unless voice is in `embedded` mode (adele-tui#67).
+    Dictate,
 }
 
 /// Handle key events that we intercept before passing to textarea.
@@ -93,6 +98,9 @@ pub fn handle_key_event(
             // any non-renaming mode so the user can pop it open while
             // editing a prompt to glance at running subagents.
             KeyCode::Char('p') => Some(Action::ToggleTasksPane),
+            // Ctrl+G starts embedded dictation (mic → prompt). A no-op when
+            // voice isn't in embedded mode; main.rs gates on the session.
+            KeyCode::Char('g') => Some(Action::Dictate),
             _ => None,
         };
     }
@@ -754,6 +762,48 @@ mod tests {
                 false
             ),
             Some(Action::ToggleTasksPane)
+        );
+    }
+
+    // --- Ctrl+G starts dictation ---
+
+    #[test]
+    fn ctrl_g_dictates_in_normal() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('g'), KeyModifiers::CONTROL),
+                &InputMode::Normal,
+                false
+            ),
+            Some(Action::Dictate)
+        );
+    }
+
+    #[test]
+    fn ctrl_g_dictates_in_editing() {
+        // Dictation must be reachable while composing a prompt — that's the
+        // primary use (mic appends to the input you're typing).
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('g'), KeyModifiers::CONTROL),
+                &InputMode::Editing,
+                false
+            ),
+            Some(Action::Dictate)
+        );
+    }
+
+    #[test]
+    fn ctrl_g_is_not_intercepted_in_renaming() {
+        // Renaming forwards all Ctrl combos to the rename textarea; dictation
+        // must not hijack them mid-rename.
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('g'), KeyModifiers::CONTROL),
+                &InputMode::Renaming,
+                false
+            ),
+            None
         );
     }
 

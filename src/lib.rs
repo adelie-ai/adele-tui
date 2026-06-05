@@ -20,3 +20,4 @@ pub mod settings;
 pub mod tasks;
 pub mod toolbar;
 pub mod ui;
+pub mod voice;
