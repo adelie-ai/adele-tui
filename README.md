@@ -24,6 +24,41 @@ chat, tool calls, and background tasks.
 - **Debug view toggle** for tool and system messages, **conversation rename**,
   **auto-reconnect** with backoff, and a **keybind hint toolbar** at the
   bottom of the window.
+- **Embedded voice** (optional, off by default) — `Ctrl+G` dictates a prompt
+  (mic → speech-to-text) straight into the composer and sends it; replies can
+  be spoken back. Runs in-process with **no voice daemon and no wake word**.
+
+## Voice (embedded dictation + playback)
+
+The TUI can do in-app dictation and reply playback by embedding the
+[`adele-voice-module`](https://github.com/adelie-ai/voice) library — entirely
+in-process, reaching only the daemon/orchestrator the TUI already talks to. No
+voice daemon and no wake word: those stay in the voice *service* (run the voice
+daemon if you want hands-free "Hey Adele").
+
+It is **off by default**. Enable it in `~/.config/adele-tui/voice.toml`:
+
+```toml
+# off (default) | embedded | daemon
+#   embedded — in-process dictation + playback (this feature)
+#   daemon   — reserved; the TUI has no daemon voice client, so it acts as off
+mode = "embedded"
+
+# Speak assistant replies aloud after they finish streaming.
+play_replies = false
+
+# All sections below are optional; each falls back to the same defaults the
+# voice daemon uses (models under $XDG_DATA_HOME/adele-voice/models).
+[tts]
+backend = "kokoro"   # kokoro (local, default) | piper (local) | polly (AWS, billable)
+```
+
+Then press **`Ctrl+G`** to dictate: speak after the "Listening…" indicator
+appears; the transcript is placed in the prompt and sent. The Silero VAD/Whisper
+models (and the TTS backend) load once in the background at startup; until they
+are ready, `Ctrl+G` reports that voice is still loading. If the models are not
+provisioned the TUI just reports voice is unavailable and otherwise runs
+normally — voice is a convenience, never load-bearing.
 
 ## Requirements
 
@@ -69,6 +104,12 @@ The shared protocol types and transport clients live in
 under `crates/api-model` and `crates/client-common`. This repo pulls them in
 as git dependencies so all Adele clients (TUI, GTK, KDE) share one source of
 truth. `Cargo.lock` pins the exact revision; `cargo update` advances it.
+
+The embedded voice module is **path-depended** from a sibling `voice` checkout
+(`../voice/crates/module`), mirroring how the GTK client path-deps
+`desktop-assistant`. Clone [`adelie-ai/voice`](https://github.com/adelie-ai/voice)
+next to this repo to build with voice; revisit a git-dep/publish once the
+module's API stabilizes (see voice#34).
 
 ## License
 

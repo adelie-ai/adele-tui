@@ -19,6 +19,7 @@ mod settings;
 mod tasks;
 mod toolbar;
 mod ui;
+mod voice;
 
 use std::io;
 use std::path::PathBuf;
@@ -49,6 +50,7 @@ use keys::{Action, handle_key_event};
 use picker::PickerOutcome;
 use profile::ProfileStore;
 use settings::Settings;
+use voice::{VoiceConfig, VoiceSession};
 
 const DEFAULT_WS_URL: &str = desktop_assistant_client_common::config::DEFAULT_WS_URL;
 const DEFAULT_WS_SUBJECT: &str = desktop_assistant_client_common::config::DEFAULT_WS_SUBJECT;
@@ -319,6 +321,28 @@ async fn run(
 
     let mut event_stream = crossterm::event::EventStream::new();
 
+    // Embedded voice (adele-tui#67). When voice is in `embedded` mode we build
+    // the session (load the VAD/STT ONNX models + the TTS backend) once, on a
+    // background task, and receive it over `session_rx`. Building does NOT open
+    // the mic — `dictate()` does that only on an explicit Ctrl+G — so the model
+    // load just overlaps with the user settling into the chat. Both the capture
+    // result and the ready session are merged into the select! loop like every
+    // other async source (per AGENTS.md). Off/daemon mode wires nothing.
+    let voice_cfg = VoiceConfig::load();
+    let mut voice_session: Option<VoiceSession> = None;
+    let mut dictating = false;
+    let (dictation_tx, mut dictation_rx) = unbounded_channel::<DictationOutcome>();
+    let mut session_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<VoiceSession>>> = None;
+    if voice_cfg.embedded_enabled() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cfg = voice_cfg.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(VoiceSession::build(&cfg).await);
+        });
+        session_rx = Some(rx);
+        app.status_message = "Voice: loading models… (Ctrl+G to dictate)".into();
+    }
+
     loop {
         terminal.draw(|f| ui::draw(f, &mut app))?;
 
@@ -395,7 +419,17 @@ async fn run(
                         continue;
                     }
                     if let Some(action) = handle_key_event(key, &app.mode, app.tasks.visible) {
-                        handle_action(&mut app, &client, action).await;
+                        if action == Action::Dictate {
+                            start_dictation(
+                                &mut app,
+                                &voice_cfg,
+                                &voice_session,
+                                &mut dictating,
+                                &dictation_tx,
+                            );
+                        } else {
+                            handle_action(&mut app, &client, action).await;
+                        }
                     } else {
                         match app.mode {
                             InputMode::Editing => {
@@ -416,6 +450,20 @@ async fn run(
                     }
                     SignalEvent::Complete { request_id, full_response } => {
                         app.complete_streaming(&request_id, &full_response);
+                        // Speak the reply aloud (embedded TTS, no daemon) when
+                        // enabled. Fire-and-forget on a task so synth+playback
+                        // never blocks the UI; `Speaker` is cheap to clone.
+                        if let Some(session) = voice_session.as_ref()
+                            && session.play_replies()
+                            && !full_response.trim().is_empty()
+                        {
+                            let speaker = session.speaker();
+                            tokio::spawn(async move {
+                                if let Err(e) = speaker.say(&full_response).await {
+                                    tracing::warn!("voice playback failed: {e}");
+                                }
+                            });
+                        }
                     }
                     SignalEvent::Error { request_id, error } => {
                         app.streaming_error(&request_id, &error);
@@ -501,6 +549,47 @@ async fn run(
                     }
                 }
             }
+            // The embedded voice session finished loading (or failed). Cache it
+            // for the dictate/playback paths; on failure, fall back to voice
+            // off. Polled only while `session_rx` is Some — a oneshot must not
+            // be awaited after it resolves, so we clear it once consumed.
+            built = async {
+                match session_rx.as_mut() {
+                    Some(rx) => rx.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                session_rx = None;
+                match built {
+                    Ok(Ok(session)) => {
+                        voice_session = Some(session);
+                        app.status_message = "Voice ready (Ctrl+G to dictate)".into();
+                    }
+                    Ok(Err(e)) => {
+                        app.status_message = format!("Voice unavailable: {e}");
+                    }
+                    // Builder task dropped without sending — treat as voice off.
+                    Err(_) => {}
+                }
+            }
+            // A dictation capture finished: drop the transcript into the prompt
+            // and send it through the normal assistant path, or report why not.
+            Some(outcome) = dictation_rx.recv() => {
+                dictating = false;
+                app.set_assistant_status("");
+                match outcome {
+                    DictationOutcome::Transcribed(text) => {
+                        insert_dictated_text(&mut app, &text);
+                        send_prompt_from_input(&mut app, &client).await;
+                    }
+                    DictationOutcome::NoSpeech => {
+                        app.status_message = "No speech detected".into();
+                    }
+                    DictationOutcome::Failed(e) => {
+                        app.status_message = format!("Dictation failed: {e}");
+                    }
+                }
+            }
         }
     }
 }
@@ -568,34 +657,11 @@ async fn handle_action(
             }
         }
         Action::ExitEditMode => app.enter_normal_mode(),
-        Action::SubmitPrompt => {
-            if let Some((conv_id, prompt)) = app.submit_prompt()
-                && let Some(client) = client.as_ref()
-            {
-                let override_selection = app.take_pending_override();
-                // Use the WS override path when one was staged via the
-                // model picker; the trait-level `send_prompt` only takes
-                // the bare prompt. D-Bus + override isn't supported yet —
-                // we fall back to plain send and warn.
-                let result = match (override_selection, client.as_ws()) {
-                    (Some(ovr), Some(ws)) => {
-                        ws.send_prompt_with_override(&conv_id, &prompt, Some(ovr))
-                            .await
-                    }
-                    (Some(_), None) => {
-                        app.status_message =
-                            "Model override only works over WebSocket — sent without override"
-                                .into();
-                        client.send_prompt(&conv_id, &prompt).await
-                    }
-                    (None, _) => client.send_prompt(&conv_id, &prompt).await,
-                };
-                match result {
-                    Ok(task_id) => app.apply_prompt_ack(task_id),
-                    Err(e) => app.status_message = format!("Send error: {e}"),
-                }
-            }
-        }
+        Action::SubmitPrompt => send_prompt_from_input(app, client).await,
+        // Dictation is handled in the event loop (it needs the embedded voice
+        // session + a result channel + a spawned capture task — loop-local
+        // resources that don't belong in `handle_action`'s signature).
+        Action::Dictate => {}
         Action::InsertNewline => {
             app.textarea.insert_newline();
         }
@@ -761,6 +827,110 @@ async fn handle_action(
                     Err(e) => app.status_message = format!("Open conversation error: {e}"),
                 }
             }
+        }
+    }
+}
+
+/// Result of a one-shot embedded dictation capture, delivered from the capture
+/// task back to the event loop.
+enum DictationOutcome {
+    /// A non-empty transcript was produced.
+    Transcribed(String),
+    /// The capture ended with no usable speech (timed out, near-silent, or an
+    /// empty transcript) — the module returned `None`.
+    NoSpeech,
+    /// The capture errored (mic open failed, model error, …).
+    Failed(String),
+}
+
+/// Begin a one-shot dictation capture, if embedded voice is ready and not
+/// already capturing. Spawns the mic→VAD→Whisper work on a task and reports the
+/// outcome over `dictation_tx`; the UI just shows a "Listening…" indicator.
+///
+/// Gating order matters: nothing here opens the mic unless voice is in
+/// `embedded` mode, the session has loaded, and no capture is already running.
+fn start_dictation(
+    app: &mut App,
+    cfg: &VoiceConfig,
+    session: &Option<VoiceSession>,
+    dictating: &mut bool,
+    dictation_tx: &tokio::sync::mpsc::UnboundedSender<DictationOutcome>,
+) {
+    if !cfg.embedded_enabled() {
+        app.status_message =
+            "Voice is off — set mode = \"embedded\" in ~/.config/adele-tui/voice.toml".into();
+        return;
+    }
+    if *dictating {
+        app.status_message = "Already listening…".into();
+        return;
+    }
+    let Some(session) = session.as_ref() else {
+        app.status_message = "Voice still loading models — try again in a moment".into();
+        return;
+    };
+
+    *dictating = true;
+    // Reuse the transient assistant-status indicator line for "Listening…".
+    app.set_assistant_status("Listening…");
+    let handle = session.dictation();
+    let tx = dictation_tx.clone();
+    tokio::spawn(async move {
+        // One capture at a time: holding the lock for the whole capture both
+        // gives this task the `&mut Dictation` it needs and prevents a second
+        // press from opening the mic concurrently.
+        let mut dictation = handle.lock().await;
+        let outcome = match dictation.dictate().await {
+            Ok(Some(text)) => DictationOutcome::Transcribed(text),
+            Ok(None) => DictationOutcome::NoSpeech,
+            Err(e) => DictationOutcome::Failed(e.to_string()),
+        };
+        let _ = tx.send(outcome);
+    });
+}
+
+/// Drop a dictated transcript into the prompt input, ready to send. Switches to
+/// editing mode and appends to any text already in the composer (with a
+/// separating space) so dictation can extend a partially typed prompt.
+fn insert_dictated_text(app: &mut App, text: &str) {
+    app.enter_editing_mode();
+    let existing = app.textarea_content();
+    if !existing.is_empty() && !existing.ends_with(char::is_whitespace) {
+        app.textarea.insert_char(' ');
+    }
+    app.textarea.insert_str(text);
+}
+
+/// Send whatever is in the prompt input to the assistant over the current
+/// transport. Shared by the keyboard submit (`Enter`) and the dictation path
+/// (which appends a transcript to the input, then submits via the same route),
+/// so both honor the staged model override and the same ack handling.
+async fn send_prompt_from_input(
+    app: &mut App,
+    client: &Option<desktop_assistant_client_common::TransportClient>,
+) {
+    if let Some((conv_id, prompt)) = app.submit_prompt()
+        && let Some(client) = client.as_ref()
+    {
+        let override_selection = app.take_pending_override();
+        // Use the WS override path when one was staged via the model picker;
+        // the trait-level `send_prompt` only takes the bare prompt. D-Bus +
+        // override isn't supported yet — we fall back to plain send and warn.
+        let result = match (override_selection, client.as_ws()) {
+            (Some(ovr), Some(ws)) => {
+                ws.send_prompt_with_override(&conv_id, &prompt, Some(ovr))
+                    .await
+            }
+            (Some(_), None) => {
+                app.status_message =
+                    "Model override only works over WebSocket — sent without override".into();
+                client.send_prompt(&conv_id, &prompt).await
+            }
+            (None, _) => client.send_prompt(&conv_id, &prompt).await,
+        };
+        match result {
+            Ok(task_id) => app.apply_prompt_ack(task_id),
+            Err(e) => app.status_message = format!("Send error: {e}"),
         }
     }
 }
