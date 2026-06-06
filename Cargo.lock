@@ -1474,7 +1474,7 @@ dependencies = [
 [[package]]
 name = "desktop-assistant-api-model"
 version = "0.1.0"
-source = "git+https://github.com/adelie-ai/desktop-assistant.git?branch=main#15efad50fee76e57bbe2bb7d0617642997151dcf"
+source = "git+https://github.com/adelie-ai/desktop-assistant.git?branch=main#a6283e350e46bb903436741d26b2a47ef93ec793"
 dependencies = [
  "desktop-assistant-core",
  "serde",
@@ -1484,7 +1484,7 @@ dependencies = [
 [[package]]
 name = "desktop-assistant-auth-jwt"
 version = "0.1.0"
-source = "git+https://github.com/adelie-ai/desktop-assistant.git?branch=main#15efad50fee76e57bbe2bb7d0617642997151dcf"
+source = "git+https://github.com/adelie-ai/desktop-assistant.git?branch=main#a6283e350e46bb903436741d26b2a47ef93ec793"
 dependencies = [
  "anyhow",
  "jsonwebtoken",
@@ -1495,7 +1495,7 @@ dependencies = [
 [[package]]
 name = "desktop-assistant-client-common"
 version = "0.1.0"
-source = "git+https://github.com/adelie-ai/desktop-assistant.git?branch=main#15efad50fee76e57bbe2bb7d0617642997151dcf"
+source = "git+https://github.com/adelie-ai/desktop-assistant.git?branch=main#a6283e350e46bb903436741d26b2a47ef93ec793"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1515,7 +1515,7 @@ dependencies = [
 [[package]]
 name = "desktop-assistant-core"
 version = "0.1.0"
-source = "git+https://github.com/adelie-ai/desktop-assistant.git?branch=main#15efad50fee76e57bbe2bb7d0617642997151dcf"
+source = "git+https://github.com/adelie-ai/desktop-assistant.git?branch=main#a6283e350e46bb903436741d26b2a47ef93ec793"
 dependencies = [
  "async-trait",
  "backon",

@@ -32,7 +32,7 @@ use desktop_assistant_api_model::{
     Command, CommandResult, ConnectionView, EffortLevel, ModelListing, PurposeConfigView,
     PurposeKindApi, PurposesView,
 };
-use desktop_assistant_client_common::{AssistantCommands, TransportClient};
+use desktop_assistant_client_common::TransportClient;
 use futures::StreamExt;
 use ratatui::{
     Frame, Terminal,
@@ -266,14 +266,14 @@ async fn refresh_all(state: &mut State, client: &TransportClient) {
 }
 
 async fn refresh_models(state: &mut State, client: &TransportClient, refresh_cache: bool) {
-    let Some(ws) = client.as_ws() else {
+    let Some(commands) = client.as_commands() else {
         state.error = Some(
-            "Purposes management is only available over WebSocket — switch transport with --transport ws"
+            "Purposes management isn't available over D-Bus — switch transport with --transport ws or the local socket"
                 .into(),
         );
         return;
     };
-    match ws.list_available_models(None, refresh_cache).await {
+    match commands.list_available_models(None, refresh_cache).await {
         Ok(models) => state.models = models,
         Err(e) => state.error = Some(format!("Failed to list models: {e}")),
     }
@@ -481,11 +481,11 @@ fn effort_label(effort: Option<EffortLevel>) -> &'static str {
 }
 
 async fn send(client: &TransportClient, command: Command) -> anyhow::Result<CommandResult> {
-    if let Some(ws) = client.as_ws() {
-        ws.send_command(command).await
+    if let Some(commands) = client.as_commands() {
+        commands.send_command(command).await
     } else {
         anyhow::bail!(
-            "Purposes management is only available over WebSocket — switch transport with --transport ws"
+            "Purposes management isn't available over D-Bus — switch transport with --transport ws or the local socket"
         )
     }
 }

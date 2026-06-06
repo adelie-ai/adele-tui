@@ -35,8 +35,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use desktop_assistant_client_common::{
-    AssistantClient, AssistantCommands, ConnectionConfig, SignalEvent, TransportClient,
-    TransportMode, connect_transport, transport::transport_label,
+    AssistantClient, ConnectionConfig, Connector, SignalEvent, TransportClient, TransportMode,
 };
 use futures::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
@@ -295,22 +294,29 @@ async fn run(
     let settings = Settings::load();
     app.show_debug = settings.show_debug;
 
-    let mut client: Option<TransportClient> = None;
+    // The `Connector` owns the transport AND the signal stream, pumping every
+    // `SignalEvent` to its subscribers from a dedicated task (client-common
+    // #203). The TUI holds the connector (so reconnect/disconnect can drop and
+    // rebuild it) plus one `subscribe()`d receiver that feeds the `select!`
+    // loop. Before there's a live connection both are the not-connected
+    // sentinels: `connector = None` and a closed `signal_rx`.
+    let mut connector: Option<Connector> = None;
     let mut signal_rx: UnboundedReceiver<SignalEvent> = unbounded_channel().1;
     let mut reconnect = ReconnectState::Connected;
 
     // Initial connect — on failure, fall straight into the backoff loop
-    // instead of running with no client.
-    match connect_transport(config).await {
-        Ok((transport_client, rx)) => {
-            match transport_client.list_conversations().await {
+    // instead of running with no connection.
+    match Connector::connect(config).await {
+        Ok(conn) => {
+            // Subscribe before any prompt so no early streaming chunk is lost.
+            signal_rx = conn.subscribe();
+            match conn.client().list_conversations().await {
                 Ok(convs) => app.set_conversations(convs),
                 Err(e) => app.status_message = format!("Error loading conversations: {e}"),
             }
-            init_background_tasks(&mut app, &transport_client).await;
-            app.status_message = transport_label(config);
-            client = Some(transport_client);
-            signal_rx = rx;
+            init_background_tasks(&mut app, conn.client()).await;
+            app.status_message = conn.label().to_string();
+            connector = Some(conn);
         }
         Err(e) => {
             reconnect = schedule_reconnect(None);
@@ -362,8 +368,8 @@ async fn run(
 
         if app.kb_requested {
             app.kb_requested = false;
-            if let Some(client) = client.as_ref()
-                && let Err(e) = kb::run(terminal, client).await
+            if let Some(conn) = connector.as_ref()
+                && let Err(e) = kb::run(terminal, conn.client()).await
             {
                 app.status_message = format!("KB error: {e}");
             }
@@ -374,8 +380,8 @@ async fn run(
 
         if app.connections_requested {
             app.connections_requested = false;
-            if let Some(client) = client.as_ref()
-                && let Err(e) = connections::run(terminal, client).await
+            if let Some(conn) = connector.as_ref()
+                && let Err(e) = connections::run(terminal, conn.client()).await
             {
                 app.status_message = format!("Connections error: {e}");
             }
@@ -384,8 +390,8 @@ async fn run(
 
         if app.purposes_requested {
             app.purposes_requested = false;
-            if let Some(client) = client.as_ref()
-                && let Err(e) = purposes::run(terminal, client).await
+            if let Some(conn) = connector.as_ref()
+                && let Err(e) = purposes::run(terminal, conn.client()).await
             {
                 app.status_message = format!("Purposes error: {e}");
             }
@@ -394,7 +400,8 @@ async fn run(
 
         if app.model_picker_requested {
             app.model_picker_requested = false;
-            if let Some(client) = client.as_ref() {
+            if let Some(conn) = connector.as_ref() {
+                let client = conn.client();
                 let current = app
                     .current_conversation
                     .as_ref()
@@ -428,7 +435,7 @@ async fn run(
                                 &dictation_tx,
                             );
                         } else {
-                            handle_action(&mut app, &client, action).await;
+                            handle_action(&mut app, &connector, action).await;
                         }
                     } else {
                         match app.mode {
@@ -476,7 +483,10 @@ async fn run(
                         app.update_conversation_title(&conversation_id, &title);
                     }
                     SignalEvent::Disconnected { reason } => {
-                        client = None;
+                        // Drop the connector (closing its transport + fanout
+                        // task) and reset to the not-connected sentinel receiver
+                        // so the backoff loop owns reconnection.
+                        connector = None;
                         signal_rx = unbounded_channel().1;
                         reconnect = schedule_reconnect(None);
                         app.status_message = format!(
@@ -513,6 +523,9 @@ async fn run(
                         }
                         app.tasks.apply_task_completed(&id);
                     }
+                    // The TUI has no scratchpad pane (that lives in the GTK/KDE
+                    // clients), so the change notification is a no-op here.
+                    SignalEvent::ScratchpadChanged { .. } => {}
                 }
             }
             _ = async {
@@ -526,17 +539,18 @@ async fn run(
                     ReconnectState::Connected => None,
                 };
                 app.status_message = "Reconnecting...".to_string();
-                match connect_transport(config).await {
-                    Ok((transport_client, rx)) => {
-                        match transport_client.list_conversations().await {
+                match Connector::connect(config).await {
+                    Ok(conn) => {
+                        // Subscribe before any prompt so no early chunk is lost.
+                        signal_rx = conn.subscribe();
+                        match conn.client().list_conversations().await {
                             Ok(convs) => app.set_conversations(convs),
                             Err(e) => app.status_message = format!("Error loading conversations: {e}"),
                         }
-                        init_background_tasks(&mut app, &transport_client).await;
-                        client = Some(transport_client);
-                        signal_rx = rx;
+                        init_background_tasks(&mut app, conn.client()).await;
                         reconnect = ReconnectState::Connected;
-                        app.status_message = transport_label(config);
+                        app.status_message = conn.label().to_string();
+                        connector = Some(conn);
                     }
                     Err(e) => {
                         reconnect = schedule_reconnect(prev_delay);
@@ -580,7 +594,7 @@ async fn run(
                 match outcome {
                     DictationOutcome::Transcribed(text) => {
                         insert_dictated_text(&mut app, &text);
-                        send_prompt_from_input(&mut app, &client).await;
+                        send_prompt_from_input(&mut app, &connector).await;
                     }
                     DictationOutcome::NoSpeech => {
                         app.status_message = "No speech detected".into();
@@ -594,17 +608,16 @@ async fn run(
     }
 }
 
-async fn handle_action(
-    app: &mut App,
-    client: &Option<desktop_assistant_client_common::TransportClient>,
-    action: Action,
-) {
+async fn handle_action(app: &mut App, connector: &Option<Connector>, action: Action) {
+    // The action handlers all want the transport client; pull it out once as an
+    // `Option<&TransportClient>` so each arm reads the same as before.
+    let client: Option<&TransportClient> = connector.as_ref().map(Connector::client);
     match action {
         Action::Quit => app.quit(),
         Action::NextConversation => app.next_conversation(),
         Action::PreviousConversation => app.previous_conversation(),
         Action::OpenConversation => {
-            if let (Some(client), Some(id)) = (client.as_ref(), app.selected_conversation_id()) {
+            if let (Some(client), Some(id)) = (client, app.selected_conversation_id()) {
                 let id = id.to_string();
                 match client.get_conversation(&id).await {
                     Ok(detail) => {
@@ -617,14 +630,14 @@ async fn handle_action(
         }
         Action::DeleteConversation => {
             if let Some(id) = app.delete_selected_conversation()
-                && let Some(client) = client.as_ref()
+                && let Some(client) = client
                 && let Err(e) = client.delete_conversation(&id).await
             {
                 app.status_message = format!("Delete error: {e}");
             }
         }
         Action::NewConversation => {
-            if let Some(client) = client.as_ref() {
+            if let Some(client) = client {
                 match client.create_conversation("New Conversation").await {
                     Ok(id) => {
                         match fetch_conversations(client, app.show_archived).await {
@@ -657,7 +670,7 @@ async fn handle_action(
             }
         }
         Action::ExitEditMode => app.enter_normal_mode(),
-        Action::SubmitPrompt => send_prompt_from_input(app, client).await,
+        Action::SubmitPrompt => send_prompt_from_input(app, connector).await,
         // Dictation is handled in the event loop (it needs the embedded voice
         // session + a result channel + a spawned capture task — loop-local
         // resources that don't belong in `handle_action`'s signature).
@@ -667,7 +680,7 @@ async fn handle_action(
         }
         Action::ToggleShowArchived => {
             app.show_archived = !app.show_archived;
-            if let Some(client) = client.as_ref() {
+            if let Some(client) = client {
                 match fetch_conversations(client, app.show_archived).await {
                     Ok(convs) => app.set_conversations(convs),
                     Err(e) => app.status_message = format!("Error refreshing: {e}"),
@@ -680,7 +693,7 @@ async fn handle_action(
             };
         }
         Action::ArchiveConversation => {
-            if let (Some(client), Some(id)) = (client.as_ref(), app.selected_conversation_id()) {
+            if let (Some(client), Some(id)) = (client, app.selected_conversation_id()) {
                 let id = id.to_string();
                 // Determine if conversation is currently archived
                 let is_archived = app
@@ -720,7 +733,7 @@ async fn handle_action(
         }
         Action::SubmitRename => {
             if let Some((id, title)) = app.submit_rename()
-                && let Some(client) = client.as_ref()
+                && let Some(client) = client
             {
                 match client.rename_conversation(&id, &title).await {
                     Ok(()) => {
@@ -799,12 +812,12 @@ async fn handle_action(
         Action::PreviousTask => app.tasks.move_selection(-1),
         Action::CancelSelectedTask => {
             if let Some(id) = app.request_cancel_selected_task()
-                && let Some(client) = client.as_ref()
-                && let Some(ws) = client.as_ws()
+                && let Some(client) = client
+                && let Some(commands) = client.as_commands()
             {
                 let cmd =
                     desktop_assistant_api_model::Command::CancelBackgroundTask { id: id.0.clone() };
-                match ws.send_command(cmd).await {
+                match commands.send_command(cmd).await {
                     Ok(_) => {
                         // Status will move to "Cancelling..." then resolve
                         // when `TaskCompleted { status: Cancelled }` arrives.
@@ -818,7 +831,7 @@ async fn handle_action(
         }
         Action::OpenSelectedTaskConversation => {
             if let Some(conv_id) = app.jump_to_selected_task_conversation()
-                && let Some(client) = client.as_ref()
+                && let Some(client) = client
             {
                 match client.get_conversation(&conv_id).await {
                     Ok(detail) => {
@@ -905,25 +918,26 @@ fn insert_dictated_text(app: &mut App, text: &str) {
 /// transport. Shared by the keyboard submit (`Enter`) and the dictation path
 /// (which appends a transcript to the input, then submits via the same route),
 /// so both honor the staged model override and the same ack handling.
-async fn send_prompt_from_input(
-    app: &mut App,
-    client: &Option<desktop_assistant_client_common::TransportClient>,
-) {
+async fn send_prompt_from_input(app: &mut App, connector: &Option<Connector>) {
     if let Some((conv_id, prompt)) = app.submit_prompt()
-        && let Some(client) = client.as_ref()
+        && let Some(connector) = connector.as_ref()
     {
+        let client = connector.client();
         let override_selection = app.take_pending_override();
-        // Use the WS override path when one was staged via the model picker;
-        // the trait-level `send_prompt` only takes the bare prompt. D-Bus +
-        // override isn't supported yet — we fall back to plain send and warn.
-        let result = match (override_selection, client.as_ws()) {
-            (Some(ovr), Some(ws)) => {
-                ws.send_prompt_with_override(&conv_id, &prompt, Some(ovr))
+        // Use the command-channel override path when one was staged via the
+        // model picker; the high-level `send_prompt` only takes the bare prompt.
+        // `as_commands()` is `Some` on both socket transports (UDS + WS) but
+        // `None` on D-Bus, which has no override field — there we fall back to a
+        // plain send and warn.
+        let result = match (override_selection, client.as_commands()) {
+            (Some(ovr), Some(commands)) => {
+                commands
+                    .send_prompt_with_override(&conv_id, &prompt, Some(ovr))
                     .await
             }
             (Some(_), None) => {
                 app.status_message =
-                    "Model override only works over WebSocket — sent without override".into();
+                    "Model override isn't supported over D-Bus — sent without override".into();
                 client.send_prompt(&conv_id, &prompt).await
             }
             (None, _) => client.send_prompt(&conv_id, &prompt).await,
@@ -939,20 +953,21 @@ async fn send_prompt_from_input(
 /// events. Failure is non-fatal — the chat still works without the
 /// process-manager pane, so we surface a status hint and move on.
 ///
-/// Both commands only exist over WS today. Over D-Bus the call quietly
+/// These commands ride the shared command channel (`as_commands`), so they
+/// work over both socket transports (UDS + WS). Over D-Bus the call quietly
 /// no-ops; the pane will simply stay empty.
 async fn init_background_tasks(
     app: &mut App,
     client: &desktop_assistant_client_common::TransportClient,
 ) {
-    let Some(ws) = client.as_ws() else {
+    let Some(commands) = client.as_commands() else {
         return;
     };
     let list = desktop_assistant_api_model::Command::ListBackgroundTasks {
         include_finished: false,
         limit: None,
     };
-    match ws.send_command(list).await {
+    match commands.send_command(list).await {
         Ok(desktop_assistant_api_model::CommandResult::BackgroundTasks(tasks)) => {
             app.tasks.set_initial(tasks);
         }
@@ -963,7 +978,7 @@ async fn init_background_tasks(
             app.status_message = format!("Tasks snapshot failed: {e}");
         }
     }
-    if let Err(e) = ws
+    if let Err(e) = commands
         .send_command(desktop_assistant_api_model::Command::SubscribeBackgroundTasks)
         .await
     {
