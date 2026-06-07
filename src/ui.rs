@@ -509,6 +509,7 @@ mod tests {
                 },
             ],
             model_selection: None,
+            conversation_personality: None,
         });
         terminal.draw(|f| draw(f, &mut app)).unwrap();
     }
@@ -523,6 +524,7 @@ mod tests {
             title: "Test".into(),
             messages: vec![],
             model_selection: None,
+            conversation_personality: None,
         });
         app.start_streaming("req1".into());
         app.receive_chunk("req1", "Partial response...");
@@ -637,6 +639,7 @@ mod tests {
                 },
             ],
             model_selection: None,
+            conversation_personality: None,
         });
         app
     }
@@ -681,6 +684,7 @@ mod tests {
             title: "Test".into(),
             messages: vec![],
             model_selection: None,
+            conversation_personality: None,
         });
         app.set_assistant_status("Searching knowledge base...");
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -744,6 +748,7 @@ mod tests {
                 content: "answer with **strong** word".into(),
             }],
             model_selection: None,
+            conversation_personality: None,
         });
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer().clone();

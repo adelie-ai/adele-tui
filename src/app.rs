@@ -110,6 +110,9 @@ pub struct App {
     pub purposes_requested: bool,
     /// Set when the user asks to open the per-conversation model picker.
     pub model_picker_requested: bool,
+    /// Set when the user asks to open the per-conversation personality picker.
+    /// Mirrors `model_picker_requested`'s screen-handoff pattern.
+    pub personality_picker_requested: bool,
     /// One-shot override staged by the model picker. Applied to the next
     /// `SendPrompt` and then cleared — the daemon persists it as the
     /// conversation's `last_model_selection`, so subsequent prompts pick
@@ -153,6 +156,7 @@ impl App {
             connections_requested: false,
             purposes_requested: false,
             model_picker_requested: false,
+            personality_picker_requested: false,
             pending_model_override: None,
             tasks: TaskPane::new(),
             pending_task_cancel: None,
@@ -766,6 +770,7 @@ mod tests {
             title: "Test".into(),
             messages: vec![],
             model_selection: None,
+            conversation_personality: None,
         });
         assert!(app.submit_prompt().is_none());
     }
@@ -778,6 +783,7 @@ mod tests {
             title: "Test".into(),
             messages: vec![],
             model_selection: None,
+            conversation_personality: None,
         });
         app.textarea.insert_str("What is Rust?");
 
@@ -804,6 +810,7 @@ mod tests {
             title: "Test".into(),
             messages: vec![],
             model_selection: None,
+            conversation_personality: None,
         });
 
         app.start_streaming("req1".into());
@@ -831,6 +838,7 @@ mod tests {
             title: "Test".into(),
             messages: vec![],
             model_selection: None,
+            conversation_personality: None,
         });
 
         app.start_streaming("req1".into());
@@ -859,6 +867,7 @@ mod tests {
             title: "Test".into(),
             messages: vec![],
             model_selection: None,
+            conversation_personality: None,
         });
         app.start_streaming("req1".into());
         app.set_assistant_status("Searching knowledge base...");
@@ -896,6 +905,7 @@ mod tests {
             title: "Test".into(),
             messages: vec![],
             model_selection: None,
+            conversation_personality: None,
         });
 
         app.start_streaming_without_request_id();
@@ -942,6 +952,7 @@ mod tests {
             title: "Test".into(),
             messages: vec![],
             model_selection: None,
+            conversation_personality: None,
         });
 
         // Daemon ack carries a task_id (post-#114 wire protocol).
@@ -1017,6 +1028,7 @@ mod tests {
             title: "Second".into(),
             messages: vec![],
             model_selection: None,
+            conversation_personality: None,
         });
 
         let deleted = app.delete_selected_conversation();
@@ -1144,6 +1156,7 @@ mod tests {
             title: "Second".into(),
             messages: vec![],
             model_selection: None,
+            conversation_personality: None,
         });
         app.apply_rename("2", "Renamed");
         assert_eq!(app.conversations[1].title, "Renamed");
@@ -1163,6 +1176,7 @@ mod tests {
             title: "Chat".into(),
             messages: vec![],
             model_selection: None,
+            conversation_personality: None,
         });
         let ovr = desktop_assistant_api_model::SendPromptOverride {
             connection_id: "work".into(),
@@ -1236,6 +1250,7 @@ mod tests {
             title: "Test".into(),
             messages: vec![],
             model_selection: None,
+            conversation_personality: None,
         });
         app.scroll_up(10);
         app.textarea.insert_str("hello");
