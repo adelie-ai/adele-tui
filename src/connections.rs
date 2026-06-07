@@ -34,7 +34,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use desktop_assistant_api_model::{
     Command, CommandResult, ConnectionAvailability, ConnectionConfigView, ConnectionView,
 };
-use desktop_assistant_client_common::{AssistantCommands, TransportClient};
+use desktop_assistant_client_common::TransportClient;
 use futures::StreamExt;
 use ratatui::{
     Frame, Terminal,
@@ -501,16 +501,17 @@ async fn save_edit(state: &mut State, client: &TransportClient) {
     }
 }
 
-/// Send a `Command` over the transport. Today only the WS transport
-/// exposes a generic `send_command` — D-Bus is used for a fixed set of
-/// methods. We surface a clear error in that case rather than silently
-/// no-op'ing.
+/// Send a `Command` over the transport. The shared command channel
+/// (`as_commands`) exposes a generic `send_command` over both socket
+/// transports (UDS + WS); D-Bus speaks a fixed set of typed methods and so
+/// has no command channel. We surface a clear error in that case rather than
+/// silently no-op'ing.
 async fn send(client: &TransportClient, command: Command) -> anyhow::Result<CommandResult> {
-    if let Some(ws) = client.as_ws() {
-        ws.send_command(command).await
+    if let Some(commands) = client.as_commands() {
+        commands.send_command(command).await
     } else {
         anyhow::bail!(
-            "Connection management is only available over WebSocket — switch transport with --transport ws"
+            "Connection management isn't available over D-Bus — switch transport with --transport ws or the local socket"
         )
     }
 }
@@ -883,6 +884,10 @@ mod tests {
             display_label: format!("{id} ({ty})"),
             availability: ConnectionAvailability::Ok,
             has_credentials: true,
+            // Echoed non-secret config (added upstream after the view shipped);
+            // the TUI's edit form pre-fills from `id`/`connector_type` only, so
+            // these tests don't exercise it.
+            config: None,
         }
     }
 

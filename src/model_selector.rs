@@ -143,9 +143,9 @@ fn advance(state: &mut State, delta: i32) {
 }
 
 async fn refresh(state: &mut State, client: &TransportClient, refresh_cache: bool) {
-    let Some(ws) = client.as_ws() else {
+    let Some(commands) = client.as_commands() else {
         state.error = Some(
-            "Model selection is only available over WebSocket — switch transport with --transport ws"
+            "Model selection isn't available over D-Bus — switch transport with --transport ws or the local socket"
                 .into(),
         );
         state.busy = None;
@@ -156,7 +156,7 @@ async fn refresh(state: &mut State, client: &TransportClient, refresh_cache: boo
     } else {
         "Loading models...".into()
     });
-    match ws.list_available_models(None, refresh_cache).await {
+    match commands.list_available_models(None, refresh_cache).await {
         Ok(models) => {
             state.models = models;
             state.busy = None;
