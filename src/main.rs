@@ -12,6 +12,7 @@ mod keys;
 mod markdown;
 mod model_selector;
 mod oauth;
+mod personality_selector;
 mod picker;
 mod profile;
 mod purposes;
@@ -419,6 +420,33 @@ async fn run(
             continue;
         }
 
+        if app.personality_picker_requested {
+            app.personality_picker_requested = false;
+            // Only reachable with a loaded conversation (handle_action gates on
+            // `current_conversation`), but re-check so the borrow stays clean.
+            if let (Some(conn), Some(conv)) =
+                (connector.as_ref(), app.current_conversation.as_ref())
+            {
+                let conv_id = conv.id.clone();
+                let current = conv.conversation_personality;
+                match personality_selector::run(terminal, conn.client(), conv_id, current).await {
+                    Ok(personality_selector::Outcome::Saved(stored)) => {
+                        if let Some(c) = app.current_conversation.as_mut() {
+                            c.conversation_personality = Some(stored);
+                        }
+                        app.status_message = if stored == Default::default() {
+                            "Personality cleared (using global)".into()
+                        } else {
+                            "Personality saved for this conversation".into()
+                        };
+                    }
+                    Ok(personality_selector::Outcome::Cancelled) => {}
+                    Err(e) => app.status_message = format!("Personality picker error: {e}"),
+                }
+            }
+            continue;
+        }
+
         tokio::select! {
             Some(Ok(evt)) = event_stream.next() => {
                 if let Event::Key(key) = evt {
@@ -526,6 +554,11 @@ async fn run(
                     // The TUI has no scratchpad pane (that lives in the GTK/KDE
                     // clients), so the change notification is a no-op here.
                     SignalEvent::ScratchpadChanged { .. } => {}
+                    // The TUI registers no client-local MCP tools
+                    // (`register_client_tools`), so the daemon never parks a turn
+                    // on it — this variant can't actually arrive here. Match it
+                    // explicitly to keep the arm list exhaustive (#231).
+                    SignalEvent::ClientToolCall { .. } => {}
                 }
             }
             _ = async {
@@ -798,6 +831,16 @@ async fn handle_action(app: &mut App, connector: &Option<Connector>, action: Act
                 app.model_picker_requested = true;
             } else {
                 app.status_message = "Not connected — model picker unavailable".into();
+            }
+        }
+        Action::OpenPersonalityPicker => {
+            if client.is_none() {
+                app.status_message = "Not connected — personality picker unavailable".into();
+            } else if app.current_conversation.is_none() {
+                app.status_message =
+                    "Open a conversation first (Enter) — personality is per-conversation".into();
+            } else {
+                app.personality_picker_requested = true;
             }
         }
         Action::ToggleTasksPane => {

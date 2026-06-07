@@ -25,6 +25,7 @@ const HINTS_NORMAL: &[(&str, &str)] = &[
     ("a", "archived"),
     ("q", "quit"),
     ("Ctrl+M", "model"),
+    ("Ctrl+R", "personality"),
     ("Ctrl+K", "kb"),
     ("F3", "connections"),
     ("F4", "purposes"),
@@ -38,6 +39,7 @@ const HINTS_EDITING: &[(&str, &str)] = &[
     ("Esc", "back"),
     ("Ctrl+e", "bottom"),
     ("Ctrl+M", "model"),
+    ("Ctrl+R", "personality"),
     ("Ctrl+B", "sidebar"),
 ];
 

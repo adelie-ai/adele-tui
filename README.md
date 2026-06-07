@@ -12,6 +12,10 @@ chat, tool calls, and background tasks.
   code blocks. Sidebar lists conversations; `Ctrl+B` toggles it.
 - **Per-conversation model selector** (`Ctrl+M`) and **connection switcher**
   (`F2`) — no daemon restart required.
+- **Per-conversation personality picker** (`Ctrl+R`) — pin any of the seven
+  traits (professionalism, warmth, directness, enthusiasm, humor, sarcasm,
+  pretentiousness) for the active conversation; unpinned traits stay `Global`
+  (inherit your default disposition).
 - **Connection profiles**, **Connections view**, and **Purposes view** for
   CRUD over LLM provider configs and assigning a connection/model/effort to
   each purpose (chat, background, vector).

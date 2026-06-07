@@ -29,6 +29,10 @@ pub enum Action {
     OpenConnections,
     OpenPurposes,
     OpenModelPicker,
+    /// Open the per-conversation personality picker (`Ctrl+R`, "peRsonality").
+    /// Mirrors `OpenModelPicker`; pins/clears the Expressive-7 traits for the
+    /// active conversation via `set_conversation_personality`.
+    OpenPersonalityPicker,
     /// Toggle the process-manager (tasks) overlay. Currently bound to
     /// `Ctrl+P` ("process manager") since `Ctrl+T` is already used for
     /// the debug-view toggle and a chord-style `g t` would require a
@@ -94,6 +98,9 @@ pub fn handle_key_event(
             KeyCode::Char('b') => Some(Action::ToggleSidebar),
             KeyCode::Char('k') => Some(Action::OpenKnowledgeBase),
             KeyCode::Char('m') => Some(Action::OpenModelPicker),
+            // Ctrl+R ("peRsonality") opens the per-conversation personality
+            // picker, mirroring Ctrl+M's per-conversation model picker.
+            KeyCode::Char('r') => Some(Action::OpenPersonalityPicker),
             // Ctrl+P toggles the process-manager pane. Available from
             // any non-renaming mode so the user can pop it open while
             // editing a prompt to glance at running subagents.
