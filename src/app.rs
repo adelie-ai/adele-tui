@@ -266,24 +266,25 @@ impl App {
     /// Set voice mode for an explicit `conversation_id` (used by the model's
     /// `request_voice` / `stop_voice` tools, which carry their own
     /// conversation). Per-conversation: only the named conversation is affected.
-    pub fn set_voice_mode(&mut self, _conversation_id: &str, _on: bool) {
-        // STUB (tests-first): no-op.
+    pub fn set_voice_mode(&mut self, conversation_id: &str, on: bool) {
+        self.voice_mode.insert(conversation_id.to_string(), on);
     }
 
     /// Flip voice mode for the currently-open conversation and return the new
     /// state (used by the `Ctrl+V` keybind). `None` when no conversation is
     /// open. Per-conversation: toggling one never affects another.
     pub fn toggle_current_voice_mode(&mut self) -> Option<bool> {
-        // STUB (tests-first): never flips.
-        None
+        let conv_id = self.current_conversation.as_ref()?.id.clone();
+        let next = !self.voice_mode_for(&conv_id);
+        self.voice_mode.insert(conv_id, next);
+        Some(next)
     }
 
     /// Whether a reply for `conversation_id` should be spoken: read-aloud OR
     /// voice-mode (adele-tui#75). This is the single narration / `say_this`
     /// audio gate.
     pub fn audio_enabled_for(&self, conversation_id: &str) -> bool {
-        // STUB (tests-first): read-aloud only, ignores voice mode.
-        self.speech_enabled_for(conversation_id)
+        self.speech_enabled_for(conversation_id) || self.voice_mode_for(conversation_id)
     }
 
     /// Whether audio is on for the currently-open conversation (read-aloud OR

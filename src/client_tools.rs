@@ -115,20 +115,22 @@ pub fn handle_say_this(arguments: &serde_json::Value, audio_enabled: bool) -> To
 /// entering voice mode for the conversation. Pure — emits a `SetVoiceMode(true)`
 /// effect the handler applies to `App::voice_mode`, and always a result.
 pub fn handle_request_voice() -> ToolOutcome {
-    // STUB (tests-first): wrong effect + no result message, so the test fails.
     ToolOutcome {
-        effect: ToolEffect::None,
-        result: Err("unimplemented".to_string()),
+        effect: ToolEffect::SetVoiceMode(true),
+        result: Ok(
+            "voice mode on: this conversation is now spoken — replies will be read aloud and \
+             kept brief and conversational"
+                .to_string(),
+        ),
     }
 }
 
 /// Decide how to handle a `stop_voice` call (adele-tui#75): the model is leaving
 /// voice mode. Pure — emits a `SetVoiceMode(false)` effect and always a result.
 pub fn handle_stop_voice() -> ToolOutcome {
-    // STUB (tests-first).
     ToolOutcome {
-        effect: ToolEffect::None,
-        result: Err("unimplemented".to_string()),
+        effect: ToolEffect::SetVoiceMode(false),
+        result: Ok("voice mode off: this conversation is back to text-only".to_string()),
     }
 }
 
@@ -145,7 +147,8 @@ pub fn dispatch(
 ) -> ToolOutcome {
     match tool_name {
         SAY_THIS => handle_say_this(arguments, audio_enabled),
-        // STUB (tests-first): request_voice/stop_voice not yet routed.
+        REQUEST_VOICE => handle_request_voice(),
+        STOP_VOICE => handle_stop_voice(),
         other => ToolOutcome {
             effect: ToolEffect::None,
             result: Err(format!("unknown client tool `{other}`")),

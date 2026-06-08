@@ -127,7 +127,9 @@ pub fn handle_key_event(
             // Ctrl+S toggles per-conversation read-aloud (adele-tui#73). A
             // no-op status hint when no conversation is open; main.rs gates.
             KeyCode::Char('s') => Some(Action::ToggleSpeech),
-            // STUB (tests-first): Ctrl+V not yet mapped to ToggleVoiceMode.
+            // Ctrl+V toggles per-conversation voice mode (adele-tui#75). Like
+            // Ctrl+S it is delivered as a real key by the enhancement flags.
+            KeyCode::Char('v') => Some(Action::ToggleVoiceMode),
             _ => None,
         };
     }

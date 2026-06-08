@@ -380,8 +380,11 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     // glyph so it reads differently from read-aloud's speaker glyph; shown only
     // when ON. Voice mode also narrates, but it adds spoken-style shaping, so it
     // is surfaced separately even when read-aloud is also on.
-    // STUB (tests-first): voice-mode cue not yet rendered.
-    let voice_suffix = "";
+    let voice_suffix = if app.current_voice_mode() {
+        "  ·  🎙 voice mode (Ctrl+V)"
+    } else {
+        ""
+    };
     let title = if app.scroll_offset > 0 {
         format!(
             "{chat_title}{model_suffix}{speech_suffix}{voice_suffix} \
