@@ -115,7 +115,9 @@ pub fn handle_key_event(
             // Ctrl+G starts embedded dictation (mic → prompt). A no-op when
             // voice isn't in embedded mode; main.rs gates on the session.
             KeyCode::Char('g') => Some(Action::Dictate),
-            // TODO(adele-tui#73): bind Ctrl+S to Action::ToggleSpeech.
+            // Ctrl+S toggles per-conversation speech (adele-tui#73). A no-op
+            // status hint when no conversation is open; main.rs gates on it.
+            KeyCode::Char('s') => Some(Action::ToggleSpeech),
             _ => None,
         };
     }

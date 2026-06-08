@@ -183,30 +183,35 @@ impl App {
     /// Seed the default speech state new conversations inherit (from
     /// `voice.toml`'s `play_replies`). Conversations already toggled keep
     /// their explicit state; only the implicit default changes.
-    pub fn set_speech_default(&mut self, _default: bool) {
-        // TODO(adele-tui#73): seed the per-conversation default.
+    pub fn set_speech_default(&mut self, default: bool) {
+        self.speech_default = default;
     }
 
     /// Whether speech is enabled for `conversation_id`. Falls back to
     /// `speech_default` for a conversation the user hasn't toggled.
-    pub fn speech_enabled_for(&self, _conversation_id: &str) -> bool {
-        // TODO(adele-tui#73): per-conversation lookup with default fallback.
-        false
+    pub fn speech_enabled_for(&self, conversation_id: &str) -> bool {
+        self.speech_enabled
+            .get(conversation_id)
+            .copied()
+            .unwrap_or(self.speech_default)
     }
 
     /// Whether speech is enabled for the currently-open conversation. `false`
     /// when no conversation is open (nothing to speak into).
     pub fn current_speech_enabled(&self) -> bool {
-        // TODO(adele-tui#73).
-        false
+        self.current_conversation
+            .as_ref()
+            .is_some_and(|c| self.speech_enabled_for(&c.id))
     }
 
     /// Flip the speech toggle for the currently-open conversation and return
     /// the new state. `None` when no conversation is open. Per-conversation:
     /// toggling one conversation never affects another.
     pub fn toggle_current_speech(&mut self) -> Option<bool> {
-        // TODO(adele-tui#73): flip and persist the per-conversation toggle.
-        None
+        let conv_id = self.current_conversation.as_ref()?.id.clone();
+        let next = !self.speech_enabled_for(&conv_id);
+        self.speech_enabled.insert(conv_id, next);
+        Some(next)
     }
 
     /// Render a `say_this` call that arrived while speech was OFF as an inline
@@ -214,9 +219,19 @@ impl App {
     /// to `conversation_id` only when that is the open conversation, so a call
     /// from a stale/other conversation never bleeds into the visible chat.
     /// Returns whether the note was shown.
-    pub fn push_speech_disabled_note(&mut self, _conversation_id: &str, _text: &str) -> bool {
-        // TODO(adele-tui#73): append the inline disabled note.
-        false
+    pub fn push_speech_disabled_note(&mut self, conversation_id: &str, text: &str) -> bool {
+        let Some(conv) = self.current_conversation.as_mut() else {
+            return false;
+        };
+        if conv.id != conversation_id {
+            return false;
+        }
+        conv.messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: format!("(speech mode disabled) {text}"),
+        });
+        self.scroll_offset = 0;
+        true
     }
 
     // --- Tasks-pane glue ---

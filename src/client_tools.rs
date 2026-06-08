@@ -64,11 +64,27 @@ pub enum ToolEffect {
 /// per-conversation hard toggle for the call's conversation. Never panics:
 /// a non-object payload or a missing/non-string `text` field becomes an error
 /// result (the turn still resumes) rather than an unwrap.
-pub fn handle_say_this(_arguments: &serde_json::Value, _speech_enabled: bool) -> ToolOutcome {
-    // TODO(adele-tui#73): implement say_this dispatch.
-    ToolOutcome {
-        effect: ToolEffect::None,
-        result: Ok(String::new()),
+pub fn handle_say_this(arguments: &serde_json::Value, speech_enabled: bool) -> ToolOutcome {
+    let Some(text) = arguments.get("text").and_then(|t| t.as_str()) else {
+        return ToolOutcome {
+            effect: ToolEffect::None,
+            result: Err("say_this requires a string `text` argument".to_string()),
+        };
+    };
+    if speech_enabled {
+        ToolOutcome {
+            effect: ToolEffect::Speak(text.to_string()),
+            result: Ok("spoken".to_string()),
+        }
+    } else {
+        ToolOutcome {
+            effect: ToolEffect::ShowDisabled(text.to_string()),
+            result: Ok(
+                "speech mode is disabled in this conversation; the text was shown to the user, \
+                 not spoken"
+                    .to_string(),
+            ),
+        }
     }
 }
 
@@ -77,25 +93,37 @@ pub fn handle_say_this(_arguments: &serde_json::Value, _speech_enabled: bool) ->
 /// leaked from another session pre-#261, or a future tool the TUI doesn't yet
 /// implement) still resumes the turn instead of wedging it.
 pub fn dispatch(
-    _tool_name: &str,
-    _arguments: &serde_json::Value,
-    _speech_enabled: bool,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    speech_enabled: bool,
 ) -> ToolOutcome {
-    // TODO(adele-tui#73): route tools and always produce a result.
-    ToolOutcome {
-        effect: ToolEffect::None,
-        result: Ok(String::new()),
+    match tool_name {
+        SAY_THIS => handle_say_this(arguments, speech_enabled),
+        other => ToolOutcome {
+            effect: ToolEffect::None,
+            result: Err(format!("unknown client tool `{other}`")),
+        },
     }
 }
 
 /// The `say_this` tool registration to advertise to the daemon. Re-sent on
 /// every connect because the daemon replaces the whole set each time (#231).
 pub fn say_this_registration() -> desktop_assistant_api_model::ClientToolRegistration {
-    // TODO(adele-tui#73): build the say_this registration.
     desktop_assistant_api_model::ClientToolRegistration {
-        name: String::new(),
-        description: String::new(),
-        input_schema: serde_json::Value::Null,
+        name: SAY_THIS.to_string(),
+        description: "Speak a short piece of text aloud to the user through their speakers. \
+            Use for brief spoken asides; the user's reply still arrives as text."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "The text to speak aloud."
+                }
+            },
+            "required": ["text"]
+        }),
     }
 }
 

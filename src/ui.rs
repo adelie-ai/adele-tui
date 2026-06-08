@@ -368,8 +368,14 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .and_then(|conv| conv.model_selection.as_ref())
         .map(|sel| format!("  ·  {} · {}", sel.connection_id, sel.model_id))
         .unwrap_or_default();
-    // TODO(adele-tui#73): show a persistent speech cue when the toggle is ON.
-    let speech_suffix = "";
+    // Persistent cue for the per-conversation speech toggle (adele-tui#73), so
+    // the user can always tell whether replies/say_this will be spoken. Only
+    // shown when ON; OFF (the common default) stays uncluttered.
+    let speech_suffix = if app.current_speech_enabled() {
+        "  ·  🔊 speech (Ctrl+S)"
+    } else {
+        ""
+    };
     let title = if app.scroll_offset > 0 {
         format!("{chat_title}{model_suffix}{speech_suffix} (Ctrl+u/d scroll, Ctrl+e bottom)")
     } else {
