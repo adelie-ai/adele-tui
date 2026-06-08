@@ -54,9 +54,18 @@ use tokio::sync::Mutex;
 /// one-shot push/flush with no streaming, so the time-based flush never fires.
 pub fn into_speakable_sentences(text: &str) -> Vec<String> {
     // Timeout is unused on this synchronous push→flush path; any value works.
-    // STUB (failing-tests commit): chunking not yet implemented.
-    let _ = SentenceBuffer::new(Duration::from_millis(500));
-    Vec::new()
+    let mut buf = SentenceBuffer::new(Duration::from_millis(500));
+    let mut sentences = buf.push(text);
+    let tail = buf.flush();
+    if !tail.is_empty() {
+        sentences.push(tail);
+    }
+    if sentences.is_empty() && !text.trim().is_empty() {
+        // No boundary produced a chunk but there *is* speakable text — speak it
+        // whole rather than dropping it silently.
+        sentences.push(text.trim().to_string());
+    }
+    sentences
 }
 
 /// How the TUI sources voice. Defaults to [`VoiceMode::Off`].

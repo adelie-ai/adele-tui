@@ -130,11 +130,11 @@ pub fn handle_key_event(
             // Ctrl+S cycles the per-conversation Adele output level
             // (adele-tui#77). A no-op status hint when no conversation is open;
             // main.rs gates.
-            KeyCode::Char('s') => None, // STUB (failing-tests commit)
+            KeyCode::Char('s') => Some(Action::CycleAdeleOutput),
             // Ctrl+V toggles the per-conversation You (voice-input) control
             // (adele-tui#77). Like Ctrl+S it is delivered as a real key by the
             // enhancement flags.
-            KeyCode::Char('v') => None, // STUB (failing-tests commit)
+            KeyCode::Char('v') => Some(Action::ToggleVoiceIn),
             _ => None,
         };
     }

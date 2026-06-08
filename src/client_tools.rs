@@ -123,7 +123,7 @@ pub fn handle_say_this(arguments: &serde_json::Value, say_this_spoken: bool) -> 
 /// and always a result.
 pub fn handle_request_voice() -> ToolOutcome {
     ToolOutcome {
-        effect: ToolEffect::None, // STUB (failing-tests commit)
+        effect: ToolEffect::SetAdeleOutput(AdeleOutput::OnDemand),
         result: Ok(
             "voice mode on: this conversation is now spoken — replies will be read aloud and \
              kept brief and conversational"
@@ -137,7 +137,7 @@ pub fn handle_request_voice() -> ToolOutcome {
 /// result.
 pub fn handle_stop_voice() -> ToolOutcome {
     ToolOutcome {
-        effect: ToolEffect::None, // STUB (failing-tests commit)
+        effect: ToolEffect::SetAdeleOutput(AdeleOutput::Disabled),
         result: Ok("voice mode off: this conversation is back to text-only".to_string()),
     }
 }

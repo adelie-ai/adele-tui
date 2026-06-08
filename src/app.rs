@@ -96,8 +96,11 @@ impl AdeleOutput {
     /// The next level when the user cycles the control
     /// (`Disabled → OnDemand → Always → Disabled`).
     pub fn next(self) -> Self {
-        // STUB (failing-tests commit): cycle not yet implemented.
-        Self::Disabled
+        match self {
+            Self::Disabled => Self::OnDemand,
+            Self::OnDemand => Self::Always,
+            Self::Always => Self::Disabled,
+        }
     }
 
     /// Short label for the status line / chat title cue.
@@ -294,9 +297,12 @@ impl App {
     /// Whether a *reply* is spoken for `conversation_id` (adele-tui#77, the
     /// narration gate): `Adele == Always` OR (`Adele == OnDemand` AND
     /// `You == Enabled`). `Disabled` never narrates.
-    pub fn narrate_for(&self, _conversation_id: &str) -> bool {
-        // STUB (failing-tests commit): narration gate not yet implemented.
-        false
+    pub fn narrate_for(&self, conversation_id: &str) -> bool {
+        match self.adele_output_for(conversation_id) {
+            AdeleOutput::Always => true,
+            AdeleOutput::OnDemand => self.voice_in_for(conversation_id),
+            AdeleOutput::Disabled => false,
+        }
     }
 
     /// Whether a reply is spoken for the currently-open conversation. `false`
@@ -311,9 +317,11 @@ impl App {
     /// Whether a `say_this` aside is spoken for `conversation_id` (adele-tui#77):
     /// spoken iff `Adele ∈ {OnDemand, Always}` (independent of `You`). `Disabled`
     /// downgrades the aside to inline text.
-    pub fn say_this_spoken_for(&self, _conversation_id: &str) -> bool {
-        // STUB (failing-tests commit): aside gate not yet implemented.
-        false
+    pub fn say_this_spoken_for(&self, conversation_id: &str) -> bool {
+        !matches!(
+            self.adele_output_for(conversation_id),
+            AdeleOutput::Disabled
+        )
     }
 
     /// Render a `say_this` call whose aside is NOT spoken (Adele == Disabled) as
