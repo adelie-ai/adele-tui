@@ -70,6 +70,46 @@ pub enum InputMode {
     Renaming,
 }
 
+/// The `Adele:` voice-output level for a conversation (adele-tui#77, mirroring
+/// adele-gtk#80's `AdeleOutput`). Decides reply narration (with `You`), the
+/// `say_this` aside gate, and the send-time `system_refinement`. Defaults to
+/// [`AdeleOutput::Disabled`].
+///
+/// * `Disabled` — never speaks; a `say_this` aside downgrades to inline text.
+/// * `OnDemand` — speaks replies only while `You == Enabled` (shaped for the ear,
+///   brief and conversational) and always speaks `say_this` asides. Selected by
+///   the model's `request_voice`.
+/// * `Always` — reads every reply aloud, in full but made speakable (not
+///   shortened).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AdeleOutput {
+    /// Never speaks (the default). `say_this` → inline note.
+    #[default]
+    Disabled,
+    /// Speaks replies when `You == Enabled`; always speaks `say_this` asides.
+    OnDemand,
+    /// Reads every reply aloud, in full, made speakable.
+    Always,
+}
+
+impl AdeleOutput {
+    /// The next level when the user cycles the control
+    /// (`Disabled → OnDemand → Always → Disabled`).
+    pub fn next(self) -> Self {
+        // STUB (failing-tests commit): cycle not yet implemented.
+        Self::Disabled
+    }
+
+    /// Short label for the status line / chat title cue.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "Disabled",
+            Self::OnDemand => "On Demand",
+            Self::Always => "Always",
+        }
+    }
+}
+
 pub struct App {
     pub conversations: Vec<ConversationSummary>,
     pub selected_conversation: Option<usize>,
@@ -130,25 +170,21 @@ pub struct App {
     /// actually closes the loop; this is purely so the status bar can
     /// say "cancelling t-1..." while we wait.
     pub pending_task_cancel: Option<TaskId>,
-    /// Per-conversation "speech enabled" hard toggle (adele-tui#73). Keyed by
-    /// conversation id; a conversation absent from the map uses
-    /// `speech_default`. This is the master cut-off: when a conversation's
-    /// flag is `false` nothing is ever spoken — not reply narration, not the
-    /// daemon's `say_this` client tool. Toggled in-app with `Ctrl+S`.
-    speech_enabled: HashMap<String, bool>,
-    /// Default speech state for a conversation not yet in `speech_enabled`.
-    /// Seeded from `voice.toml`'s `play_replies` so existing
-    /// `play_replies = true` users keep audio, but it is now per-conversation
-    /// and toggleable. Defaults `false` (off) when voice is unconfigured.
-    speech_default: bool,
-    /// Per-conversation soft-sticky **voice mode** (adele-tui#75), keyed by
-    /// conversation id. Independent of `speech_enabled` (read-aloud): either one
-    /// being ON narrates replies. Entered/left by the user (`Ctrl+V`) or by the
-    /// model (`request_voice` / `stop_voice`). When ON, sends also carry a
-    /// concise read-aloud `system_refinement` so replies are shaped for speech.
-    /// A conversation absent from the map is OFF (the default). No `*_default`
-    /// seed: voice mode is always entered explicitly, never config-seeded.
-    voice_mode: HashMap<String, bool>,
+    /// Per-conversation `You:` (voice input) state (adele-tui#77, mirroring
+    /// adele-gtk#80). Keyed by conversation id; a conversation absent from the
+    /// map is **Disabled** (type only). When `true` (Enabled), a push-to-talk
+    /// control is available and — combined with `Adele == OnDemand` — gates
+    /// reply narration. Toggled in-app with `Ctrl+V`. Per-conversation, so
+    /// enabling it in one conversation never affects another.
+    voice_in: HashMap<String, bool>,
+    /// Per-conversation `Adele:` (voice output) level (adele-tui#77, mirroring
+    /// adele-gtk#80). Keyed by conversation id; a conversation absent from the
+    /// map is `Disabled` (never speaks). Set by the user (`Ctrl+S` cycles it) or
+    /// the model (`request_voice` → OnDemand, `stop_voice` → Disabled). Decides
+    /// reply narration (with `You`), the `say_this` aside gate, and the send-time
+    /// `system_refinement`. Replaces phase-1/2's `speech_enabled` (read-aloud ==
+    /// Always) and `voice_mode` (== OnDemand) toggles.
+    adele_output: HashMap<String, AdeleOutput>,
 }
 
 impl App {
@@ -181,53 +217,110 @@ impl App {
             pending_model_override: None,
             tasks: TaskPane::new(),
             pending_task_cancel: None,
-            speech_enabled: HashMap::new(),
-            speech_default: false,
-            voice_mode: HashMap::new(),
+            voice_in: HashMap::new(),
+            adele_output: HashMap::new(),
         }
     }
 
-    // --- Per-conversation speech toggle (adele-tui#73) ---
+    // --- Per-conversation You/Adele voice controls (adele-tui#77) ---
+    //
+    // Two independent per-conversation controls mirroring adele-gtk#80:
+    //   * `You` (voice input)  — `voice_in`: Disabled (type only) | Enabled (PTT).
+    //   * `Adele` (voice output) — `adele_output`: Disabled | OnDemand | Always.
+    // Text input is always available regardless. The narration gate, the
+    // `say_this` aside gate, and the send-time refinement all derive from these
+    // two as pure functions so they are unit-testable without a transport or
+    // audio device.
 
-    /// Seed the default speech state new conversations inherit (from
-    /// `voice.toml`'s `play_replies`). Conversations already toggled keep
-    /// their explicit state; only the implicit default changes.
-    pub fn set_speech_default(&mut self, default: bool) {
-        self.speech_default = default;
+    /// Whether `You:` (voice input) is Enabled for `conversation_id`. A
+    /// conversation absent from the map is Disabled (the default).
+    pub fn voice_in_for(&self, conversation_id: &str) -> bool {
+        self.voice_in.get(conversation_id).copied().unwrap_or(false)
     }
 
-    /// Whether speech is enabled for `conversation_id`. Falls back to
-    /// `speech_default` for a conversation the user hasn't toggled.
-    pub fn speech_enabled_for(&self, conversation_id: &str) -> bool {
-        self.speech_enabled
-            .get(conversation_id)
-            .copied()
-            .unwrap_or(self.speech_default)
-    }
-
-    /// Whether speech is enabled for the currently-open conversation. `false`
-    /// when no conversation is open (nothing to speak into).
-    pub fn current_speech_enabled(&self) -> bool {
+    /// Whether `You:` is Enabled for the currently-open conversation. `false`
+    /// when no conversation is open.
+    pub fn current_voice_in(&self) -> bool {
         self.current_conversation
             .as_ref()
-            .is_some_and(|c| self.speech_enabled_for(&c.id))
+            .is_some_and(|c| self.voice_in_for(&c.id))
     }
 
-    /// Flip the speech toggle for the currently-open conversation and return
-    /// the new state. `None` when no conversation is open. Per-conversation:
-    /// toggling one conversation never affects another.
-    pub fn toggle_current_speech(&mut self) -> Option<bool> {
+    /// Flip `You:` for the currently-open conversation and return the new state
+    /// (used by the `Ctrl+V` keybind). `None` when no conversation is open.
+    pub fn toggle_current_voice_in(&mut self) -> Option<bool> {
         let conv_id = self.current_conversation.as_ref()?.id.clone();
-        let next = !self.speech_enabled_for(&conv_id);
-        self.speech_enabled.insert(conv_id, next);
+        let next = !self.voice_in_for(&conv_id);
+        self.voice_in.insert(conv_id, next);
         Some(next)
     }
 
-    /// Render a `say_this` call that arrived while speech was OFF as an inline
-    /// note in the transcript instead of speaking it (adele-tui#73). Appended
-    /// to `conversation_id` only when that is the open conversation, so a call
-    /// from a stale/other conversation never bleeds into the visible chat.
-    /// Returns whether the note was shown.
+    /// The `Adele:` (voice output) level for `conversation_id`. `Disabled` when
+    /// the conversation was never set (the default).
+    pub fn adele_output_for(&self, conversation_id: &str) -> AdeleOutput {
+        self.adele_output
+            .get(conversation_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// The `Adele:` level for the currently-open conversation. `Disabled` when
+    /// no conversation is open.
+    pub fn current_adele_output(&self) -> AdeleOutput {
+        self.current_conversation
+            .as_ref()
+            .map(|c| self.adele_output_for(&c.id))
+            .unwrap_or_default()
+    }
+
+    /// Set `Adele:` for an explicit `conversation_id` (used by the model's
+    /// `request_voice` → OnDemand / `stop_voice` → Disabled tools, which carry
+    /// their own conversation). Per-conversation: only the named conversation is
+    /// affected.
+    pub fn set_adele_output(&mut self, conversation_id: &str, level: AdeleOutput) {
+        self.adele_output.insert(conversation_id.to_string(), level);
+    }
+
+    /// Cycle `Adele:` for the currently-open conversation
+    /// (`Disabled → OnDemand → Always → Disabled`) and return the new level
+    /// (used by the `Ctrl+S` keybind). `None` when no conversation is open.
+    pub fn cycle_current_adele_output(&mut self) -> Option<AdeleOutput> {
+        let conv_id = self.current_conversation.as_ref()?.id.clone();
+        let next = self.adele_output_for(&conv_id).next();
+        self.adele_output.insert(conv_id, next);
+        Some(next)
+    }
+
+    /// Whether a *reply* is spoken for `conversation_id` (adele-tui#77, the
+    /// narration gate): `Adele == Always` OR (`Adele == OnDemand` AND
+    /// `You == Enabled`). `Disabled` never narrates.
+    pub fn narrate_for(&self, _conversation_id: &str) -> bool {
+        // STUB (failing-tests commit): narration gate not yet implemented.
+        false
+    }
+
+    /// Whether a reply is spoken for the currently-open conversation. `false`
+    /// when no conversation is open. The reply-narration gate the streaming
+    /// completion path consults.
+    pub fn current_narrate(&self) -> bool {
+        self.current_conversation
+            .as_ref()
+            .is_some_and(|c| self.narrate_for(&c.id))
+    }
+
+    /// Whether a `say_this` aside is spoken for `conversation_id` (adele-tui#77):
+    /// spoken iff `Adele ∈ {OnDemand, Always}` (independent of `You`). `Disabled`
+    /// downgrades the aside to inline text.
+    pub fn say_this_spoken_for(&self, _conversation_id: &str) -> bool {
+        // STUB (failing-tests commit): aside gate not yet implemented.
+        false
+    }
+
+    /// Render a `say_this` call whose aside is NOT spoken (Adele == Disabled) as
+    /// an inline note in the transcript instead (adele-tui#77). Appended to
+    /// `conversation_id` only when that is the open conversation, so a call from
+    /// a stale/other conversation never bleeds into the visible chat. Returns
+    /// whether the note was shown.
     pub fn push_speech_disabled_note(&mut self, conversation_id: &str, text: &str) -> bool {
         let Some(conv) = self.current_conversation.as_mut() else {
             return false;
@@ -241,59 +334,6 @@ impl App {
         });
         self.scroll_offset = 0;
         true
-    }
-
-    // --- Per-conversation voice mode (adele-tui#75) ---
-
-    /// Whether soft-sticky voice mode is on for `conversation_id`. A
-    /// conversation never entered is OFF (the default). Independent of
-    /// `speech_enabled_for` (read-aloud).
-    pub fn voice_mode_for(&self, conversation_id: &str) -> bool {
-        self.voice_mode
-            .get(conversation_id)
-            .copied()
-            .unwrap_or(false)
-    }
-
-    /// Whether voice mode is on for the currently-open conversation. `false`
-    /// when no conversation is open.
-    pub fn current_voice_mode(&self) -> bool {
-        self.current_conversation
-            .as_ref()
-            .is_some_and(|c| self.voice_mode_for(&c.id))
-    }
-
-    /// Set voice mode for an explicit `conversation_id` (used by the model's
-    /// `request_voice` / `stop_voice` tools, which carry their own
-    /// conversation). Per-conversation: only the named conversation is affected.
-    pub fn set_voice_mode(&mut self, conversation_id: &str, on: bool) {
-        self.voice_mode.insert(conversation_id.to_string(), on);
-    }
-
-    /// Flip voice mode for the currently-open conversation and return the new
-    /// state (used by the `Ctrl+V` keybind). `None` when no conversation is
-    /// open. Per-conversation: toggling one never affects another.
-    pub fn toggle_current_voice_mode(&mut self) -> Option<bool> {
-        let conv_id = self.current_conversation.as_ref()?.id.clone();
-        let next = !self.voice_mode_for(&conv_id);
-        self.voice_mode.insert(conv_id, next);
-        Some(next)
-    }
-
-    /// Whether a reply for `conversation_id` should be spoken: read-aloud OR
-    /// voice-mode (adele-tui#75). This is the single narration / `say_this`
-    /// audio gate.
-    pub fn audio_enabled_for(&self, conversation_id: &str) -> bool {
-        self.speech_enabled_for(conversation_id) || self.voice_mode_for(conversation_id)
-    }
-
-    /// Whether audio is on for the currently-open conversation (read-aloud OR
-    /// voice-mode). `false` when no conversation is open. This is the reply
-    /// narration gate for the streaming completion path.
-    pub fn current_audio_enabled(&self) -> bool {
-        self.current_conversation
-            .as_ref()
-            .is_some_and(|c| self.audio_enabled_for(&c.id))
     }
 
     // --- Tasks-pane glue ---
@@ -1513,7 +1553,7 @@ mod tests {
         assert!(id.is_none());
     }
 
-    // --- Per-conversation speech toggle (adele-tui#73) ---
+    // --- Per-conversation You/Adele voice controls (adele-tui#77) ---
 
     fn app_with_open_conversation(id: &str) -> App {
         let mut app = App::new();
@@ -1528,59 +1568,163 @@ mod tests {
     }
 
     #[test]
-    fn speech_defaults_off_when_play_replies_unset() {
-        // With no voice config (`speech_default = false`), a fresh
-        // conversation must have speech OFF — the hard cut-off default.
+    fn adele_output_next_cycles_disabled_on_demand_always() {
+        assert_eq!(AdeleOutput::Disabled.next(), AdeleOutput::OnDemand);
+        assert_eq!(AdeleOutput::OnDemand.next(), AdeleOutput::Always);
+        assert_eq!(AdeleOutput::Always.next(), AdeleOutput::Disabled);
+    }
+
+    #[test]
+    fn defaults_are_you_disabled_and_adele_disabled_silent() {
+        // The default gate must be closed: nothing is spoken, asides go inline.
         let app = app_with_open_conversation("c1");
-        assert!(!app.current_speech_enabled());
-        assert!(!app.speech_enabled_for("c1"));
+        assert!(!app.current_voice_in(), "You defaults Disabled");
+        assert_eq!(
+            app.current_adele_output(),
+            AdeleOutput::Disabled,
+            "Adele defaults Disabled"
+        );
+        assert!(
+            !app.current_narrate(),
+            "default gate is closed (no narration)"
+        );
+        assert!(
+            !app.say_this_spoken_for("c1"),
+            "default say_this is not spoken (Disabled)"
+        );
+        assert!(!app.narrate_for("never-seen"));
     }
 
     #[test]
-    fn speech_default_seeds_untoggled_conversations() {
-        // `play_replies = true` seeds the per-conversation default ON so
-        // existing users keep audio — but it is now per-conversation.
+    fn toggle_current_voice_in_flips_and_returns_new_state() {
         let mut app = app_with_open_conversation("c1");
-        app.set_speech_default(true);
-        assert!(app.current_speech_enabled());
-        assert!(app.speech_enabled_for("c1"));
-        assert!(app.speech_enabled_for("never-opened"));
+        assert_eq!(app.toggle_current_voice_in(), Some(true));
+        assert!(app.current_voice_in());
+        assert_eq!(app.toggle_current_voice_in(), Some(false));
+        assert!(!app.current_voice_in());
     }
 
     #[test]
-    fn toggle_current_speech_flips_and_returns_new_state() {
-        let mut app = app_with_open_conversation("c1");
-        assert_eq!(app.toggle_current_speech(), Some(true));
-        assert!(app.current_speech_enabled());
-        assert_eq!(app.toggle_current_speech(), Some(false));
-        assert!(!app.current_speech_enabled());
-    }
-
-    #[test]
-    fn toggle_current_speech_without_conversation_is_none() {
+    fn toggle_current_voice_in_without_conversation_is_none() {
         let mut app = App::new();
-        assert_eq!(app.toggle_current_speech(), None);
-        assert!(!app.current_speech_enabled());
+        assert_eq!(app.toggle_current_voice_in(), None);
+        assert!(!app.current_voice_in());
     }
 
     #[test]
-    fn speech_toggle_is_per_conversation_isolated() {
-        // Enabling speech in one conversation must NOT bleed into another.
+    fn cycle_current_adele_output_advances_and_returns_new_level() {
         let mut app = app_with_open_conversation("c1");
-        assert_eq!(app.toggle_current_speech(), Some(true)); // c1 ON
-        assert!(app.speech_enabled_for("c1"));
-        assert!(!app.speech_enabled_for("c2")); // c2 untouched → default OFF
+        assert_eq!(
+            app.cycle_current_adele_output(),
+            Some(AdeleOutput::OnDemand)
+        );
+        assert_eq!(app.current_adele_output(), AdeleOutput::OnDemand);
+        assert_eq!(app.cycle_current_adele_output(), Some(AdeleOutput::Always));
+        assert_eq!(
+            app.cycle_current_adele_output(),
+            Some(AdeleOutput::Disabled)
+        );
     }
 
     #[test]
-    fn speech_toggle_overrides_the_default_per_conversation() {
-        // With default ON, an explicit toggle to OFF for one conversation
-        // sticks for that conversation only.
+    fn cycle_current_adele_output_without_conversation_is_none() {
+        let mut app = App::new();
+        assert_eq!(app.cycle_current_adele_output(), None);
+        assert_eq!(app.current_adele_output(), AdeleOutput::Disabled);
+    }
+
+    #[test]
+    fn adele_always_narrates_regardless_of_you() {
+        // Always reads every reply aloud whether or not You is Enabled.
+        for you in [false, true] {
+            let mut app = app_with_open_conversation("c1");
+            app.voice_in.insert("c1".to_string(), you);
+            app.set_adele_output("c1", AdeleOutput::Always);
+            assert!(app.current_narrate(), "Always must narrate (You={you})");
+            assert!(
+                app.say_this_spoken_for("c1"),
+                "Always always speaks say_this (You={you})"
+            );
+        }
+    }
+
+    #[test]
+    fn adele_on_demand_narrates_only_when_you_enabled() {
+        // The gate's OnDemand arm: spoken iff You == Enabled.
         let mut app = app_with_open_conversation("c1");
-        app.set_speech_default(true);
-        assert_eq!(app.toggle_current_speech(), Some(false)); // c1 explicitly OFF
-        assert!(!app.speech_enabled_for("c1"));
-        assert!(app.speech_enabled_for("c2")); // others still follow default ON
+        app.set_adele_output("c1", AdeleOutput::OnDemand);
+
+        // You Disabled → reply text-only, but say_this aside still spoken.
+        app.voice_in.insert("c1".to_string(), false);
+        assert!(
+            !app.current_narrate(),
+            "OnDemand + You=Disabled: no narration"
+        );
+        assert!(
+            app.say_this_spoken_for("c1"),
+            "OnDemand say_this aside spoken even when You=Disabled"
+        );
+
+        // You Enabled → reply narrated.
+        app.voice_in.insert("c1".to_string(), true);
+        assert!(app.current_narrate(), "OnDemand + You=Enabled narrates");
+        assert!(app.say_this_spoken_for("c1"));
+    }
+
+    #[test]
+    fn adele_disabled_never_narrates_and_say_this_goes_inline() {
+        let mut app = app_with_open_conversation("c1");
+        app.set_adele_output("c1", AdeleOutput::Disabled);
+        for you in [false, true] {
+            app.voice_in.insert("c1".to_string(), you);
+            assert!(
+                !app.current_narrate(),
+                "Disabled never narrates (You={you})"
+            );
+            assert!(
+                !app.say_this_spoken_for("c1"),
+                "Disabled never speaks say_this (You={you})"
+            );
+        }
+    }
+
+    #[test]
+    fn set_voice_in_targets_an_explicit_conversation() {
+        // The model's tools / the streaming path carry their own conversation id.
+        let mut app = app_with_open_conversation("c1");
+        app.voice_in.insert("c2".to_string(), true);
+        assert!(app.voice_in_for("c2"));
+        assert!(!app.voice_in_for("c1")); // open conversation untouched
+    }
+
+    #[test]
+    fn set_adele_output_targets_an_explicit_conversation() {
+        let mut app = app_with_open_conversation("c1");
+        app.set_adele_output("c2", AdeleOutput::OnDemand);
+        assert_eq!(app.adele_output_for("c2"), AdeleOutput::OnDemand);
+        assert_eq!(app.adele_output_for("c1"), AdeleOutput::Disabled);
+    }
+
+    #[test]
+    fn voice_controls_are_per_conversation_isolated() {
+        // Enabling You / raising Adele in one conversation must NOT bleed.
+        let mut app = app_with_open_conversation("c1");
+        assert_eq!(app.toggle_current_voice_in(), Some(true)); // c1 You ON
+        app.set_adele_output("c1", AdeleOutput::Always);
+        assert!(app.voice_in_for("c1"));
+        assert_eq!(app.adele_output_for("c1"), AdeleOutput::Always);
+        // c2 untouched → both defaults.
+        assert!(!app.voice_in_for("c2"));
+        assert_eq!(app.adele_output_for("c2"), AdeleOutput::Disabled);
+        assert!(!app.narrate_for("c2"));
+    }
+
+    #[test]
+    fn current_narrate_is_false_without_a_conversation() {
+        let mut app = App::new();
+        // Even with stale per-conversation state, no open conversation → silent.
+        app.set_adele_output("c1", AdeleOutput::Always);
+        assert!(!app.current_narrate());
     }
 
     #[test]
@@ -1612,78 +1756,6 @@ mod tests {
     fn push_speech_disabled_note_with_no_conversation_is_noop() {
         let mut app = App::new();
         assert!(!app.push_speech_disabled_note("c1", "anything"));
-    }
-
-    // --- Per-conversation voice mode (adele-tui#75) ---
-
-    #[test]
-    fn voice_mode_defaults_off() {
-        let app = app_with_open_conversation("c1");
-        assert!(!app.current_voice_mode());
-        assert!(!app.voice_mode_for("c1"));
-        assert!(!app.voice_mode_for("never-seen"));
-    }
-
-    #[test]
-    fn toggle_current_voice_mode_flips_and_returns_new_state() {
-        let mut app = app_with_open_conversation("c1");
-        assert_eq!(app.toggle_current_voice_mode(), Some(true));
-        assert!(app.current_voice_mode());
-        assert_eq!(app.toggle_current_voice_mode(), Some(false));
-        assert!(!app.current_voice_mode());
-    }
-
-    #[test]
-    fn toggle_current_voice_mode_without_conversation_is_none() {
-        let mut app = App::new();
-        assert_eq!(app.toggle_current_voice_mode(), None);
-        assert!(!app.current_voice_mode());
-    }
-
-    #[test]
-    fn set_voice_mode_targets_an_explicit_conversation() {
-        // The model's request_voice/stop_voice carry their own conversation id,
-        // which may not be the open one.
-        let mut app = app_with_open_conversation("c1");
-        app.set_voice_mode("c2", true);
-        assert!(app.voice_mode_for("c2"));
-        assert!(!app.voice_mode_for("c1")); // open conversation untouched
-        app.set_voice_mode("c2", false);
-        assert!(!app.voice_mode_for("c2"));
-    }
-
-    #[test]
-    fn voice_mode_is_per_conversation_isolated() {
-        let mut app = app_with_open_conversation("c1");
-        assert_eq!(app.toggle_current_voice_mode(), Some(true)); // c1 ON
-        assert!(app.voice_mode_for("c1"));
-        assert!(!app.voice_mode_for("c2")); // c2 untouched → OFF
-    }
-
-    #[test]
-    fn audio_enabled_is_read_aloud_or_voice_mode() {
-        // Both off → no audio (exactly phase-1 toggle-off).
-        let mut app = app_with_open_conversation("c1");
-        assert!(!app.audio_enabled_for("c1"));
-        assert!(!app.current_audio_enabled());
-
-        // Read-aloud on (phase-1 toggle) → audio on.
-        assert_eq!(app.toggle_current_speech(), Some(true));
-        assert!(app.audio_enabled_for("c1"));
-        assert!(app.current_audio_enabled());
-
-        // Read-aloud back off, voice-mode on → still audio on.
-        assert_eq!(app.toggle_current_speech(), Some(false));
-        assert!(!app.audio_enabled_for("c1"));
-        assert_eq!(app.toggle_current_voice_mode(), Some(true));
-        assert!(app.audio_enabled_for("c1"));
-        assert!(app.current_audio_enabled());
-    }
-
-    #[test]
-    fn current_audio_enabled_is_false_without_a_conversation() {
-        let app = App::new();
-        assert!(!app.current_audio_enabled());
     }
 
     #[test]

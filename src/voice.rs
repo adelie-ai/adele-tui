@@ -10,24 +10,54 @@
 //!
 //! Configuration lives in its own `voice.toml` next to `settings.json`, because
 //! the module's config sections are TOML-native (`Deserialize` + `Default`) and
-//! the daemon uses the same shapes. The [`VoiceMode`] toggle gates everything:
-//! it defaults to [`VoiceMode::Off`] so a TUI with no voice config behaves
-//! exactly as before. [`VoiceMode::Daemon`] is accepted but inert here — the TUI
-//! has no daemon client, so it is treated as "off"; the embedded path is the
-//! capability this module adds.
+//! the daemon uses the same shapes. The [`VoiceMode`] toggle gates the embedded
+//! pipeline: it defaults to [`VoiceMode::Off`] so a TUI with no voice config
+//! behaves exactly as before. [`VoiceMode::Daemon`] is accepted but inert here —
+//! it does not wire the embedded mic/speaker; narration still routes through the
+//! voice daemon (`org.desktopAssistant.Voice`) via [`crate::voice_client`] when
+//! that daemon is running, regardless of this mode (the daemon path is probed
+//! independently and is the preferred speaker — see adele-tui#77).
 //!
 //! Building the embedded pipeline loads ONNX models (hundreds of MB), so it is
 //! done lazily on first use rather than at startup, and only when the mode is
 //! `embedded`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use adele_voice_core::sentence_buffer::SentenceBuffer;
 use adele_voice_module::config::{AudioConfig, SttConfig, TtsConfig, VadConfig};
 use adele_voice_module::{Dictation, Speaker, TtsBackend, build_dictation, build_speaker};
 use adele_voice_stt_whisper::WhisperStt;
 use adele_voice_vad_silero::SileroVad;
 use serde::Deserialize;
 use tokio::sync::Mutex;
+
+/// Split `text` into the chunks that should be fed to a one-shot synthesizer.
+///
+/// Both the voice daemon's `SayText` and the embedded [`Speaker`] are
+/// **one-shot**: they assume a single short sentence and apply a per-synth
+/// timeout (`adele_voice_module`'s `DEFAULT_SYNTH_TIMEOUT`, ~20s). A long reply
+/// fed in one go would blow that timeout, so the *client* must chunk it the same
+/// way the daemon's streaming pipeline does — via [`SentenceBuffer`]. This is the
+/// TUI port of adele-gtk#80's `voice_embedded::into_speakable_sentences`; the
+/// chunking *algorithm* itself lives in the shared `adele-voice-core` crate.
+///
+/// This pushes the whole text through a `SentenceBuffer` (collecting every
+/// complete sentence) and then appends the trailing remainder from `flush()`
+/// (the last sentence has no trailing whitespace, so the buffer holds it back).
+/// If chunking yields nothing it falls back to a single chunk of the trimmed
+/// original when that text is non-blank, and to an empty `Vec` for
+/// empty/whitespace input (nothing to speak).
+///
+/// The timeout passed to the buffer is irrelevant here: this is a synchronous,
+/// one-shot push/flush with no streaming, so the time-based flush never fires.
+pub fn into_speakable_sentences(text: &str) -> Vec<String> {
+    // Timeout is unused on this synchronous push→flush path; any value works.
+    // STUB (failing-tests commit): chunking not yet implemented.
+    let _ = SentenceBuffer::new(Duration::from_millis(500));
+    Vec::new()
+}
 
 /// How the TUI sources voice. Defaults to [`VoiceMode::Off`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -55,11 +85,12 @@ pub enum VoiceMode {
 pub struct VoiceConfig {
     /// The capability toggle (`off` | `embedded` | `daemon`).
     pub mode: VoiceMode,
-    /// Seeds the per-conversation speech toggle's default (adele-tui#73). When
-    /// `true`, new conversations start with speech ON (so existing
-    /// `play_replies = true` users keep audio), but speech is now an in-app
-    /// per-conversation control (`Ctrl+S`), no longer a global always-on gate.
-    /// Only meaningful in `embedded` mode. Defaults `false` (speech off).
+    /// Accepted for config back-compat but no longer seeds any state
+    /// (adele-tui#77). The You/Adele model always starts each conversation at
+    /// `Adele = Disabled` (silent) and `You = Disabled`; voice output is an
+    /// explicit per-conversation choice (`Ctrl+S` cycles Adele), never
+    /// config-seeded. Retained only so an existing `play_replies = true` line
+    /// keeps parsing rather than erroring.
     pub play_replies: bool,
     pub audio: AudioConfig,
     pub vad: VadConfig,
@@ -226,5 +257,56 @@ mod tests {
         // Forward-compat: a newer config key shouldn't fail an older binary.
         let cfg: VoiceConfig = toml::from_str("mode = \"embedded\"\nfuture_knob = 42\n").unwrap();
         assert!(cfg.embedded_enabled());
+    }
+
+    // --- Sentence chunking (adele-tui#77) ---
+
+    /// A multi-sentence reply splits into one chunk per sentence, in order, so
+    /// no single synth call carries the whole paragraph past its ~20s timeout.
+    #[test]
+    fn chunks_multi_sentence_into_sentences() {
+        let chunks = into_speakable_sentences("Hello there. How are you? I am fine.");
+        assert_eq!(chunks, vec!["Hello there.", "How are you?", "I am fine."]);
+    }
+
+    /// A single sentence is one chunk.
+    #[test]
+    fn chunks_single_sentence_into_one() {
+        let chunks = into_speakable_sentences("Just one sentence here.");
+        assert_eq!(chunks, vec!["Just one sentence here."]);
+    }
+
+    /// Text with no trailing punctuation is still spoken — as one chunk (the
+    /// `flush()` tail), not dropped.
+    #[test]
+    fn chunks_text_without_terminal_punctuation_into_one() {
+        let chunks = into_speakable_sentences("no trailing punctuation here");
+        assert_eq!(chunks, vec!["no trailing punctuation here"]);
+    }
+
+    /// Empty / whitespace-only input has nothing to speak → no chunks (so the
+    /// caller makes zero synth calls rather than synthesizing silence).
+    #[test]
+    fn chunks_empty_or_whitespace_into_nothing() {
+        assert!(into_speakable_sentences("").is_empty());
+        assert!(into_speakable_sentences("   \n\t  ").is_empty());
+    }
+
+    /// A long multi-sentence paragraph splits into several chunks, each
+    /// non-empty (the whole point: keep each synth call short).
+    #[test]
+    fn chunks_long_paragraph_into_multiple() {
+        let paragraph = "The quick brown fox jumps over the lazy dog. \
+             It then trots away to find a quiet spot. \
+             Later, the dog wakes up and stretches lazily. \
+             Neither animal pays the other any further mind. \
+             The afternoon sun warms the empty field.";
+        let chunks = into_speakable_sentences(paragraph);
+        assert!(
+            chunks.len() >= 4,
+            "a five-sentence paragraph should split into several chunks, got {}: {chunks:?}",
+            chunks.len()
+        );
+        assert!(chunks.iter().all(|c| !c.trim().is_empty()));
     }
 }
