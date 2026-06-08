@@ -51,6 +51,13 @@ pub enum Action {
     /// ("Go, voice") — free across modes and not intercepted by terminals or
     /// the textarea. No-op unless voice is in `embedded` mode (adele-tui#67).
     Dictate,
+    /// Toggle the per-conversation "speech enabled" hard switch (adele-tui#73).
+    /// Bound to `Ctrl+S` ("Speech"). The keyboard-enhancement flags pushed at
+    /// startup deliver Ctrl+S as a real key event (not terminal XOFF flow
+    /// control). When ON the assistant's replies are spoken aloud and the
+    /// daemon's `say_this` client tool speaks; when OFF nothing is ever
+    /// played. Defaults OFF per conversation (seeded from `play_replies`).
+    ToggleSpeech,
 }
 
 /// Handle key events that we intercept before passing to textarea.
@@ -108,6 +115,7 @@ pub fn handle_key_event(
             // Ctrl+G starts embedded dictation (mic → prompt). A no-op when
             // voice isn't in embedded mode; main.rs gates on the session.
             KeyCode::Char('g') => Some(Action::Dictate),
+            // TODO(adele-tui#73): bind Ctrl+S to Action::ToggleSpeech.
             _ => None,
         };
     }
@@ -797,6 +805,48 @@ mod tests {
                 false
             ),
             Some(Action::Dictate)
+        );
+    }
+
+    // --- Ctrl+S toggles per-conversation speech (adele-tui#73) ---
+
+    #[test]
+    fn ctrl_s_toggles_speech_in_normal() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                &InputMode::Normal,
+                false
+            ),
+            Some(Action::ToggleSpeech)
+        );
+    }
+
+    #[test]
+    fn ctrl_s_toggles_speech_in_editing() {
+        // Speech is a per-conversation control the user will flip while
+        // composing, so it must be reachable from editing mode too.
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                &InputMode::Editing,
+                false
+            ),
+            Some(Action::ToggleSpeech)
+        );
+    }
+
+    #[test]
+    fn ctrl_s_is_not_intercepted_in_renaming() {
+        // Renaming forwards all Ctrl combos to the rename textarea; the speech
+        // toggle must not hijack them mid-rename.
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                &InputMode::Renaming,
+                false
+            ),
+            None
         );
     }
 

@@ -5,6 +5,7 @@
 //! base, connections, and purposes management screens).
 
 mod app;
+mod client_tools;
 mod connections;
 mod credentials;
 mod kb;
@@ -316,6 +317,10 @@ async fn run(
                 Err(e) => app.status_message = format!("Error loading conversations: {e}"),
             }
             init_background_tasks(&mut app, conn.client()).await;
+            // Advertise the TUI's `say_this` client tool (adele-tui#73). Scoped
+            // to this session via desktop-assistant#261, so a concurrent voice
+            // session's tools never fire on a TUI turn.
+            register_client_tools(&conn).await;
             app.status_message = conn.label().to_string();
             connector = Some(conn);
         }
@@ -336,6 +341,13 @@ async fn run(
     // result and the ready session are merged into the select! loop like every
     // other async source (per AGENTS.md). Off/daemon mode wires nothing.
     let voice_cfg = VoiceConfig::load();
+    // Seed the per-conversation speech toggle's default (adele-tui#73). Existing
+    // `play_replies = true` users keep audio (now per-conversation + toggleable
+    // via Ctrl+S); everyone else defaults to speech OFF. Only meaningful in
+    // embedded mode — there is no `Speaker` to narrate with otherwise.
+    if voice_cfg.embedded_enabled() {
+        app.set_speech_default(voice_cfg.play_replies);
+    }
     let mut voice_session: Option<VoiceSession> = None;
     let mut dictating = false;
     let (dictation_tx, mut dictation_rx) = unbounded_channel::<DictationOutcome>();
@@ -485,11 +497,15 @@ async fn run(
                     }
                     SignalEvent::Complete { request_id, full_response } => {
                         app.complete_streaming(&request_id, &full_response);
-                        // Speak the reply aloud (embedded TTS, no daemon) when
-                        // enabled. Fire-and-forget on a task so synth+playback
-                        // never blocks the UI; `Speaker` is cheap to clone.
+                        // Speak the reply aloud (embedded TTS, no daemon) only
+                        // when the OPEN conversation's per-conversation speech
+                        // toggle is ON (adele-tui#73) — the hard cut-off. The
+                        // completing reply streams into the open conversation,
+                        // so that toggle is the right gate. Fire-and-forget on a
+                        // task so synth+playback never blocks the UI; `Speaker`
+                        // is cheap to clone.
                         if let Some(session) = voice_session.as_ref()
-                            && session.play_replies()
+                            && app.current_speech_enabled()
                             && !full_response.trim().is_empty()
                         {
                             let speaker = session.speaker();
@@ -554,11 +570,28 @@ async fn run(
                     // The TUI has no scratchpad pane (that lives in the GTK/KDE
                     // clients), so the change notification is a no-op here.
                     SignalEvent::ScratchpadChanged { .. } => {}
-                    // The TUI registers no client-local MCP tools
-                    // (`register_client_tools`), so the daemon never parks a turn
-                    // on it — this variant can't actually arrive here. Match it
-                    // explicitly to keep the arm list exhaustive (#231).
-                    SignalEvent::ClientToolCall { .. } => {}
+                    // The daemon suspended a turn on a client-local tool (#107)
+                    // — the TUI registers `say_this` (adele-tui#73). Dispatch
+                    // it, perform the side effect (speak / show inline), and
+                    // ALWAYS submit a result so the parked turn resumes. With
+                    // the per-session registry (desktop-assistant#261) a
+                    // concurrent voice session's tools no longer fire here.
+                    SignalEvent::ClientToolCall {
+                        task_id,
+                        conversation_id,
+                        tool_call_id,
+                        tool_name,
+                        arguments,
+                    } => {
+                        let call = client_tools::ClientToolCall {
+                            task_id,
+                            conversation_id,
+                            tool_call_id,
+                            tool_name,
+                            arguments,
+                        };
+                        handle_client_tool_call(&mut app, &connector, &voice_session, call).await;
+                    }
                 }
             }
             _ = async {
@@ -581,6 +614,9 @@ async fn run(
                             Err(e) => app.status_message = format!("Error loading conversations: {e}"),
                         }
                         init_background_tasks(&mut app, conn.client()).await;
+                        // Re-advertise client tools — the daemon replaces the
+                        // per-session set on each connect (adele-tui#73 / #231).
+                        register_client_tools(&conn).await;
                         reconnect = ReconnectState::Connected;
                         app.status_message = conn.label().to_string();
                         connector = Some(conn);
@@ -708,6 +744,19 @@ async fn handle_action(app: &mut App, connector: &Option<Connector>, action: Act
         // session + a result channel + a spawned capture task — loop-local
         // resources that don't belong in `handle_action`'s signature).
         Action::Dictate => {}
+        Action::ToggleSpeech => match app.toggle_current_speech() {
+            Some(true) => {
+                app.status_message =
+                    "Speech ON for this conversation (replies + say_this spoken aloud)".into();
+            }
+            Some(false) => {
+                app.status_message = "Speech OFF for this conversation".into();
+            }
+            None => {
+                app.status_message =
+                    "Open a conversation first — speech is per-conversation".into();
+            }
+        },
         Action::InsertNewline => {
             app.textarea.insert_newline();
         }
@@ -884,6 +933,73 @@ async fn handle_action(app: &mut App, connector: &Option<Connector>, action: Act
                 }
             }
         }
+    }
+}
+
+/// Handle a daemon `ClientToolCall` for the TUI's `say_this` tool, then submit
+/// a result so the suspended turn resumes (adele-tui#73). The decision is pure
+/// (see [`client_tools::dispatch`]); this just performs the side effect — speak
+/// via the embedded `Speaker`, or render the text inline when speech is off —
+/// and posts the outcome back over the connector. A result is ALWAYS submitted
+/// (even on a transport/submit error we log rather than wedge silently).
+async fn handle_client_tool_call(
+    app: &mut App,
+    connector: &Option<Connector>,
+    voice_session: &Option<VoiceSession>,
+    call: client_tools::ClientToolCall,
+) {
+    // Gate on the call's OWN conversation, not the open one, so the hard toggle
+    // is honored per conversation even if the user has since switched tabs.
+    let speech_enabled = app.speech_enabled_for(&call.conversation_id);
+    let outcome = client_tools::dispatch(&call.tool_name, &call.arguments, speech_enabled);
+
+    match outcome.effect {
+        client_tools::ToolEffect::Speak(text) => {
+            // Fire-and-forget playback so we don't block submitting the result.
+            if let Some(session) = voice_session.as_ref() {
+                let speaker = session.speaker();
+                tokio::spawn(async move {
+                    if let Err(e) = speaker.say(&text).await {
+                        tracing::warn!("say_this playback failed: {e}");
+                    }
+                });
+            } else {
+                // Speech enabled but no audio pipeline (voice off / failed to
+                // load): degrade to showing the text rather than dropping it.
+                app.push_speech_disabled_note(&call.conversation_id, &text);
+            }
+        }
+        client_tools::ToolEffect::ShowDisabled(text) => {
+            app.push_speech_disabled_note(&call.conversation_id, &text);
+        }
+        client_tools::ToolEffect::None => {}
+    }
+
+    if let Some(conn) = connector.as_ref() {
+        if let Err(e) = conn
+            .submit_client_tool_result(&call.task_id, &call.tool_call_id, outcome.result)
+            .await
+        {
+            app.status_message = format!("Client tool result submit failed: {e}");
+        }
+    } else {
+        // No live connection to submit through — the turn is already lost to a
+        // disconnect; surface it rather than failing silently.
+        app.status_message = "Client tool call arrived while disconnected".into();
+    }
+}
+
+/// Advertise the TUI's `say_this` client tool to the daemon. The daemon
+/// replaces the whole set each call, so this runs on every (re)connect (#231).
+/// Best-effort: voice playback is a convenience, so a failure to register is
+/// only logged and never blocks the chat. Over D-Bus (no command channel for
+/// client tools) this is expected to fail and is silently skipped.
+async fn register_client_tools(conn: &Connector) {
+    if let Err(e) = conn
+        .register_client_tools(vec![client_tools::say_this_registration()])
+        .await
+    {
+        tracing::debug!("client tool registration skipped: {e}");
     }
 }
 

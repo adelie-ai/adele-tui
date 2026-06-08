@@ -6,6 +6,7 @@
 //! independently of the binary entry point.
 
 pub mod app;
+pub mod client_tools;
 pub mod connections;
 pub mod credentials;
 pub mod kb;

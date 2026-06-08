@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use desktop_assistant_api_model::TaskId;
 pub use desktop_assistant_client_common::{ChatMessage, ConversationDetail, ConversationSummary};
 use ratatui::style::Style;
@@ -128,6 +130,17 @@ pub struct App {
     /// actually closes the loop; this is purely so the status bar can
     /// say "cancelling t-1..." while we wait.
     pub pending_task_cancel: Option<TaskId>,
+    /// Per-conversation "speech enabled" hard toggle (adele-tui#73). Keyed by
+    /// conversation id; a conversation absent from the map uses
+    /// `speech_default`. This is the master cut-off: when a conversation's
+    /// flag is `false` nothing is ever spoken — not reply narration, not the
+    /// daemon's `say_this` client tool. Toggled in-app with `Ctrl+S`.
+    speech_enabled: HashMap<String, bool>,
+    /// Default speech state for a conversation not yet in `speech_enabled`.
+    /// Seeded from `voice.toml`'s `play_replies` so existing
+    /// `play_replies = true` users keep audio, but it is now per-conversation
+    /// and toggleable. Defaults `false` (off) when voice is unconfigured.
+    speech_default: bool,
 }
 
 impl App {
@@ -160,7 +173,50 @@ impl App {
             pending_model_override: None,
             tasks: TaskPane::new(),
             pending_task_cancel: None,
+            speech_enabled: HashMap::new(),
+            speech_default: false,
         }
+    }
+
+    // --- Per-conversation speech toggle (adele-tui#73) ---
+
+    /// Seed the default speech state new conversations inherit (from
+    /// `voice.toml`'s `play_replies`). Conversations already toggled keep
+    /// their explicit state; only the implicit default changes.
+    pub fn set_speech_default(&mut self, _default: bool) {
+        // TODO(adele-tui#73): seed the per-conversation default.
+    }
+
+    /// Whether speech is enabled for `conversation_id`. Falls back to
+    /// `speech_default` for a conversation the user hasn't toggled.
+    pub fn speech_enabled_for(&self, _conversation_id: &str) -> bool {
+        // TODO(adele-tui#73): per-conversation lookup with default fallback.
+        false
+    }
+
+    /// Whether speech is enabled for the currently-open conversation. `false`
+    /// when no conversation is open (nothing to speak into).
+    pub fn current_speech_enabled(&self) -> bool {
+        // TODO(adele-tui#73).
+        false
+    }
+
+    /// Flip the speech toggle for the currently-open conversation and return
+    /// the new state. `None` when no conversation is open. Per-conversation:
+    /// toggling one conversation never affects another.
+    pub fn toggle_current_speech(&mut self) -> Option<bool> {
+        // TODO(adele-tui#73): flip and persist the per-conversation toggle.
+        None
+    }
+
+    /// Render a `say_this` call that arrived while speech was OFF as an inline
+    /// note in the transcript instead of speaking it (adele-tui#73). Appended
+    /// to `conversation_id` only when that is the open conversation, so a call
+    /// from a stale/other conversation never bleeds into the visible chat.
+    /// Returns whether the note was shown.
+    pub fn push_speech_disabled_note(&mut self, _conversation_id: &str, _text: &str) -> bool {
+        // TODO(adele-tui#73): append the inline disabled note.
+        false
     }
 
     // --- Tasks-pane glue ---
@@ -1378,6 +1434,107 @@ mod tests {
         let mut app = App::new();
         let id = app.request_cancel_selected_task();
         assert!(id.is_none());
+    }
+
+    // --- Per-conversation speech toggle (adele-tui#73) ---
+
+    fn app_with_open_conversation(id: &str) -> App {
+        let mut app = App::new();
+        app.current_conversation = Some(ConversationDetail {
+            id: id.into(),
+            title: "Chat".into(),
+            messages: vec![],
+            model_selection: None,
+            conversation_personality: None,
+        });
+        app
+    }
+
+    #[test]
+    fn speech_defaults_off_when_play_replies_unset() {
+        // With no voice config (`speech_default = false`), a fresh
+        // conversation must have speech OFF — the hard cut-off default.
+        let app = app_with_open_conversation("c1");
+        assert!(!app.current_speech_enabled());
+        assert!(!app.speech_enabled_for("c1"));
+    }
+
+    #[test]
+    fn speech_default_seeds_untoggled_conversations() {
+        // `play_replies = true` seeds the per-conversation default ON so
+        // existing users keep audio — but it is now per-conversation.
+        let mut app = app_with_open_conversation("c1");
+        app.set_speech_default(true);
+        assert!(app.current_speech_enabled());
+        assert!(app.speech_enabled_for("c1"));
+        assert!(app.speech_enabled_for("never-opened"));
+    }
+
+    #[test]
+    fn toggle_current_speech_flips_and_returns_new_state() {
+        let mut app = app_with_open_conversation("c1");
+        assert_eq!(app.toggle_current_speech(), Some(true));
+        assert!(app.current_speech_enabled());
+        assert_eq!(app.toggle_current_speech(), Some(false));
+        assert!(!app.current_speech_enabled());
+    }
+
+    #[test]
+    fn toggle_current_speech_without_conversation_is_none() {
+        let mut app = App::new();
+        assert_eq!(app.toggle_current_speech(), None);
+        assert!(!app.current_speech_enabled());
+    }
+
+    #[test]
+    fn speech_toggle_is_per_conversation_isolated() {
+        // Enabling speech in one conversation must NOT bleed into another.
+        let mut app = app_with_open_conversation("c1");
+        assert_eq!(app.toggle_current_speech(), Some(true)); // c1 ON
+        assert!(app.speech_enabled_for("c1"));
+        assert!(!app.speech_enabled_for("c2")); // c2 untouched → default OFF
+    }
+
+    #[test]
+    fn speech_toggle_overrides_the_default_per_conversation() {
+        // With default ON, an explicit toggle to OFF for one conversation
+        // sticks for that conversation only.
+        let mut app = app_with_open_conversation("c1");
+        app.set_speech_default(true);
+        assert_eq!(app.toggle_current_speech(), Some(false)); // c1 explicitly OFF
+        assert!(!app.speech_enabled_for("c1"));
+        assert!(app.speech_enabled_for("c2")); // others still follow default ON
+    }
+
+    #[test]
+    fn push_speech_disabled_note_appends_inline_to_open_conversation() {
+        let mut app = app_with_open_conversation("c1");
+        assert!(app.push_speech_disabled_note("c1", "the kettle is on"));
+        let msgs = &app.current_conversation.as_ref().unwrap().messages;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "assistant");
+        assert_eq!(msgs[0].content, "(speech mode disabled) the kettle is on");
+    }
+
+    #[test]
+    fn push_speech_disabled_note_ignores_other_conversation() {
+        // A say_this call referencing a conversation that isn't the open one
+        // must NOT bleed text into the visible transcript.
+        let mut app = app_with_open_conversation("c1");
+        assert!(!app.push_speech_disabled_note("c2", "wrong conversation"));
+        assert!(
+            app.current_conversation
+                .as_ref()
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn push_speech_disabled_note_with_no_conversation_is_noop() {
+        let mut app = App::new();
+        assert!(!app.push_speech_disabled_note("c1", "anything"));
     }
 
     #[test]
