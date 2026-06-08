@@ -55,8 +55,11 @@ pub enum VoiceMode {
 pub struct VoiceConfig {
     /// The capability toggle (`off` | `embedded` | `daemon`).
     pub mode: VoiceMode,
-    /// Speak assistant replies aloud after they finish streaming. Only has an
-    /// effect in `embedded` mode.
+    /// Seeds the per-conversation speech toggle's default (adele-tui#73). When
+    /// `true`, new conversations start with speech ON (so existing
+    /// `play_replies = true` users keep audio), but speech is now an in-app
+    /// per-conversation control (`Ctrl+S`), no longer a global always-on gate.
+    /// Only meaningful in `embedded` mode. Defaults `false` (speech off).
     pub play_replies: bool,
     pub audio: AudioConfig,
     pub vad: VadConfig,
@@ -111,20 +114,23 @@ fn config_path() -> Option<std::path::PathBuf> {
 pub struct VoiceSession {
     dictation: Arc<Mutex<Dictation<SileroVad, WhisperStt>>>,
     speaker: Speaker<TtsBackend>,
-    play_replies: bool,
 }
 
 impl VoiceSession {
     /// Wire the embedded pipeline from config. Loads the VAD/STT models and the
     /// TTS backend (local-first Kokoro→Piper fallback), so this is the expensive
     /// step; call it once, lazily, on the first dictate.
+    ///
+    /// Whether replies are *spoken* is no longer a property of the session: the
+    /// per-conversation `Ctrl+S` speech toggle (adele-tui#73) governs that, with
+    /// its default seeded from `cfg.play_replies`. The session just supplies the
+    /// `Speaker`; the caller decides per conversation whether to use it.
     pub async fn build(cfg: &VoiceConfig) -> anyhow::Result<Self> {
         let dictation = build_dictation(&cfg.audio, &cfg.vad, &cfg.stt)?;
         let speaker = build_speaker(&cfg.tts, &cfg.audio).await;
         Ok(Self {
             dictation: Arc::new(Mutex::new(dictation)),
             speaker,
-            play_replies: cfg.play_replies,
         })
     }
 
@@ -136,11 +142,6 @@ impl VoiceSession {
     /// A speaker clone for spawning a playback task.
     pub fn speaker(&self) -> Speaker<TtsBackend> {
         self.speaker.clone()
-    }
-
-    /// Whether replies should be spoken aloud.
-    pub fn play_replies(&self) -> bool {
-        self.play_replies
     }
 }
 
