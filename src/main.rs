@@ -22,6 +22,7 @@ mod tasks;
 mod toolbar;
 mod ui;
 mod voice;
+mod voice_client;
 
 use std::io;
 use std::path::PathBuf;
@@ -46,12 +47,13 @@ use tokio::{
     time::{Instant, sleep_until},
 };
 
-use app::{App, InputMode};
+use app::{AdeleOutput, App, InputMode};
 use keys::{Action, handle_key_event};
 use picker::PickerOutcome;
 use profile::ProfileStore;
 use settings::Settings;
 use voice::{VoiceConfig, VoiceSession};
+use voice_client::VoiceController;
 
 const DEFAULT_WS_URL: &str = desktop_assistant_client_common::config::DEFAULT_WS_URL;
 const DEFAULT_WS_SUBJECT: &str = desktop_assistant_client_common::config::DEFAULT_WS_SUBJECT;
@@ -209,16 +211,45 @@ enum ReconnectState {
 const RECONNECT_INITIAL_SECS: u64 = 2;
 const RECONNECT_MAX_SECS: u64 = 30;
 
-/// Per-turn system-prompt refinement sent while a conversation is in voice mode
-/// (adele-tui#75). It shapes the reply for the ear without touching the visible
-/// transcript or later turns. A deliberately concise echo of the voice daemon's
-/// `spoken_response_hint` essence — NOT a copy of its full paragraph.
-const VOICE_SYSTEM_REFINEMENT: &str = "This reply will be read aloud, so write it to be heard, \
+/// System refinement attached on send while `Adele == OnDemand` (adele-tui#77,
+/// mirroring adele-gtk#80). Replies are spoken only while conversing by voice,
+/// so shape them **for the ear**: brief, conversational, no markdown,
+/// symbols/acronyms spelled out. Deliberately free of markdown markers so it
+/// can't itself leak formatting. Refines the system prompt for THIS turn only —
+/// never stored, never in the transcript.
+const ON_DEMAND_SYSTEM_REFINEMENT: &str = "This reply will be read aloud, so write it to be heard, \
     not read. Keep it brief and conversational — a few short sentences — and lead with the answer. \
     Use no markdown or formatting of any kind (no asterisks, backticks, bullets, or emoji); write \
     plain spoken prose. Spell out symbols, abbreviations, and acronyms as words (say \"and\" not \
     \"&\", \"percent\" not \"%\", \"for example\" not \"e.g.\"), and don't read out URLs, file \
     paths, or email addresses — describe them instead.";
+
+/// System refinement attached on send while `Adele == Always` (adele-tui#77,
+/// mirroring adele-gtk#80). Every reply is read aloud for accessibility, so make
+/// it **speakable but not shortened**: keep the full content, just strip
+/// formatting and spell out symbols. Crucially it does NOT ask for brevity
+/// (that's the OnDemand job) — Always reads the whole answer. Free of markdown
+/// markers itself.
+const ALWAYS_SYSTEM_REFINEMENT: &str = "This reply will be read aloud in full, so write it to be \
+    heard, not read, without leaving anything out. Do not shorten or summarize — cover everything \
+    you would normally say, just phrased for the ear. Use no markdown or formatting of any kind \
+    (no asterisks, backticks, bullets, or emoji); write plain spoken prose. Spell out symbols, \
+    abbreviations, and acronyms as words (say \"and\" not \"&\", \"percent\" not \"%\", \"for \
+    example\" not \"e.g.\"), and don't read out URLs, file paths, or email addresses — describe \
+    them instead.";
+
+/// The system refinement to attach on the next send for `conversation_id`
+/// (adele-tui#77), chosen by its `Adele:` level: `OnDemand` →
+/// brief/conversational/speakable; `Always` → speakable-but-full (don't
+/// shorten); `Disabled` → none. Pure decision the send path consults to choose
+/// the refinement string (empty = none).
+fn refinement_for_send(app: &App, conversation_id: &str) -> &'static str {
+    match app.adele_output_for(conversation_id) {
+        AdeleOutput::OnDemand => ON_DEMAND_SYSTEM_REFINEMENT,
+        AdeleOutput::Always => ALWAYS_SYSTEM_REFINEMENT,
+        AdeleOutput::Disabled => "",
+    }
+}
 
 fn next_backoff(prev_secs: u64) -> u64 {
     prev_secs.saturating_mul(2).min(RECONNECT_MAX_SECS)
@@ -352,13 +383,13 @@ async fn run(
     // result and the ready session are merged into the select! loop like every
     // other async source (per AGENTS.md). Off/daemon mode wires nothing.
     let voice_cfg = VoiceConfig::load();
-    // Seed the per-conversation speech toggle's default (adele-tui#73). Existing
-    // `play_replies = true` users keep audio (now per-conversation + toggleable
-    // via Ctrl+S); everyone else defaults to speech OFF. Only meaningful in
-    // embedded mode — there is no `Speaker` to narrate with otherwise.
-    if voice_cfg.embedded_enabled() {
-        app.set_speech_default(voice_cfg.play_replies);
-    }
+    // Connect to the standalone voice daemon (`org.desktopAssistant.Voice`) for
+    // narration (adele-tui#77). This is independent of the embedded pipeline and
+    // of `voice.toml`'s mode: when the daemon is running it is the preferred,
+    // warm speaker for reply narration + `say_this` asides; the embedded engine
+    // (if `embedded` mode built one) is the fallback. Connecting never fails hard
+    // — a missing daemon yields an inert controller probed per-utterance.
+    let voice_daemon = VoiceController::connect().await;
     let mut voice_session: Option<VoiceSession> = None;
     let mut dictating = false;
     let (dictation_tx, mut dictation_rx) = unbounded_channel::<DictationOutcome>();
@@ -478,13 +509,43 @@ async fn run(
                     }
                     if let Some(action) = handle_key_event(key, &app.mode, app.tasks.visible) {
                         if action == Action::Dictate {
-                            start_dictation(
-                                &mut app,
-                                &voice_cfg,
-                                &voice_session,
-                                &mut dictating,
-                                &dictation_tx,
-                            );
+                            // Push-to-talk (adele-tui#77). Prefer the voice
+                            // daemon's dictation when it is running: it captures,
+                            // transcribes, and routes the whole turn — spoken
+                            // prompt and reply — into the active conversation
+                            // (mirroring gtk's mic button). Fall back to the
+                            // embedded one-shot dictation (transcript → input)
+                            // when the daemon is absent.
+                            if voice_daemon.is_available().await {
+                                let conv = app
+                                    .current_conversation
+                                    .as_ref()
+                                    .map(|c| c.id.clone());
+                                // Barge-in: stop any in-progress narration before
+                                // we start listening, so the mic doesn't capture
+                                // Adele's own voice. Best-effort.
+                                let _ = voice_daemon.stop_speaking().await;
+                                match voice_daemon
+                                    .push_to_talk_routed(conv.as_deref())
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        app.status_message = "Listening… (voice daemon)".into();
+                                    }
+                                    Err(e) => {
+                                        app.status_message =
+                                            format!("Push-to-talk failed: {e}");
+                                    }
+                                }
+                            } else {
+                                start_dictation(
+                                    &mut app,
+                                    &voice_cfg,
+                                    &voice_session,
+                                    &mut dictating,
+                                    &dictation_tx,
+                                );
+                            }
                         } else {
                             handle_action(&mut app, &connector, action).await;
                         }
@@ -508,22 +569,18 @@ async fn run(
                     }
                     SignalEvent::Complete { request_id, full_response } => {
                         app.complete_streaming(&request_id, &full_response);
-                        // Speak the reply aloud (embedded TTS, no daemon) only
-                        // when the OPEN conversation has audio on — read-aloud OR
-                        // voice mode (adele-tui#73/#75). The completing reply
-                        // streams into the open conversation, so that gate is
-                        // right. Fire-and-forget on a task so synth+playback
-                        // never blocks the UI; `Speaker` is cheap to clone.
-                        if let Some(session) = voice_session.as_ref()
-                            && app.current_audio_enabled()
-                            && !full_response.trim().is_empty()
-                        {
-                            let speaker = session.speaker();
-                            tokio::spawn(async move {
-                                if let Err(e) = speaker.say(&full_response).await {
-                                    tracing::warn!("voice playback failed: {e}");
-                                }
-                            });
+                        // Narrate the finalized reply only when the OPEN
+                        // conversation's gate holds (adele-tui#77): `Adele ==
+                        // Always` OR (`Adele == OnDemand` AND `You == Enabled`).
+                        // The completing reply streams into the open conversation,
+                        // so that gate is right. Route daemon-first + chunked via
+                        // `speak_text`; fire-and-forget so synth never blocks the
+                        // UI. Gated entirely here so the cut-off holds: when the
+                        // gate is false nothing is spoken on any path.
+                        if app.current_narrate() && !full_response.trim().is_empty() {
+                            let voice = Some(voice_daemon.clone());
+                            let embedded = voice_session.as_ref().map(VoiceSession::speaker);
+                            tokio::spawn(speak_text(voice, embedded, full_response));
                         }
                     }
                     SignalEvent::Error { request_id, error } => {
@@ -600,7 +657,14 @@ async fn run(
                             tool_name,
                             arguments,
                         };
-                        handle_client_tool_call(&mut app, &connector, &voice_session, call).await;
+                        handle_client_tool_call(
+                            &mut app,
+                            &connector,
+                            &voice_daemon,
+                            &voice_session,
+                            call,
+                        )
+                        .await;
                     }
                 }
             }
@@ -754,33 +818,39 @@ async fn handle_action(app: &mut App, connector: &Option<Connector>, action: Act
         // session + a result channel + a spawned capture task — loop-local
         // resources that don't belong in `handle_action`'s signature).
         Action::Dictate => {}
-        Action::ToggleSpeech => match app.toggle_current_speech() {
-            Some(true) => {
+        Action::CycleAdeleOutput => match app.cycle_current_adele_output() {
+            Some(AdeleOutput::Disabled) => {
                 app.status_message =
-                    "Read aloud ON for this conversation (replies read aloud) — Ctrl+S to stop"
-                        .into();
+                    "Adele: Disabled for this conversation (never speaks) — Ctrl+S to cycle".into();
             }
-            Some(false) => {
-                app.status_message = "Read aloud OFF for this conversation".into();
+            Some(AdeleOutput::OnDemand) => {
+                app.status_message = "Adele: On Demand for this conversation (speaks replies when \
+                     You is Enabled; always speaks asides) — Ctrl+S to cycle"
+                    .into();
+            }
+            Some(AdeleOutput::Always) => {
+                app.status_message =
+                    "Adele: Always for this conversation (reads every reply aloud) — Ctrl+S to cycle"
+                        .into();
             }
             None => {
                 app.status_message =
-                    "Open a conversation first — read aloud is per-conversation".into();
+                    "Open a conversation first — Adele output is per-conversation".into();
             }
         },
-        Action::ToggleVoiceMode => match app.toggle_current_voice_mode() {
+        Action::ToggleVoiceIn => match app.toggle_current_voice_in() {
             Some(true) => {
                 app.status_message =
-                    "Voice mode ON for this conversation (replies read aloud + kept conversational) \
-                     — Ctrl+V to stop"
+                    "You: Enabled for this conversation (push-to-talk with Ctrl+G; narrates \
+                     replies when Adele is On Demand) — Ctrl+V to disable"
                         .into();
             }
             Some(false) => {
-                app.status_message = "Voice mode OFF for this conversation".into();
+                app.status_message = "You: Disabled for this conversation (type only)".into();
             }
             None => {
                 app.status_message =
-                    "Open a conversation first — voice mode is per-conversation".into();
+                    "Open a conversation first — the You control is per-conversation".into();
             }
         },
         Action::InsertNewline => {
@@ -962,6 +1032,61 @@ async fn handle_action(app: &mut App, connector: &Option<Connector>, action: Act
     }
 }
 
+/// Speak `text` aloud, daemon-first and chunked (adele-tui#77, mirroring
+/// adele-gtk#80's `window::speak_text`).
+///
+/// Single entry point shared by reply narration and `say_this` asides so routing
+/// + chunking live in one place:
+///
+/// 1. **Chunk.** `text` is split into one-short-sentence-per-call pieces via
+///    [`voice::into_speakable_sentences`]. Both backends' synth is one-shot with
+///    a ~20s per-synth timeout, so feeding a long reply whole would blow it.
+/// 2. **Route, daemon-first.** When a connected voice daemon is available, each
+///    sentence goes to its warm `SayText`; otherwise, if the embedded engine is
+///    present, to its `Speaker`; otherwise nothing is spoken. The backend is
+///    chosen **once** for the whole utterance (not per sentence) so playback
+///    never splits across engines.
+/// 3. **Order.** Sentences are awaited **sequentially**, so the daemon/embedded
+///    sink receives — and plays — them in order; they are never fired unordered.
+///
+/// Spawned fire-and-forget by callers so synthesis + playback never blocks the
+/// UI. Errors are logged once (the first failing sentence) and the rest of the
+/// utterance is abandoned.
+async fn speak_text(
+    voice: Option<VoiceController>,
+    embedded: Option<adele_voice_module::Speaker<adele_voice_module::TtsBackend>>,
+    text: String,
+) {
+    let sentences = voice::into_speakable_sentences(&text);
+    if sentences.is_empty() {
+        return;
+    }
+
+    // Choose the backend once for the whole utterance: a daemon that has
+    // actually connected wins (warm models), else the in-process engine. Probing
+    // availability also avoids handing sentences to a daemon that vanished.
+    let daemon = match voice {
+        Some(controller) if controller.is_available().await => Some(controller),
+        _ => None,
+    };
+
+    for sentence in sentences {
+        let result = if let Some(controller) = &daemon {
+            controller.say(&sentence).await
+        } else if let Some(speaker) = &embedded {
+            speaker.say(&sentence).await.map_err(|e| e.to_string())
+        } else {
+            // Neither backend present: nothing to speak, and nothing more will
+            // become available mid-loop.
+            return;
+        };
+        if let Err(e) = result {
+            tracing::warn!("voice playback failed: {e}");
+            return;
+        }
+    }
+}
+
 /// Handle a daemon `ClientToolCall` for the TUI's `say_this` tool, then submit
 /// a result so the suspended turn resumes (adele-tui#73). The decision is pure
 /// (see [`client_tools::dispatch`]); this just performs the side effect — speak
@@ -971,39 +1096,39 @@ async fn handle_action(app: &mut App, connector: &Option<Connector>, action: Act
 async fn handle_client_tool_call(
     app: &mut App,
     connector: &Option<Connector>,
+    voice_daemon: &VoiceController,
     voice_session: &Option<VoiceSession>,
     call: client_tools::ClientToolCall,
 ) {
     // Gate on the call's OWN conversation, not the open one, so the per-
     // conversation controls are honored even if the user has since switched
-    // tabs. The say_this audio gate is read-aloud OR voice-mode (adele-tui#75).
-    let audio_enabled = app.audio_enabled_for(&call.conversation_id);
-    let outcome = client_tools::dispatch(&call.tool_name, &call.arguments, audio_enabled);
+    // tabs. The say_this aside gate is `Adele ∈ {OnDemand, Always}` (adele-tui#77).
+    let say_this_spoken = app.say_this_spoken_for(&call.conversation_id);
+    let outcome = client_tools::dispatch(&call.tool_name, &call.arguments, say_this_spoken);
 
     match outcome.effect {
         client_tools::ToolEffect::Speak(text) => {
-            // Fire-and-forget playback so we don't block submitting the result.
-            if let Some(session) = voice_session.as_ref() {
-                let speaker = session.speaker();
-                tokio::spawn(async move {
-                    if let Err(e) = speaker.say(&text).await {
-                        tracing::warn!("say_this playback failed: {e}");
-                    }
-                });
+            // Speak the aside daemon-first + chunked, fire-and-forget so we don't
+            // block submitting the result. When neither the daemon nor the
+            // embedded engine is present, `speak_text` is a no-op; degrade to
+            // showing the text inline instead of dropping it silently.
+            let has_backend = voice_daemon.is_available().await || voice_session.is_some();
+            if has_backend {
+                let voice = Some(voice_daemon.clone());
+                let embedded = voice_session.as_ref().map(VoiceSession::speaker);
+                tokio::spawn(speak_text(voice, embedded, text));
             } else {
-                // Audio enabled but no pipeline (voice off / failed to load):
-                // degrade to showing the text rather than dropping it.
                 app.push_speech_disabled_note(&call.conversation_id, &text);
             }
         }
         client_tools::ToolEffect::ShowDisabled(text) => {
             app.push_speech_disabled_note(&call.conversation_id, &text);
         }
-        // request_voice / stop_voice (adele-tui#75): the model entered/left
-        // voice mode for its OWN conversation. Apply it to App state here so the
-        // pure dispatch stays free of App.
-        client_tools::ToolEffect::SetVoiceMode(on) => {
-            app.set_voice_mode(&call.conversation_id, on);
+        // request_voice / stop_voice (adele-tui#77): the model set the `Adele`
+        // output level for its OWN conversation. Apply it to App state here so
+        // the pure dispatch stays free of App.
+        client_tools::ToolEffect::SetAdeleOutput(level) => {
+            app.set_adele_output(&call.conversation_id, level);
         }
         client_tools::ToolEffect::None => {}
     }
@@ -1121,14 +1246,12 @@ async fn send_prompt_from_input(app: &mut App, connector: &Option<Connector>) {
     {
         let client = connector.client();
         let override_selection = app.take_pending_override();
-        // In voice mode (adele-tui#75) carry a concise read-aloud system
-        // refinement so the reply is shaped for speech. It only refines the
-        // system prompt for THIS turn — never stored, never in the transcript.
-        let refinement = if app.voice_mode_for(&conv_id) {
-            VOICE_SYSTEM_REFINEMENT
-        } else {
-            ""
-        };
+        // Per the conversation's `Adele:` level (adele-tui#77) carry a system
+        // refinement so the reply is shaped for speech: OnDemand → brief and
+        // conversational; Always → speakable but full (not shortened); Disabled →
+        // none. It only refines the system prompt for THIS turn — never stored,
+        // never in the transcript.
+        let refinement = refinement_for_send(app, &conv_id);
         // Use the command-channel `send_prompt_full` when a model override is
         // staged (model picker) and/or a refinement applies; the high-level
         // `send_prompt` carries neither. `as_commands()` is `Some` on both

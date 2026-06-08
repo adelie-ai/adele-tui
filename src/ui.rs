@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::app::{App, InputMode};
+use crate::app::{AdeleOutput, App, InputMode};
 
 const INPUT_VISIBLE_LINES: u16 = 4;
 const INPUT_TOTAL_HEIGHT: u16 = INPUT_VISIBLE_LINES + 2; // +2 for borders
@@ -368,30 +368,27 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .and_then(|conv| conv.model_selection.as_ref())
         .map(|sel| format!("  ·  {} · {}", sel.connection_id, sel.model_id))
         .unwrap_or_default();
-    // Persistent cue for the per-conversation read-aloud toggle (adele-tui#73),
-    // so the user can always tell whether replies/say_this will be spoken. Only
-    // shown when ON; OFF (the common default) stays uncluttered.
-    let speech_suffix = if app.current_speech_enabled() {
-        "  ·  🔊 read aloud (Ctrl+S)"
-    } else {
-        ""
+    // Persistent cue for the two per-conversation voice controls (adele-tui#77),
+    // so the user can always see both states. `Adele:` (voice output, Ctrl+S
+    // cycles) shows only when not Disabled — the common default stays
+    // uncluttered; `You:` (voice input, Ctrl+V toggles) shows only when Enabled.
+    // A speaker glyph for Adele, a mic glyph for You so they read distinctly.
+    let adele_suffix = match app.current_adele_output() {
+        AdeleOutput::Disabled => String::new(),
+        level => format!("  ·  🔊 Adele: {} (Ctrl+S)", level.label()),
     };
-    // Persistent cue for soft-sticky voice mode (adele-tui#75). A distinct mic
-    // glyph so it reads differently from read-aloud's speaker glyph; shown only
-    // when ON. Voice mode also narrates, but it adds spoken-style shaping, so it
-    // is surfaced separately even when read-aloud is also on.
-    let voice_suffix = if app.current_voice_mode() {
-        "  ·  🎙 voice mode (Ctrl+V)"
+    let you_suffix = if app.current_voice_in() {
+        "  ·  🎙 You: Enabled (Ctrl+V)"
     } else {
         ""
     };
     let title = if app.scroll_offset > 0 {
         format!(
-            "{chat_title}{model_suffix}{speech_suffix}{voice_suffix} \
+            "{chat_title}{model_suffix}{adele_suffix}{you_suffix} \
              (Ctrl+u/d scroll, Ctrl+e bottom)"
         )
     } else {
-        format!("{chat_title}{model_suffix}{speech_suffix}{voice_suffix}")
+        format!("{chat_title}{model_suffix}{adele_suffix}{you_suffix}")
     };
 
     let block = Block::default()
@@ -534,52 +531,24 @@ mod tests {
         terminal.draw(|f| draw(f, &mut app)).unwrap();
     }
 
-    #[test]
-    fn draw_shows_speech_cue_only_when_enabled() {
-        // The persistent speech indicator (adele-tui#73) appears in the chat
-        // title only while the open conversation's toggle is ON.
+    fn title_dump(app: &mut App) -> String {
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
-            id: "c1".into(),
-            title: "ChatProbe".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-        });
-
-        // OFF (default): no "speech" cue in the title.
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        let dump: String = terminal
+        terminal.draw(|f| draw(f, app)).unwrap();
+        terminal
             .backend()
             .buffer()
             .content
             .iter()
             .map(|c| c.symbol())
-            .collect();
-        assert!(!dump.contains("speech"));
-
-        // ON: the cue appears (reframed to "read aloud" in #75).
-        assert_eq!(app.toggle_current_speech(), Some(true));
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        let dump: String = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
-        assert!(dump.contains("read aloud"));
+            .collect()
     }
 
     #[test]
-    fn draw_shows_voice_mode_cue_only_when_enabled() {
-        // The persistent voice-mode indicator (adele-tui#75) appears in the
-        // chat title only while the open conversation's voice mode is ON, and
-        // is distinct from the read-aloud cue.
-        let backend = TestBackend::new(100, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
+    fn draw_shows_adele_cue_only_when_not_disabled() {
+        // The persistent Adele (voice-output) indicator (adele-tui#77) appears in
+        // the chat title only when the open conversation's level is not Disabled,
+        // and reflects the current level label.
         let mut app = App::new();
         app.current_conversation = Some(ConversationDetail {
             id: "c1".into(),
@@ -589,28 +558,45 @@ mod tests {
             conversation_personality: None,
         });
 
-        // OFF (default): no "voice mode" cue in the title.
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        let dump: String = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
-        assert!(!dump.contains("voice mode"));
+        // Disabled (default): no "Adele:" cue in the title.
+        assert!(!title_dump(&mut app).contains("Adele:"));
 
-        // ON: the cue appears.
-        assert_eq!(app.toggle_current_voice_mode(), Some(true));
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        let dump: String = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
-        assert!(dump.contains("voice mode"));
+        // On Demand: the cue appears with the level label.
+        assert_eq!(
+            app.cycle_current_adele_output(),
+            Some(AdeleOutput::OnDemand)
+        );
+        let dump = title_dump(&mut app);
+        assert!(dump.contains("Adele:"));
+        assert!(dump.contains("On Demand"));
+
+        // Always: the cue updates to the new level.
+        assert_eq!(app.cycle_current_adele_output(), Some(AdeleOutput::Always));
+        let dump = title_dump(&mut app);
+        assert!(dump.contains("Adele:"));
+        assert!(dump.contains("Always"));
+    }
+
+    #[test]
+    fn draw_shows_you_cue_only_when_enabled() {
+        // The persistent You (voice-input) indicator (adele-tui#77) appears in
+        // the chat title only while the open conversation's You is Enabled, and
+        // is distinct from the Adele cue.
+        let mut app = App::new();
+        app.current_conversation = Some(ConversationDetail {
+            id: "c1".into(),
+            title: "ChatProbe".into(),
+            messages: vec![],
+            model_selection: None,
+            conversation_personality: None,
+        });
+
+        // Disabled (default): no "You:" cue in the title.
+        assert!(!title_dump(&mut app).contains("You:"));
+
+        // Enabled: the cue appears.
+        assert_eq!(app.toggle_current_voice_in(), Some(true));
+        assert!(title_dump(&mut app).contains("You:"));
     }
 
     #[test]

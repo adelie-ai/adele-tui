@@ -46,27 +46,30 @@ pub enum Action {
     CancelSelectedTask,
     /// Jump to the conversation linked to the highlighted task.
     OpenSelectedTaskConversation,
-    /// Start one-shot embedded dictation: capture a single utterance from the
-    /// mic and drop the transcript into the prompt input. Bound to `Ctrl+G`
-    /// ("Go, voice") — free across modes and not intercepted by terminals or
-    /// the textarea. No-op unless voice is in `embedded` mode (adele-tui#67).
+    /// Push-to-talk dictation (adele-tui#77). Bound to `Ctrl+G` ("Go, voice") —
+    /// free across modes and not intercepted by terminals or the textarea.
+    /// Prefers the voice daemon when it is running (it routes the whole spoken
+    /// turn into the active conversation); otherwise falls back to one-shot
+    /// embedded dictation (mic → transcript → prompt input), which is a no-op
+    /// unless voice is in `embedded` mode. Available when `You == Enabled`.
     Dictate,
-    /// Toggle the per-conversation "read aloud" accessibility switch
-    /// (adele-tui#73, reframed in #75). Bound to `Ctrl+S` ("Speech"). The
-    /// keyboard-enhancement flags pushed at startup deliver Ctrl+S as a real
-    /// key event (not terminal XOFF flow control). When ON every assistant
-    /// reply is read aloud and the daemon's `say_this` client tool speaks; it is
-    /// LLM-unaware (the model isn't told). Independent of voice mode — either
-    /// one being ON narrates replies. Defaults OFF per conversation (seeded from
-    /// `play_replies`).
-    ToggleSpeech,
-    /// Toggle the per-conversation soft-sticky **voice mode** (adele-tui#75).
-    /// Bound to `Ctrl+V` ("Voice"), delivered as a real key event by the same
-    /// keyboard-enhancement flags. When ON, replies are read aloud (like
-    /// read-aloud) AND a concise spoken-style `system_refinement` shapes each
-    /// send so replies are brief and conversational. Also entered/left by the
-    /// model via the `request_voice` / `stop_voice` client tools. Defaults OFF.
-    ToggleVoiceMode,
+    /// Cycle the per-conversation `Adele:` voice-output level (adele-tui#77),
+    /// `Disabled → On Demand → Always → Disabled`. Bound to `Ctrl+S` ("Speech";
+    /// Adele's speech). The keyboard-enhancement flags pushed at startup deliver
+    /// Ctrl+S as a real key event (not terminal XOFF flow control). `Always`
+    /// reads every reply aloud in full (made speakable); `On Demand` reads
+    /// replies only while `You == Enabled`, kept brief, and always speaks
+    /// `say_this` asides; `Disabled` never speaks. Also set by the model via
+    /// `request_voice` (→ On Demand) / `stop_voice` (→ Disabled). Defaults
+    /// `Disabled` per conversation.
+    CycleAdeleOutput,
+    /// Toggle the per-conversation `You:` voice-input control (adele-tui#77),
+    /// `Disabled ↔ Enabled`. Bound to `Ctrl+V` ("Voice"; your voice), delivered
+    /// as a real key event by the same keyboard-enhancement flags. When Enabled,
+    /// push-to-talk dictation is available (Ctrl+G) and — combined with
+    /// `Adele == On Demand` — reply narration is on. Defaults `Disabled` (type
+    /// only); text input is always available.
+    ToggleVoiceIn,
 }
 
 /// Handle key events that we intercept before passing to textarea.
@@ -124,12 +127,14 @@ pub fn handle_key_event(
             // Ctrl+G starts embedded dictation (mic → prompt). A no-op when
             // voice isn't in embedded mode; main.rs gates on the session.
             KeyCode::Char('g') => Some(Action::Dictate),
-            // Ctrl+S toggles per-conversation read-aloud (adele-tui#73). A
-            // no-op status hint when no conversation is open; main.rs gates.
-            KeyCode::Char('s') => Some(Action::ToggleSpeech),
-            // Ctrl+V toggles per-conversation voice mode (adele-tui#75). Like
-            // Ctrl+S it is delivered as a real key by the enhancement flags.
-            KeyCode::Char('v') => Some(Action::ToggleVoiceMode),
+            // Ctrl+S cycles the per-conversation Adele output level
+            // (adele-tui#77). A no-op status hint when no conversation is open;
+            // main.rs gates.
+            KeyCode::Char('s') => Some(Action::CycleAdeleOutput),
+            // Ctrl+V toggles the per-conversation You (voice-input) control
+            // (adele-tui#77). Like Ctrl+S it is delivered as a real key by the
+            // enhancement flags.
+            KeyCode::Char('v') => Some(Action::ToggleVoiceIn),
             _ => None,
         };
     }
@@ -822,23 +827,23 @@ mod tests {
         );
     }
 
-    // --- Ctrl+S toggles per-conversation speech (adele-tui#73) ---
+    // --- Ctrl+S cycles the Adele output level (adele-tui#77) ---
 
     #[test]
-    fn ctrl_s_toggles_speech_in_normal() {
+    fn ctrl_s_cycles_adele_output_in_normal() {
         assert_eq!(
             handle_key_event(
                 key_with_mod(KeyCode::Char('s'), KeyModifiers::CONTROL),
                 &InputMode::Normal,
                 false
             ),
-            Some(Action::ToggleSpeech)
+            Some(Action::CycleAdeleOutput)
         );
     }
 
     #[test]
-    fn ctrl_s_toggles_speech_in_editing() {
-        // Speech is a per-conversation control the user will flip while
+    fn ctrl_s_cycles_adele_output_in_editing() {
+        // Adele output is a per-conversation control the user will change while
         // composing, so it must be reachable from editing mode too.
         assert_eq!(
             handle_key_event(
@@ -846,14 +851,14 @@ mod tests {
                 &InputMode::Editing,
                 false
             ),
-            Some(Action::ToggleSpeech)
+            Some(Action::CycleAdeleOutput)
         );
     }
 
     #[test]
     fn ctrl_s_is_not_intercepted_in_renaming() {
-        // Renaming forwards all Ctrl combos to the rename textarea; the speech
-        // toggle must not hijack them mid-rename.
+        // Renaming forwards all Ctrl combos to the rename textarea; the Adele
+        // cycle must not hijack them mid-rename.
         assert_eq!(
             handle_key_event(
                 key_with_mod(KeyCode::Char('s'), KeyModifiers::CONTROL),
@@ -878,23 +883,23 @@ mod tests {
         );
     }
 
-    // --- Ctrl+V toggles per-conversation voice mode (adele-tui#75) ---
+    // --- Ctrl+V toggles the You (voice-input) control (adele-tui#77) ---
 
     #[test]
-    fn ctrl_v_toggles_voice_mode_in_normal() {
+    fn ctrl_v_toggles_voice_in_in_normal() {
         assert_eq!(
             handle_key_event(
                 key_with_mod(KeyCode::Char('v'), KeyModifiers::CONTROL),
                 &InputMode::Normal,
                 false
             ),
-            Some(Action::ToggleVoiceMode)
+            Some(Action::ToggleVoiceIn)
         );
     }
 
     #[test]
-    fn ctrl_v_toggles_voice_mode_in_editing() {
-        // Voice mode is a per-conversation control the user will flip while
+    fn ctrl_v_toggles_voice_in_in_editing() {
+        // The You control is a per-conversation control the user will flip while
         // composing, so it must be reachable from editing mode too.
         assert_eq!(
             handle_key_event(
@@ -902,13 +907,13 @@ mod tests {
                 &InputMode::Editing,
                 false
             ),
-            Some(Action::ToggleVoiceMode)
+            Some(Action::ToggleVoiceIn)
         );
     }
 
     #[test]
     fn ctrl_v_is_not_intercepted_in_renaming() {
-        // Renaming forwards all Ctrl combos to the rename textarea; the voice
+        // Renaming forwards all Ctrl combos to the rename textarea; the You
         // toggle must not hijack them mid-rename.
         assert_eq!(
             handle_key_event(

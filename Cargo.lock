@@ -6,6 +6,7 @@ version = 4
 name = "adele"
 version = "0.1.0"
 dependencies = [
+ "adele-voice-core",
  "adele-voice-module",
  "adele-voice-stt-whisper",
  "adele-voice-vad-silero",
@@ -30,6 +31,7 @@ dependencies = [
  "toml",
  "tracing",
  "url",
+ "zbus",
  "zbus-secret-service-keyring-store",
 ]
 
@@ -41,6 +43,7 @@ dependencies = [
  "anyhow",
  "cpal",
  "ringbuf",
+ "rubato",
  "tokio",
  "tracing",
 ]

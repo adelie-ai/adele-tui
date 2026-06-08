@@ -29,6 +29,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 url = "2"
 toml = "0.9"
 tracing = "0.1"
+# Direct zbus client for the standalone voice daemon (`org.desktopAssistant.Voice`),
+# a separate D-Bus service from the orchestrator transport. Used by
+# `voice_client::VoiceController` to route narration through the daemon's warm
+# `SayText`, mirroring adele-gtk#80's `voice_client.rs`. Matches gtk's pin.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 # Shared protocol + transport crates live in the desktop-assistant repo.
 # Cargo resolves the package by name from that workspace; Cargo.lock pins
 # the exact revision for reproducibility.
@@ -44,6 +49,13 @@ desktop-assistant-api-model = { git = "https://github.com/adelie-ai/desktop-assi
 # transitive deps from the voice workspace automatically.
 [dependencies.adele-voice-module]
 path = "../voice/crates/module"
+
+# Shared voice domain crate: its `SentenceBuffer` carries the sentence-chunking
+# algorithm so a long reply is spoken one short sentence at a time (each synth is
+# one-shot with a ~20s timeout). Used by `voice::into_speakable_sentences`,
+# mirroring adele-gtk#80's `voice_embedded::into_speakable_sentences`.
+[dependencies.adele-voice-core]
+path = "../voice/crates/core"
 
 [dependencies.adele-voice-vad-silero]
 path = "../voice/crates/vad-silero"
