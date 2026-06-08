@@ -141,6 +141,14 @@ pub struct App {
     /// `play_replies = true` users keep audio, but it is now per-conversation
     /// and toggleable. Defaults `false` (off) when voice is unconfigured.
     speech_default: bool,
+    /// Per-conversation soft-sticky **voice mode** (adele-tui#75), keyed by
+    /// conversation id. Independent of `speech_enabled` (read-aloud): either one
+    /// being ON narrates replies. Entered/left by the user (`Ctrl+V`) or by the
+    /// model (`request_voice` / `stop_voice`). When ON, sends also carry a
+    /// concise read-aloud `system_refinement` so replies are shaped for speech.
+    /// A conversation absent from the map is OFF (the default). No `*_default`
+    /// seed: voice mode is always entered explicitly, never config-seeded.
+    voice_mode: HashMap<String, bool>,
 }
 
 impl App {
@@ -175,6 +183,7 @@ impl App {
             pending_task_cancel: None,
             speech_enabled: HashMap::new(),
             speech_default: false,
+            voice_mode: HashMap::new(),
         }
     }
 
@@ -232,6 +241,58 @@ impl App {
         });
         self.scroll_offset = 0;
         true
+    }
+
+    // --- Per-conversation voice mode (adele-tui#75) ---
+
+    /// Whether soft-sticky voice mode is on for `conversation_id`. A
+    /// conversation never entered is OFF (the default). Independent of
+    /// `speech_enabled_for` (read-aloud).
+    pub fn voice_mode_for(&self, conversation_id: &str) -> bool {
+        self.voice_mode
+            .get(conversation_id)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Whether voice mode is on for the currently-open conversation. `false`
+    /// when no conversation is open.
+    pub fn current_voice_mode(&self) -> bool {
+        self.current_conversation
+            .as_ref()
+            .is_some_and(|c| self.voice_mode_for(&c.id))
+    }
+
+    /// Set voice mode for an explicit `conversation_id` (used by the model's
+    /// `request_voice` / `stop_voice` tools, which carry their own
+    /// conversation). Per-conversation: only the named conversation is affected.
+    pub fn set_voice_mode(&mut self, _conversation_id: &str, _on: bool) {
+        // STUB (tests-first): no-op.
+    }
+
+    /// Flip voice mode for the currently-open conversation and return the new
+    /// state (used by the `Ctrl+V` keybind). `None` when no conversation is
+    /// open. Per-conversation: toggling one never affects another.
+    pub fn toggle_current_voice_mode(&mut self) -> Option<bool> {
+        // STUB (tests-first): never flips.
+        None
+    }
+
+    /// Whether a reply for `conversation_id` should be spoken: read-aloud OR
+    /// voice-mode (adele-tui#75). This is the single narration / `say_this`
+    /// audio gate.
+    pub fn audio_enabled_for(&self, conversation_id: &str) -> bool {
+        // STUB (tests-first): read-aloud only, ignores voice mode.
+        self.speech_enabled_for(conversation_id)
+    }
+
+    /// Whether audio is on for the currently-open conversation (read-aloud OR
+    /// voice-mode). `false` when no conversation is open. This is the reply
+    /// narration gate for the streaming completion path.
+    pub fn current_audio_enabled(&self) -> bool {
+        self.current_conversation
+            .as_ref()
+            .is_some_and(|c| self.audio_enabled_for(&c.id))
     }
 
     // --- Tasks-pane glue ---
@@ -1550,6 +1611,78 @@ mod tests {
     fn push_speech_disabled_note_with_no_conversation_is_noop() {
         let mut app = App::new();
         assert!(!app.push_speech_disabled_note("c1", "anything"));
+    }
+
+    // --- Per-conversation voice mode (adele-tui#75) ---
+
+    #[test]
+    fn voice_mode_defaults_off() {
+        let app = app_with_open_conversation("c1");
+        assert!(!app.current_voice_mode());
+        assert!(!app.voice_mode_for("c1"));
+        assert!(!app.voice_mode_for("never-seen"));
+    }
+
+    #[test]
+    fn toggle_current_voice_mode_flips_and_returns_new_state() {
+        let mut app = app_with_open_conversation("c1");
+        assert_eq!(app.toggle_current_voice_mode(), Some(true));
+        assert!(app.current_voice_mode());
+        assert_eq!(app.toggle_current_voice_mode(), Some(false));
+        assert!(!app.current_voice_mode());
+    }
+
+    #[test]
+    fn toggle_current_voice_mode_without_conversation_is_none() {
+        let mut app = App::new();
+        assert_eq!(app.toggle_current_voice_mode(), None);
+        assert!(!app.current_voice_mode());
+    }
+
+    #[test]
+    fn set_voice_mode_targets_an_explicit_conversation() {
+        // The model's request_voice/stop_voice carry their own conversation id,
+        // which may not be the open one.
+        let mut app = app_with_open_conversation("c1");
+        app.set_voice_mode("c2", true);
+        assert!(app.voice_mode_for("c2"));
+        assert!(!app.voice_mode_for("c1")); // open conversation untouched
+        app.set_voice_mode("c2", false);
+        assert!(!app.voice_mode_for("c2"));
+    }
+
+    #[test]
+    fn voice_mode_is_per_conversation_isolated() {
+        let mut app = app_with_open_conversation("c1");
+        assert_eq!(app.toggle_current_voice_mode(), Some(true)); // c1 ON
+        assert!(app.voice_mode_for("c1"));
+        assert!(!app.voice_mode_for("c2")); // c2 untouched → OFF
+    }
+
+    #[test]
+    fn audio_enabled_is_read_aloud_or_voice_mode() {
+        // Both off → no audio (exactly phase-1 toggle-off).
+        let mut app = app_with_open_conversation("c1");
+        assert!(!app.audio_enabled_for("c1"));
+        assert!(!app.current_audio_enabled());
+
+        // Read-aloud on (phase-1 toggle) → audio on.
+        assert_eq!(app.toggle_current_speech(), Some(true));
+        assert!(app.audio_enabled_for("c1"));
+        assert!(app.current_audio_enabled());
+
+        // Read-aloud back off, voice-mode on → still audio on.
+        assert_eq!(app.toggle_current_speech(), Some(false));
+        assert!(!app.audio_enabled_for("c1"));
+        assert_eq!(app.toggle_current_voice_mode(), Some(true));
+        assert!(app.audio_enabled_for("c1"));
+        assert!(app.current_audio_enabled());
+    }
+
+    #[test]
+    fn current_audio_enabled_is_false_without_a_conversation() {
+        let app = App::new();
+        assert!(!app.current_audio_enabled());
     }
 
     #[test]

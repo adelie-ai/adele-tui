@@ -11,15 +11,33 @@
 //! loop performs the side effect and submits the result; the decision itself is
 //! pure so it is unit-testable without a transport or an audio device.
 //!
-//! The one tool the TUI understands is `say_this` — "speak this text aloud".
-//! Whether it actually speaks is gated by the per-conversation speech toggle
-//! (the hard cut-off): ON ⇒ speak; OFF ⇒ render `(speech mode disabled) <text>`
-//! inline instead. Either way the turn completes. Any other tool name resolves
-//! to an error result rather than a wedge.
+//! The TUI understands three tools:
+//!
+//! * `say_this` — "speak this text aloud". Whether it actually speaks is gated
+//!   by whether ANY audio control is on for the call's conversation:
+//!   read-aloud (the phase-1 accessibility toggle) OR voice-mode (phase-2). ON
+//!   ⇒ speak; OFF ⇒ render `(speech mode disabled) <text>` inline instead.
+//! * `request_voice` (adele-tui#75) — the model switching this conversation into
+//!   spoken voice mode ("ok, let's talk by voice"). Turns the per-conversation
+//!   soft-sticky voice mode ON.
+//! * `stop_voice` (adele-tui#75) — the model leaving voice mode; turns it OFF.
+//!
+//! Either way the turn always completes, and any other tool name resolves to an
+//! error result rather than a wedge. The decision is pure; the async handler
+//! performs the side effect (speak / show inline / flip `App::voice_mode`).
 
-/// The TUI's one client tool: speak a short piece of text aloud. The daemon
-/// forwards this name verbatim to the LLM's tool list.
+/// The TUI's `say_this` client tool: speak a short piece of text aloud. The
+/// daemon forwards this name verbatim to the LLM's tool list.
 pub const SAY_THIS: &str = "say_this";
+
+/// The model-driven "enter voice mode" tool (adele-tui#75). The model calls it
+/// when the user asks to talk by voice; it flips the conversation's soft-sticky
+/// voice mode ON (replies narrated + shaped for speech).
+pub const REQUEST_VOICE: &str = "request_voice";
+
+/// The model-driven "leave voice mode" tool (adele-tui#75). Flips the
+/// conversation's voice mode OFF, back to text-only.
+pub const STOP_VOICE: &str = "stop_voice";
 
 /// A `SignalEvent::ClientToolCall` flattened into one value so the async
 /// handler takes a single argument instead of five positional ones. Built in
@@ -51,27 +69,32 @@ pub struct ToolOutcome {
 pub enum ToolEffect {
     /// Speak `text` aloud via the embedded `Speaker`.
     Speak(String),
-    /// Speech is off for this conversation: show `text` inline in the
+    /// No audio control is on for this conversation: show `text` inline in the
     /// transcript prefixed with `(speech mode disabled)` instead of speaking.
     ShowDisabled(String),
+    /// Set the call's conversation's soft-sticky voice mode (adele-tui#75) —
+    /// `true` for `request_voice`, `false` for `stop_voice`. The async handler
+    /// applies it to `App::voice_mode` so this decision stays pure.
+    SetVoiceMode(bool),
     /// Nothing to do beyond submitting the result (unknown tool / bad args).
     None,
 }
 
 /// Decide how to handle a `say_this` client tool call.
 ///
-/// `arguments` is the raw JSON the daemon forwarded; `speech_enabled` is the
-/// per-conversation hard toggle for the call's conversation. Never panics:
-/// a non-object payload or a missing/non-string `text` field becomes an error
-/// result (the turn still resumes) rather than an unwrap.
-pub fn handle_say_this(arguments: &serde_json::Value, speech_enabled: bool) -> ToolOutcome {
+/// `arguments` is the raw JSON the daemon forwarded; `audio_enabled` is whether
+/// ANY audio control is on for the call's conversation — read-aloud OR
+/// voice-mode (adele-tui#75 broadened this from phase-1's read-aloud-only
+/// gate). Never panics: a non-object payload or a missing/non-string `text`
+/// field becomes an error result (the turn still resumes) rather than an unwrap.
+pub fn handle_say_this(arguments: &serde_json::Value, audio_enabled: bool) -> ToolOutcome {
     let Some(text) = arguments.get("text").and_then(|t| t.as_str()) else {
         return ToolOutcome {
             effect: ToolEffect::None,
             result: Err("say_this requires a string `text` argument".to_string()),
         };
     };
-    if speech_enabled {
+    if audio_enabled {
         ToolOutcome {
             effect: ToolEffect::Speak(text.to_string()),
             result: Ok("spoken".to_string()),
@@ -88,17 +111,41 @@ pub fn handle_say_this(arguments: &serde_json::Value, speech_enabled: bool) -> T
     }
 }
 
-/// Dispatch an arbitrary client tool call by name. `say_this` is handled;
-/// anything else resolves to an error result so an unexpected tool (e.g. one
-/// leaked from another session pre-#261, or a future tool the TUI doesn't yet
-/// implement) still resumes the turn instead of wedging it.
+/// Decide how to handle a `request_voice` call (adele-tui#75): the model is
+/// entering voice mode for the conversation. Pure — emits a `SetVoiceMode(true)`
+/// effect the handler applies to `App::voice_mode`, and always a result.
+pub fn handle_request_voice() -> ToolOutcome {
+    // STUB (tests-first): wrong effect + no result message, so the test fails.
+    ToolOutcome {
+        effect: ToolEffect::None,
+        result: Err("unimplemented".to_string()),
+    }
+}
+
+/// Decide how to handle a `stop_voice` call (adele-tui#75): the model is leaving
+/// voice mode. Pure — emits a `SetVoiceMode(false)` effect and always a result.
+pub fn handle_stop_voice() -> ToolOutcome {
+    // STUB (tests-first).
+    ToolOutcome {
+        effect: ToolEffect::None,
+        result: Err("unimplemented".to_string()),
+    }
+}
+
+/// Dispatch an arbitrary client tool call by name. `say_this`, `request_voice`,
+/// and `stop_voice` are handled; anything else resolves to an error result so an
+/// unexpected tool (e.g. one leaked from another session pre-#261, or a future
+/// tool the TUI doesn't yet implement) still resumes the turn instead of wedging
+/// it. `audio_enabled` is whether any audio control is on for the call's
+/// conversation (read-aloud OR voice-mode); it only affects `say_this`.
 pub fn dispatch(
     tool_name: &str,
     arguments: &serde_json::Value,
-    speech_enabled: bool,
+    audio_enabled: bool,
 ) -> ToolOutcome {
     match tool_name {
-        SAY_THIS => handle_say_this(arguments, speech_enabled),
+        SAY_THIS => handle_say_this(arguments, audio_enabled),
+        // STUB (tests-first): request_voice/stop_voice not yet routed.
         other => ToolOutcome {
             effect: ToolEffect::None,
             result: Err(format!("unknown client tool `{other}`")),
@@ -123,6 +170,40 @@ pub fn say_this_registration() -> desktop_assistant_api_model::ClientToolRegistr
                 }
             },
             "required": ["text"]
+        }),
+    }
+}
+
+/// The `request_voice` tool registration (adele-tui#75). Advertised on every
+/// (re)connect alongside `say_this`. Calling it switches the conversation into
+/// spoken voice mode.
+pub fn request_voice_registration() -> desktop_assistant_api_model::ClientToolRegistration {
+    desktop_assistant_api_model::ClientToolRegistration {
+        name: REQUEST_VOICE.to_string(),
+        description: "Switch this conversation into spoken voice mode (the user asked to talk by \
+            voice); replies are read aloud and kept short and conversational. Call when the user \
+            says something like \"let's talk by voice\" or \"read your replies to me\". No \
+            arguments."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {}
+        }),
+    }
+}
+
+/// The `stop_voice` tool registration (adele-tui#75). Leaves voice mode, back to
+/// text-only.
+pub fn stop_voice_registration() -> desktop_assistant_api_model::ClientToolRegistration {
+    desktop_assistant_api_model::ClientToolRegistration {
+        name: STOP_VOICE.to_string(),
+        description: "Leave voice mode; this conversation goes back to text-only (replies are no \
+            longer read aloud). Call when the user says something like \"stop talking\" or \"let's \
+            go back to text\". No arguments."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {}
         }),
     }
 }
@@ -205,5 +286,78 @@ mod tests {
         assert!(!reg.description.is_empty());
         let required = reg.input_schema.get("required").unwrap();
         assert_eq!(required, &serde_json::json!(["text"]));
+    }
+
+    // --- Voice mode (adele-tui#75) ---
+
+    #[test]
+    fn request_voice_turns_voice_mode_on_with_a_result() {
+        let outcome = handle_request_voice();
+        assert_eq!(outcome.effect, ToolEffect::SetVoiceMode(true));
+        let msg = outcome
+            .result
+            .expect("request_voice always returns a result");
+        assert!(msg.contains("voice mode on"));
+    }
+
+    #[test]
+    fn stop_voice_turns_voice_mode_off_with_a_result() {
+        let outcome = handle_stop_voice();
+        assert_eq!(outcome.effect, ToolEffect::SetVoiceMode(false));
+        let msg = outcome.result.expect("stop_voice always returns a result");
+        assert!(msg.contains("voice mode off"));
+    }
+
+    #[test]
+    fn dispatch_routes_request_voice() {
+        // request_voice ignores its arguments and the audio gate; it just flips
+        // voice mode on. Pass an empty object and audio OFF to prove that.
+        let outcome = dispatch(REQUEST_VOICE, &serde_json::json!({}), false);
+        assert_eq!(outcome.effect, ToolEffect::SetVoiceMode(true));
+        assert!(outcome.result.is_ok());
+    }
+
+    #[test]
+    fn dispatch_routes_stop_voice() {
+        let outcome = dispatch(STOP_VOICE, &serde_json::json!({}), true);
+        assert_eq!(outcome.effect, ToolEffect::SetVoiceMode(false));
+        assert!(outcome.result.is_ok());
+    }
+
+    #[test]
+    fn request_voice_with_malformed_args_still_returns_a_result_no_panic() {
+        // The model shouldn't send args, but a non-object payload must not
+        // panic — request_voice ignores arguments entirely.
+        let outcome = dispatch(REQUEST_VOICE, &serde_json::Value::Null, false);
+        assert_eq!(outcome.effect, ToolEffect::SetVoiceMode(true));
+        assert!(outcome.result.is_ok());
+    }
+
+    #[test]
+    fn say_this_speaks_when_audio_enabled_via_voice_mode() {
+        // Phase-2: the say_this audio gate is (read-aloud OR voice-mode). The
+        // caller passes the OR'd value; here it is on (e.g. via voice-mode).
+        let outcome = handle_say_this(&args("aside"), true);
+        assert_eq!(outcome.effect, ToolEffect::Speak("aside".to_string()));
+    }
+
+    #[test]
+    fn say_this_shows_inline_when_no_audio_control_is_on() {
+        let outcome = handle_say_this(&args("aside"), false);
+        assert_eq!(
+            outcome.effect,
+            ToolEffect::ShowDisabled("aside".to_string())
+        );
+        assert!(outcome.result.is_ok());
+    }
+
+    #[test]
+    fn voice_registrations_have_names_and_descriptions() {
+        let req = request_voice_registration();
+        assert_eq!(req.name, REQUEST_VOICE);
+        assert!(!req.description.is_empty());
+        let stop = stop_voice_registration();
+        assert_eq!(stop.name, STOP_VOICE);
+        assert!(!stop.description.is_empty());
     }
 }
