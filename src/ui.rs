@@ -368,18 +368,30 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .and_then(|conv| conv.model_selection.as_ref())
         .map(|sel| format!("  ·  {} · {}", sel.connection_id, sel.model_id))
         .unwrap_or_default();
-    // Persistent cue for the per-conversation speech toggle (adele-tui#73), so
-    // the user can always tell whether replies/say_this will be spoken. Only
+    // Persistent cue for the per-conversation read-aloud toggle (adele-tui#73),
+    // so the user can always tell whether replies/say_this will be spoken. Only
     // shown when ON; OFF (the common default) stays uncluttered.
     let speech_suffix = if app.current_speech_enabled() {
-        "  ·  🔊 speech (Ctrl+S)"
+        "  ·  🔊 read aloud (Ctrl+S)"
+    } else {
+        ""
+    };
+    // Persistent cue for soft-sticky voice mode (adele-tui#75). A distinct mic
+    // glyph so it reads differently from read-aloud's speaker glyph; shown only
+    // when ON. Voice mode also narrates, but it adds spoken-style shaping, so it
+    // is surfaced separately even when read-aloud is also on.
+    let voice_suffix = if app.current_voice_mode() {
+        "  ·  🎙 voice mode (Ctrl+V)"
     } else {
         ""
     };
     let title = if app.scroll_offset > 0 {
-        format!("{chat_title}{model_suffix}{speech_suffix} (Ctrl+u/d scroll, Ctrl+e bottom)")
+        format!(
+            "{chat_title}{model_suffix}{speech_suffix}{voice_suffix} \
+             (Ctrl+u/d scroll, Ctrl+e bottom)"
+        )
     } else {
-        format!("{chat_title}{model_suffix}{speech_suffix}")
+        format!("{chat_title}{model_suffix}{speech_suffix}{voice_suffix}")
     };
 
     let block = Block::default()
@@ -548,7 +560,7 @@ mod tests {
             .collect();
         assert!(!dump.contains("speech"));
 
-        // ON: the cue appears.
+        // ON: the cue appears (reframed to "read aloud" in #75).
         assert_eq!(app.toggle_current_speech(), Some(true));
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let dump: String = terminal
@@ -558,7 +570,47 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(dump.contains("speech"));
+        assert!(dump.contains("read aloud"));
+    }
+
+    #[test]
+    fn draw_shows_voice_mode_cue_only_when_enabled() {
+        // The persistent voice-mode indicator (adele-tui#75) appears in the
+        // chat title only while the open conversation's voice mode is ON, and
+        // is distinct from the read-aloud cue.
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.current_conversation = Some(ConversationDetail {
+            id: "c1".into(),
+            title: "ChatProbe".into(),
+            messages: vec![],
+            model_selection: None,
+            conversation_personality: None,
+        });
+
+        // OFF (default): no "voice mode" cue in the title.
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let dump: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(!dump.contains("voice mode"));
+
+        // ON: the cue appears.
+        assert_eq!(app.toggle_current_voice_mode(), Some(true));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let dump: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(dump.contains("voice mode"));
     }
 
     #[test]

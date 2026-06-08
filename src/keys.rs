@@ -51,13 +51,22 @@ pub enum Action {
     /// ("Go, voice") — free across modes and not intercepted by terminals or
     /// the textarea. No-op unless voice is in `embedded` mode (adele-tui#67).
     Dictate,
-    /// Toggle the per-conversation "speech enabled" hard switch (adele-tui#73).
-    /// Bound to `Ctrl+S` ("Speech"). The keyboard-enhancement flags pushed at
-    /// startup deliver Ctrl+S as a real key event (not terminal XOFF flow
-    /// control). When ON the assistant's replies are spoken aloud and the
-    /// daemon's `say_this` client tool speaks; when OFF nothing is ever
-    /// played. Defaults OFF per conversation (seeded from `play_replies`).
+    /// Toggle the per-conversation "read aloud" accessibility switch
+    /// (adele-tui#73, reframed in #75). Bound to `Ctrl+S` ("Speech"). The
+    /// keyboard-enhancement flags pushed at startup deliver Ctrl+S as a real
+    /// key event (not terminal XOFF flow control). When ON every assistant
+    /// reply is read aloud and the daemon's `say_this` client tool speaks; it is
+    /// LLM-unaware (the model isn't told). Independent of voice mode — either
+    /// one being ON narrates replies. Defaults OFF per conversation (seeded from
+    /// `play_replies`).
     ToggleSpeech,
+    /// Toggle the per-conversation soft-sticky **voice mode** (adele-tui#75).
+    /// Bound to `Ctrl+V` ("Voice"), delivered as a real key event by the same
+    /// keyboard-enhancement flags. When ON, replies are read aloud (like
+    /// read-aloud) AND a concise spoken-style `system_refinement` shapes each
+    /// send so replies are brief and conversational. Also entered/left by the
+    /// model via the `request_voice` / `stop_voice` client tools. Defaults OFF.
+    ToggleVoiceMode,
 }
 
 /// Handle key events that we intercept before passing to textarea.
@@ -115,9 +124,12 @@ pub fn handle_key_event(
             // Ctrl+G starts embedded dictation (mic → prompt). A no-op when
             // voice isn't in embedded mode; main.rs gates on the session.
             KeyCode::Char('g') => Some(Action::Dictate),
-            // Ctrl+S toggles per-conversation speech (adele-tui#73). A no-op
-            // status hint when no conversation is open; main.rs gates on it.
+            // Ctrl+S toggles per-conversation read-aloud (adele-tui#73). A
+            // no-op status hint when no conversation is open; main.rs gates.
             KeyCode::Char('s') => Some(Action::ToggleSpeech),
+            // Ctrl+V toggles per-conversation voice mode (adele-tui#75). Like
+            // Ctrl+S it is delivered as a real key by the enhancement flags.
+            KeyCode::Char('v') => Some(Action::ToggleVoiceMode),
             _ => None,
         };
     }
@@ -859,6 +871,48 @@ mod tests {
         assert_eq!(
             handle_key_event(
                 key_with_mod(KeyCode::Char('g'), KeyModifiers::CONTROL),
+                &InputMode::Renaming,
+                false
+            ),
+            None
+        );
+    }
+
+    // --- Ctrl+V toggles per-conversation voice mode (adele-tui#75) ---
+
+    #[test]
+    fn ctrl_v_toggles_voice_mode_in_normal() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('v'), KeyModifiers::CONTROL),
+                &InputMode::Normal,
+                false
+            ),
+            Some(Action::ToggleVoiceMode)
+        );
+    }
+
+    #[test]
+    fn ctrl_v_toggles_voice_mode_in_editing() {
+        // Voice mode is a per-conversation control the user will flip while
+        // composing, so it must be reachable from editing mode too.
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('v'), KeyModifiers::CONTROL),
+                &InputMode::Editing,
+                false
+            ),
+            Some(Action::ToggleVoiceMode)
+        );
+    }
+
+    #[test]
+    fn ctrl_v_is_not_intercepted_in_renaming() {
+        // Renaming forwards all Ctrl combos to the rename textarea; the voice
+        // toggle must not hijack them mid-rename.
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('v'), KeyModifiers::CONTROL),
                 &InputMode::Renaming,
                 false
             ),

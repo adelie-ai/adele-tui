@@ -209,6 +209,17 @@ enum ReconnectState {
 const RECONNECT_INITIAL_SECS: u64 = 2;
 const RECONNECT_MAX_SECS: u64 = 30;
 
+/// Per-turn system-prompt refinement sent while a conversation is in voice mode
+/// (adele-tui#75). It shapes the reply for the ear without touching the visible
+/// transcript or later turns. A deliberately concise echo of the voice daemon's
+/// `spoken_response_hint` essence — NOT a copy of its full paragraph.
+const VOICE_SYSTEM_REFINEMENT: &str = "This reply will be read aloud, so write it to be heard, \
+    not read. Keep it brief and conversational — a few short sentences — and lead with the answer. \
+    Use no markdown or formatting of any kind (no asterisks, backticks, bullets, or emoji); write \
+    plain spoken prose. Spell out symbols, abbreviations, and acronyms as words (say \"and\" not \
+    \"&\", \"percent\" not \"%\", \"for example\" not \"e.g.\"), and don't read out URLs, file \
+    paths, or email addresses — describe them instead.";
+
 fn next_backoff(prev_secs: u64) -> u64 {
     prev_secs.saturating_mul(2).min(RECONNECT_MAX_SECS)
 }
@@ -498,14 +509,13 @@ async fn run(
                     SignalEvent::Complete { request_id, full_response } => {
                         app.complete_streaming(&request_id, &full_response);
                         // Speak the reply aloud (embedded TTS, no daemon) only
-                        // when the OPEN conversation's per-conversation speech
-                        // toggle is ON (adele-tui#73) — the hard cut-off. The
-                        // completing reply streams into the open conversation,
-                        // so that toggle is the right gate. Fire-and-forget on a
-                        // task so synth+playback never blocks the UI; `Speaker`
-                        // is cheap to clone.
+                        // when the OPEN conversation has audio on — read-aloud OR
+                        // voice mode (adele-tui#73/#75). The completing reply
+                        // streams into the open conversation, so that gate is
+                        // right. Fire-and-forget on a task so synth+playback
+                        // never blocks the UI; `Speaker` is cheap to clone.
                         if let Some(session) = voice_session.as_ref()
-                            && app.current_speech_enabled()
+                            && app.current_audio_enabled()
                             && !full_response.trim().is_empty()
                         {
                             let speaker = session.speaker();
@@ -747,14 +757,30 @@ async fn handle_action(app: &mut App, connector: &Option<Connector>, action: Act
         Action::ToggleSpeech => match app.toggle_current_speech() {
             Some(true) => {
                 app.status_message =
-                    "Speech ON for this conversation (replies + say_this spoken aloud)".into();
+                    "Read aloud ON for this conversation (replies read aloud) — Ctrl+S to stop"
+                        .into();
             }
             Some(false) => {
-                app.status_message = "Speech OFF for this conversation".into();
+                app.status_message = "Read aloud OFF for this conversation".into();
             }
             None => {
                 app.status_message =
-                    "Open a conversation first — speech is per-conversation".into();
+                    "Open a conversation first — read aloud is per-conversation".into();
+            }
+        },
+        Action::ToggleVoiceMode => match app.toggle_current_voice_mode() {
+            Some(true) => {
+                app.status_message =
+                    "Voice mode ON for this conversation (replies read aloud + kept conversational) \
+                     — Ctrl+V to stop"
+                        .into();
+            }
+            Some(false) => {
+                app.status_message = "Voice mode OFF for this conversation".into();
+            }
+            None => {
+                app.status_message =
+                    "Open a conversation first — voice mode is per-conversation".into();
             }
         },
         Action::InsertNewline => {
@@ -948,10 +974,11 @@ async fn handle_client_tool_call(
     voice_session: &Option<VoiceSession>,
     call: client_tools::ClientToolCall,
 ) {
-    // Gate on the call's OWN conversation, not the open one, so the hard toggle
-    // is honored per conversation even if the user has since switched tabs.
-    let speech_enabled = app.speech_enabled_for(&call.conversation_id);
-    let outcome = client_tools::dispatch(&call.tool_name, &call.arguments, speech_enabled);
+    // Gate on the call's OWN conversation, not the open one, so the per-
+    // conversation controls are honored even if the user has since switched
+    // tabs. The say_this audio gate is read-aloud OR voice-mode (adele-tui#75).
+    let audio_enabled = app.audio_enabled_for(&call.conversation_id);
+    let outcome = client_tools::dispatch(&call.tool_name, &call.arguments, audio_enabled);
 
     match outcome.effect {
         client_tools::ToolEffect::Speak(text) => {
@@ -964,13 +991,19 @@ async fn handle_client_tool_call(
                     }
                 });
             } else {
-                // Speech enabled but no audio pipeline (voice off / failed to
-                // load): degrade to showing the text rather than dropping it.
+                // Audio enabled but no pipeline (voice off / failed to load):
+                // degrade to showing the text rather than dropping it.
                 app.push_speech_disabled_note(&call.conversation_id, &text);
             }
         }
         client_tools::ToolEffect::ShowDisabled(text) => {
             app.push_speech_disabled_note(&call.conversation_id, &text);
+        }
+        // request_voice / stop_voice (adele-tui#75): the model entered/left
+        // voice mode for its OWN conversation. Apply it to App state here so the
+        // pure dispatch stays free of App.
+        client_tools::ToolEffect::SetVoiceMode(on) => {
+            app.set_voice_mode(&call.conversation_id, on);
         }
         client_tools::ToolEffect::None => {}
     }
@@ -989,14 +1022,19 @@ async fn handle_client_tool_call(
     }
 }
 
-/// Advertise the TUI's `say_this` client tool to the daemon. The daemon
-/// replaces the whole set each call, so this runs on every (re)connect (#231).
-/// Best-effort: voice playback is a convenience, so a failure to register is
-/// only logged and never blocks the chat. Over D-Bus (no command channel for
-/// client tools) this is expected to fail and is silently skipped.
+/// Advertise the TUI's client tools to the daemon: `say_this` (adele-tui#73)
+/// plus `request_voice` / `stop_voice` (adele-tui#75). The daemon replaces the
+/// whole set each call, so this runs on every (re)connect (#231). Best-effort:
+/// voice playback is a convenience, so a failure to register is only logged and
+/// never blocks the chat. Over D-Bus (no command channel for client tools) this
+/// is expected to fail and is silently skipped.
 async fn register_client_tools(conn: &Connector) {
     if let Err(e) = conn
-        .register_client_tools(vec![client_tools::say_this_registration()])
+        .register_client_tools(vec![
+            client_tools::say_this_registration(),
+            client_tools::request_voice_registration(),
+            client_tools::stop_voice_registration(),
+        ])
         .await
     {
         tracing::debug!("client tool registration skipped: {e}");
@@ -1083,23 +1121,38 @@ async fn send_prompt_from_input(app: &mut App, connector: &Option<Connector>) {
     {
         let client = connector.client();
         let override_selection = app.take_pending_override();
-        // Use the command-channel override path when one was staged via the
-        // model picker; the high-level `send_prompt` only takes the bare prompt.
-        // `as_commands()` is `Some` on both socket transports (UDS + WS) but
-        // `None` on D-Bus, which has no override field — there we fall back to a
-        // plain send and warn.
+        // In voice mode (adele-tui#75) carry a concise read-aloud system
+        // refinement so the reply is shaped for speech. It only refines the
+        // system prompt for THIS turn — never stored, never in the transcript.
+        let refinement = if app.voice_mode_for(&conv_id) {
+            VOICE_SYSTEM_REFINEMENT
+        } else {
+            ""
+        };
+        // Use the command-channel `send_prompt_full` when a model override is
+        // staged (model picker) and/or a refinement applies; the high-level
+        // `send_prompt` carries neither. `as_commands()` is `Some` on both
+        // socket transports (UDS + WS) but `None` on D-Bus. The Connector's
+        // refinement helper already folds the refinement into the prompt over
+        // D-Bus, so the no-override voice-mode path works everywhere.
         let result = match (override_selection, client.as_commands()) {
             (Some(ovr), Some(commands)) => {
                 commands
-                    .send_prompt_with_override(&conv_id, &prompt, Some(ovr))
+                    .send_prompt_full(&conv_id, &prompt, Some(ovr), refinement.to_string())
                     .await
             }
             (Some(_), None) => {
                 app.status_message =
                     "Model override isn't supported over D-Bus — sent without override".into();
-                client.send_prompt(&conv_id, &prompt).await
+                connector
+                    .send_prompt_with_system_refinement(&conv_id, &prompt, refinement)
+                    .await
             }
-            (None, _) => client.send_prompt(&conv_id, &prompt).await,
+            (None, _) => {
+                connector
+                    .send_prompt_with_system_refinement(&conv_id, &prompt, refinement)
+                    .await
+            }
         };
         match result {
             Ok(task_id) => app.apply_prompt_ack(task_id),
