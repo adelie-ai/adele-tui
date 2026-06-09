@@ -1335,7 +1335,7 @@ async fn send_prompt_from_input(app: &mut App, connector: &Option<Connector>) {
             }
         };
         match result {
-            Ok(task_id) => app.apply_prompt_ack(task_id),
+            Ok(task_id) => app.apply_prompt_ack(task_id, conv_id.clone()),
             Err(e) => {
                 app.restore_failed_submission(&conv_id, &prompt);
                 app.status_message = format!("Send error: {e} (your text is preserved)");

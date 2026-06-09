@@ -611,7 +611,7 @@ mod tests {
             model_selection: None,
             conversation_personality: None,
         });
-        app.start_streaming("req1".into());
+        app.start_streaming("req1".into(), "1".into());
         app.receive_chunk("req1", "Partial response...");
         terminal.draw(|f| draw(f, &mut app)).unwrap();
     }
