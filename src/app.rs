@@ -497,6 +497,16 @@ impl App {
         Some((conv.id.clone(), content))
     }
 
+    /// Apply a bracketed paste (TUI-3 / `Event::Paste`) to whichever input is
+    /// focused. Pasted text is inserted **verbatim** into the composer — each
+    /// newline becomes a real line of the prompt instead of firing
+    /// `SubmitPrompt` per line (the pre-bracketed-paste failure mode). The
+    /// rename input is single-line, so newlines collapse to spaces there.
+    /// Normal mode has no focused input; the paste is ignored.
+    pub fn apply_paste(&mut self, _text: &str) {
+        // Stubbed pending TUI-3 implementation.
+    }
+
     /// Hard-wrap textarea lines to fit the available editor width.
     ///
     /// This gives the TUI composer word-wrap behavior even though the backing
@@ -979,6 +989,68 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[0].content, "What is Rust?");
+    }
+
+    // --- Bracketed paste (TUI-3) ---
+
+    #[test]
+    fn paste_in_editing_inserts_multiline_text_verbatim() {
+        // Acceptance: a multi-line paste lands in the composer as-is — no
+        // per-newline submit, no dropped lines.
+        let mut app = App::new();
+        app.enter_editing_mode();
+        app.apply_paste("line one\nline two\nline three");
+        assert_eq!(app.textarea_content(), "line one\nline two\nline three");
+    }
+
+    #[test]
+    fn paste_in_editing_normalizes_crlf_to_lf() {
+        let mut app = App::new();
+        app.enter_editing_mode();
+        app.apply_paste("alpha\r\nbeta");
+        assert_eq!(app.textarea_content(), "alpha\nbeta");
+    }
+
+    #[test]
+    fn paste_then_submit_sends_one_prompt_containing_the_newlines() {
+        // Acceptance (TUI-3): a 3-line paste yields ONE submitted prompt with
+        // the newlines intact, not three partial prompts.
+        let mut app = App::new();
+        app.current_conversation = Some(ConversationDetail {
+            id: "c1".into(),
+            title: "Test".into(),
+            messages: vec![],
+            model_selection: None,
+            conversation_personality: None,
+        });
+        app.enter_editing_mode();
+        app.apply_paste("first\nsecond\nthird");
+        let result = app.submit_prompt();
+        assert_eq!(
+            result,
+            Some(("c1".to_string(), "first\nsecond\nthird".to_string()))
+        );
+        let msgs = &app.current_conversation.as_ref().unwrap().messages;
+        assert_eq!(msgs.len(), 1, "exactly one user message appended");
+    }
+
+    #[test]
+    fn paste_in_renaming_collapses_newlines_to_spaces() {
+        // The rename input is single-line; a pasted title with newlines must
+        // not create phantom lines.
+        let mut app = app_with_conversations();
+        app.selected_conversation = Some(0);
+        app.begin_rename();
+        app.rename_textarea = TextArea::default();
+        app.apply_paste("New\nTitle");
+        assert_eq!(app.rename_textarea.lines().join(""), "New Title");
+    }
+
+    #[test]
+    fn paste_in_normal_mode_is_ignored() {
+        let mut app = App::new();
+        app.apply_paste("stray paste");
+        assert_eq!(app.textarea_content(), "");
     }
 
     // --- Streaming tests ---

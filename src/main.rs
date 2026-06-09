@@ -154,6 +154,22 @@ impl From<CliArgs> for ConnectionConfig {
     }
 }
 
+/// Best-effort terminal restoration (TUI-1): undo everything `main`'s setup
+/// pushed — raw mode, the kitty keyboard-enhancement flags, the alternate
+/// screen, and bracketed paste — and re-show the cursor. Every step is
+/// `let _ =` because this runs on panic/exit paths where some state may
+/// already be gone; restoring as much as possible beats bailing early.
+fn restore_terminal() {
+    // Stubbed pending TUI-1 implementation.
+}
+
+/// Install a panic hook that restores the terminal before delegating to the
+/// previously installed hook (TUI-1), so a panic prints its message onto a
+/// usable screen instead of a raw-mode alternate-screen mess.
+fn install_panic_hook() {
+    // Stubbed pending TUI-1 implementation.
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Both `ring` and `aws-lc-rs` end up enabled in rustls because reqwest 0.12
@@ -1437,6 +1453,34 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("ws"));
         assert!(rendered.contains("dbus"));
+    }
+
+    // --- Panic hook (TUI-1) ---
+
+    #[test]
+    fn panic_hook_chains_the_previously_installed_hook() {
+        // Acceptance: installing our hook must not swallow the previous one —
+        // the default hook's backtrace/message printing has to still run after
+        // the terminal is restored.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static PREV_CALLED: AtomicBool = AtomicBool::new(false);
+
+        let original = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| PREV_CALLED.store(true, Ordering::SeqCst)));
+        install_panic_hook();
+
+        let result = std::panic::catch_unwind(|| panic!("deliberate test panic"));
+        assert!(result.is_err());
+
+        // Put the original hook back before asserting so a failure here
+        // doesn't leave the silent test hook installed for other tests.
+        let _ = std::panic::take_hook();
+        std::panic::set_hook(original);
+
+        assert!(
+            PREV_CALLED.load(Ordering::SeqCst),
+            "previous panic hook must be chained, not replaced"
+        );
     }
 
     // --- Reconnect backoff tests ---
