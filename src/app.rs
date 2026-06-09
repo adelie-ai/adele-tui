@@ -503,8 +503,23 @@ impl App {
     /// `SubmitPrompt` per line (the pre-bracketed-paste failure mode). The
     /// rename input is single-line, so newlines collapse to spaces there.
     /// Normal mode has no focused input; the paste is ignored.
-    pub fn apply_paste(&mut self, _text: &str) {
-        // Stubbed pending TUI-3 implementation.
+    pub fn apply_paste(&mut self, text: &str) {
+        match self.mode {
+            InputMode::Editing => {
+                // `insert_str` splits on '\n' and strips a trailing '\r' per
+                // line, so CRLF pastes normalize to real composer lines.
+                self.textarea.insert_str(text);
+            }
+            InputMode::Renaming => {
+                let single_line = text
+                    .split(['\n', '\r'])
+                    .filter(|piece| !piece.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                self.rename_textarea.insert_str(single_line);
+            }
+            InputMode::Normal => {}
+        }
     }
 
     /// Hard-wrap textarea lines to fit the available editor width.

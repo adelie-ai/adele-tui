@@ -31,7 +31,7 @@ use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches, Parser, parser::ValueSource};
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
+        DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind, KeyboardEnhancementFlags,
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
@@ -160,14 +160,28 @@ impl From<CliArgs> for ConnectionConfig {
 /// `let _ =` because this runs on panic/exit paths where some state may
 /// already be gone; restoring as much as possible beats bailing early.
 fn restore_terminal() {
-    // Stubbed pending TUI-1 implementation.
+    let mut stdout = io::stdout();
+    let _ = disable_raw_mode();
+    // Pop the kitty flags first (pushed last); harmless if the terminal never
+    // accepted the push.
+    let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    let _ = execute!(
+        stdout,
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
 }
 
 /// Install a panic hook that restores the terminal before delegating to the
 /// previously installed hook (TUI-1), so a panic prints its message onto a
 /// usable screen instead of a raw-mode alternate-screen mess.
 fn install_panic_hook() {
-    // Stubbed pending TUI-1 implementation.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        previous(info);
+    }));
 }
 
 #[tokio::main]
@@ -185,9 +199,18 @@ async fn main() -> Result<()> {
     let cli = CliArgs::from_arg_matches(&matches)?;
     let cli_explicit = any_explicit_connection_arg(&matches);
 
+    // Restore the terminal on panic BEFORE any state is pushed, chaining the
+    // default hook so the panic message lands on a usable screen (TUI-1).
+    install_panic_hook();
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Mouse capture is deliberately NOT enabled (TUI-9): the TUI handles no
+    // mouse events, and capturing them hijacks the terminal's native text
+    // selection/copy and scrollback. Keyboard scrolling (Ctrl+U/D/E,
+    // PageUp/Down) covers navigation. Bracketed paste keeps a multi-line
+    // paste as ONE Event::Paste instead of a stream of per-line Enters (TUI-3).
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let _ = execute!(
         stdout,
         PushKeyboardEnhancementFlags(
@@ -202,14 +225,8 @@ async fn main() -> Result<()> {
 
     let result = run_app(&mut terminal, cli, cli_explicit).await;
 
-    // Restore terminal
-    disable_raw_mode()?;
-    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    // Restore terminal (same best-effort path the panic hook uses).
+    restore_terminal();
     terminal.show_cursor()?;
 
     result
@@ -519,6 +536,14 @@ async fn run(
 
         tokio::select! {
             Some(Ok(evt)) = event_stream.next() => {
+                // Bracketed paste (TUI-3): the whole paste arrives as one
+                // event and goes verbatim into the focused input — never
+                // through the key map, so embedded newlines can't fire
+                // SubmitPrompt per line.
+                if let Event::Paste(text) = &evt {
+                    app.apply_paste(text);
+                    continue;
+                }
                 if let Event::Key(key) = evt {
                     if key.kind == KeyEventKind::Release {
                         continue;
