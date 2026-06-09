@@ -496,8 +496,18 @@ impl App {
     ///   so nothing is lost — the user sends again once the reply lands).
     ///
     /// Only when both gates pass does it delegate to [`App::submit_prompt`].
-    pub fn prepare_submission(&mut self, _connected: bool) -> Option<(String, String)> {
-        // Stubbed pending TUI-2/TUI-7 implementation.
+    pub fn prepare_submission(&mut self, connected: bool) -> Option<(String, String)> {
+        if !connected {
+            self.status_message =
+                "Not connected — message not sent (your text is preserved)".into();
+            return None;
+        }
+        if self.pending_request_id.is_some() {
+            self.status_message =
+                "A reply is still streaming — wait for it to finish (your text is preserved)"
+                    .into();
+            return None;
+        }
         self.submit_prompt()
     }
 
@@ -506,8 +516,20 @@ impl App {
     /// conversation is still open and the tail message matches) and put the
     /// prompt text back into the composer so the user can retry without
     /// retyping. The caller sets the status message with the send error.
-    pub fn restore_failed_submission(&mut self, _conversation_id: &str, _prompt: &str) {
-        // Stubbed pending TUI-2 implementation.
+    pub fn restore_failed_submission(&mut self, conversation_id: &str, prompt: &str) {
+        if let Some(conv) = self
+            .current_conversation
+            .as_mut()
+            .filter(|c| c.id == conversation_id)
+            && conv
+                .messages
+                .last()
+                .is_some_and(|m| m.role == "user" && m.content == prompt)
+        {
+            conv.messages.pop();
+        }
+        self.textarea = new_textarea();
+        self.textarea.insert_str(prompt);
     }
 
     /// Returns (conversation_id, prompt) if valid, None otherwise.

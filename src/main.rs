@@ -813,11 +813,22 @@ async fn handle_action(app: &mut App, connector: &Option<Connector>, action: Act
             }
         }
         Action::DeleteConversation => {
+            // Check connectivity BEFORE mutating local state (TUI-2's shape):
+            // previously the row vanished locally while the daemon never heard
+            // about the delete, resurrecting it on the next refresh.
+            let Some(client) = client else {
+                app.status_message = "Not connected — conversation not deleted".into();
+                return;
+            };
             if let Some(id) = app.delete_selected_conversation()
-                && let Some(client) = client
                 && let Err(e) = client.delete_conversation(&id).await
             {
                 app.status_message = format!("Delete error: {e}");
+                // Resync the sidebar with the daemon so the optimistic local
+                // removal doesn't linger after a failed delete.
+                if let Ok(convs) = fetch_conversations(client, app.show_archived).await {
+                    app.set_conversations(convs);
+                }
             }
         }
         Action::NewConversation => {
@@ -1281,8 +1292,13 @@ fn insert_dictated_text(app: &mut App, text: &str) {
 /// transport. Shared by the keyboard submit (`Enter`) and the dictation path
 /// (which appends a transcript to the input, then submits via the same route),
 /// so both honor the staged model override and the same ack handling.
+///
+/// The connected/streaming gates run BEFORE any state mutation
+/// (`App::prepare_submission`, TUI-2/TUI-7), and a failed send RPC rolls the
+/// optimistic transcript append back and refills the composer
+/// (`App::restore_failed_submission`).
 async fn send_prompt_from_input(app: &mut App, connector: &Option<Connector>) {
-    if let Some((conv_id, prompt)) = app.submit_prompt()
+    if let Some((conv_id, prompt)) = app.prepare_submission(connector.is_some())
         && let Some(connector) = connector.as_ref()
     {
         let client = connector.client();
@@ -1320,7 +1336,10 @@ async fn send_prompt_from_input(app: &mut App, connector: &Option<Connector>) {
         };
         match result {
             Ok(task_id) => app.apply_prompt_ack(task_id),
-            Err(e) => app.status_message = format!("Send error: {e}"),
+            Err(e) => {
+                app.restore_failed_submission(&conv_id, &prompt);
+                app.status_message = format!("Send error: {e} (your text is preserved)");
+            }
         }
     }
 }
