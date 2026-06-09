@@ -481,6 +481,35 @@ impl App {
         self.textarea.lines().join("\n")
     }
 
+    /// Gate + mutate for a prompt submission (TUI-2 / TUI-7). Checks the
+    /// preconditions BEFORE touching any state, so a refused submission leaves
+    /// the composer and transcript untouched:
+    ///
+    /// * not connected → refuse with a status message (TUI-2: previously the
+    ///   message was appended to the transcript and the composer cleared, then
+    ///   silently never sent);
+    /// * a reply is still streaming (`pending_request_id` is claimed or the
+    ///   ack sentinel) → refuse with a status message (TUI-7 policy: **block
+    ///   concurrent sends**. The TUI renders a single streaming buffer for the
+    ///   open conversation; interleaving a second stream would cross-wire the
+    ///   request-id claim and drop one reply. Blocking keeps the composer text
+    ///   so nothing is lost — the user sends again once the reply lands).
+    ///
+    /// Only when both gates pass does it delegate to [`App::submit_prompt`].
+    pub fn prepare_submission(&mut self, _connected: bool) -> Option<(String, String)> {
+        // Stubbed pending TUI-2/TUI-7 implementation.
+        self.submit_prompt()
+    }
+
+    /// Roll back a submission whose send RPC failed (TUI-2): remove the
+    /// optimistically appended user message (only when the originating
+    /// conversation is still open and the tail message matches) and put the
+    /// prompt text back into the composer so the user can retry without
+    /// retyping. The caller sets the status message with the send error.
+    pub fn restore_failed_submission(&mut self, _conversation_id: &str, _prompt: &str) {
+        // Stubbed pending TUI-2 implementation.
+    }
+
     /// Returns (conversation_id, prompt) if valid, None otherwise.
     pub fn submit_prompt(&mut self) -> Option<(String, String)> {
         let content = self.textarea_content();
@@ -1066,6 +1095,166 @@ mod tests {
         let mut app = App::new();
         app.apply_paste("stray paste");
         assert_eq!(app.textarea_content(), "");
+    }
+
+    // --- Send-path integrity (TUI-2 / TUI-7) ---
+
+    fn app_ready_to_send(conv_id: &str, prompt: &str) -> App {
+        let mut app = App::new();
+        app.current_conversation = Some(ConversationDetail {
+            id: conv_id.into(),
+            title: "Test".into(),
+            messages: vec![],
+            model_selection: None,
+            conversation_personality: None,
+        });
+        app.enter_editing_mode();
+        app.textarea.insert_str(prompt);
+        app
+    }
+
+    #[test]
+    fn submit_while_disconnected_preserves_composer_and_appends_nothing() {
+        // Acceptance (TUI-2): disconnected submit → composer text preserved,
+        // status message set, nothing appended to the transcript.
+        let mut app = app_ready_to_send("c1", "important prompt");
+        app.status_message.clear();
+
+        let result = app.prepare_submission(false);
+
+        assert!(result.is_none(), "nothing must be sent while disconnected");
+        assert_eq!(
+            app.textarea_content(),
+            "important prompt",
+            "composer text must be preserved"
+        );
+        assert!(
+            app.current_conversation
+                .as_ref()
+                .unwrap()
+                .messages
+                .is_empty(),
+            "transcript must not gain a user message"
+        );
+        assert!(
+            !app.status_message.is_empty(),
+            "the refusal must be surfaced in the status line"
+        );
+    }
+
+    #[test]
+    fn submit_while_streaming_is_blocked_and_composer_preserved() {
+        // Acceptance (TUI-7, chosen policy = block concurrent sends): a second
+        // send while a reply streams is refused with a status message and the
+        // composer keeps its text.
+        let mut app = app_ready_to_send("c1", "second question");
+        app.start_streaming("req-in-flight".into());
+        app.status_message.clear();
+
+        let result = app.prepare_submission(true);
+
+        assert!(result.is_none(), "second send must be blocked mid-stream");
+        assert_eq!(app.textarea_content(), "second question");
+        assert!(
+            app.current_conversation
+                .as_ref()
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+        assert!(!app.status_message.is_empty());
+    }
+
+    #[test]
+    fn submit_while_awaiting_ack_sentinel_is_also_blocked() {
+        // Unhappy path: the window between send and the first chunk uses the
+        // pending sentinel; a send in that window must be blocked too.
+        let mut app = app_ready_to_send("c1", "rapid second send");
+        app.start_streaming_without_request_id();
+
+        assert!(app.prepare_submission(true).is_none());
+        assert_eq!(app.textarea_content(), "rapid second send");
+    }
+
+    #[test]
+    fn submit_when_connected_and_idle_goes_through() {
+        let mut app = app_ready_to_send("c1", "hello");
+        let result = app.prepare_submission(true);
+        assert_eq!(result, Some(("c1".to_string(), "hello".to_string())));
+        assert_eq!(app.textarea_content(), "");
+        assert_eq!(app.current_conversation.as_ref().unwrap().messages.len(), 1);
+    }
+
+    #[test]
+    fn restore_failed_submission_pops_message_and_refills_composer() {
+        // Acceptance (TUI-2): a failed send RPC rolls back the optimistic
+        // transcript append and puts the prompt back in the composer.
+        let mut app = app_ready_to_send("c1", "doomed prompt");
+        let (conv_id, prompt) = app.prepare_submission(true).unwrap();
+
+        app.restore_failed_submission(&conv_id, &prompt);
+
+        assert!(
+            app.current_conversation
+                .as_ref()
+                .unwrap()
+                .messages
+                .is_empty(),
+            "optimistic user message must be rolled back"
+        );
+        assert_eq!(app.textarea_content(), "doomed prompt");
+    }
+
+    #[test]
+    fn restore_failed_submission_after_switching_conversations_keeps_other_transcript() {
+        // Unhappy path: the user switched conversations between submit and the
+        // send failure. The other conversation's tail message must NOT be
+        // popped; the composer still gets the text back.
+        let mut app = app_ready_to_send("c1", "prompt for c1");
+        let (conv_id, prompt) = app.prepare_submission(true).unwrap();
+
+        // Switch to a different conversation that already has a user message.
+        app.load_conversation(ConversationDetail {
+            id: "c2".into(),
+            title: "Other".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "prompt for c1".into(), // same text, different conv
+            }],
+            model_selection: None,
+            conversation_personality: None,
+        });
+
+        app.restore_failed_submission(&conv_id, &prompt);
+
+        assert_eq!(
+            app.current_conversation.as_ref().unwrap().messages.len(),
+            1,
+            "the other conversation's transcript must be untouched"
+        );
+        assert_eq!(app.textarea_content(), "prompt for c1");
+    }
+
+    #[test]
+    fn restore_failed_submission_does_not_pop_a_non_matching_tail() {
+        // Unhappy path: something else (e.g. an inline note) landed after the
+        // optimistic append; only an exact matching tail is rolled back.
+        let mut app = app_ready_to_send("c1", "prompt");
+        let (conv_id, prompt) = app.prepare_submission(true).unwrap();
+        app.current_conversation
+            .as_mut()
+            .unwrap()
+            .messages
+            .push(ChatMessage {
+                role: "assistant".into(),
+                content: "(speech mode disabled) aside".into(),
+            });
+
+        app.restore_failed_submission(&conv_id, &prompt);
+
+        let msgs = &app.current_conversation.as_ref().unwrap().messages;
+        assert_eq!(msgs.len(), 2, "non-matching tail must not be popped");
+        assert_eq!(app.textarea_content(), "prompt");
     }
 
     // --- Streaming tests ---
