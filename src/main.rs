@@ -31,7 +31,7 @@ use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches, Parser, parser::ValueSource};
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
+        DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind, KeyboardEnhancementFlags,
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
@@ -154,6 +154,36 @@ impl From<CliArgs> for ConnectionConfig {
     }
 }
 
+/// Best-effort terminal restoration (TUI-1): undo everything `main`'s setup
+/// pushed — raw mode, the kitty keyboard-enhancement flags, the alternate
+/// screen, and bracketed paste — and re-show the cursor. Every step is
+/// `let _ =` because this runs on panic/exit paths where some state may
+/// already be gone; restoring as much as possible beats bailing early.
+fn restore_terminal() {
+    let mut stdout = io::stdout();
+    let _ = disable_raw_mode();
+    // Pop the kitty flags first (pushed last); harmless if the terminal never
+    // accepted the push.
+    let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    let _ = execute!(
+        stdout,
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
+}
+
+/// Install a panic hook that restores the terminal before delegating to the
+/// previously installed hook (TUI-1), so a panic prints its message onto a
+/// usable screen instead of a raw-mode alternate-screen mess.
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        previous(info);
+    }));
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Both `ring` and `aws-lc-rs` end up enabled in rustls because reqwest 0.12
@@ -169,9 +199,18 @@ async fn main() -> Result<()> {
     let cli = CliArgs::from_arg_matches(&matches)?;
     let cli_explicit = any_explicit_connection_arg(&matches);
 
+    // Restore the terminal on panic BEFORE any state is pushed, chaining the
+    // default hook so the panic message lands on a usable screen (TUI-1).
+    install_panic_hook();
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Mouse capture is deliberately NOT enabled (TUI-9): the TUI handles no
+    // mouse events, and capturing them hijacks the terminal's native text
+    // selection/copy and scrollback. Keyboard scrolling (Ctrl+U/D/E,
+    // PageUp/Down) covers navigation. Bracketed paste keeps a multi-line
+    // paste as ONE Event::Paste instead of a stream of per-line Enters (TUI-3).
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let _ = execute!(
         stdout,
         PushKeyboardEnhancementFlags(
@@ -186,14 +225,8 @@ async fn main() -> Result<()> {
 
     let result = run_app(&mut terminal, cli, cli_explicit).await;
 
-    // Restore terminal
-    disable_raw_mode()?;
-    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    // Restore terminal (same best-effort path the panic hook uses).
+    restore_terminal();
     terminal.show_cursor()?;
 
     result
@@ -503,6 +536,14 @@ async fn run(
 
         tokio::select! {
             Some(Ok(evt)) = event_stream.next() => {
+                // Bracketed paste (TUI-3): the whole paste arrives as one
+                // event and goes verbatim into the focused input — never
+                // through the key map, so embedded newlines can't fire
+                // SubmitPrompt per line.
+                if let Event::Paste(text) = &evt {
+                    app.apply_paste(text);
+                    continue;
+                }
                 if let Event::Key(key) = evt {
                     if key.kind == KeyEventKind::Release {
                         continue;
@@ -772,11 +813,22 @@ async fn handle_action(app: &mut App, connector: &Option<Connector>, action: Act
             }
         }
         Action::DeleteConversation => {
+            // Check connectivity BEFORE mutating local state (TUI-2's shape):
+            // previously the row vanished locally while the daemon never heard
+            // about the delete, resurrecting it on the next refresh.
+            let Some(client) = client else {
+                app.status_message = "Not connected — conversation not deleted".into();
+                return;
+            };
             if let Some(id) = app.delete_selected_conversation()
-                && let Some(client) = client
                 && let Err(e) = client.delete_conversation(&id).await
             {
                 app.status_message = format!("Delete error: {e}");
+                // Resync the sidebar with the daemon so the optimistic local
+                // removal doesn't linger after a failed delete.
+                if let Ok(convs) = fetch_conversations(client, app.show_archived).await {
+                    app.set_conversations(convs);
+                }
             }
         }
         Action::NewConversation => {
@@ -1240,8 +1292,13 @@ fn insert_dictated_text(app: &mut App, text: &str) {
 /// transport. Shared by the keyboard submit (`Enter`) and the dictation path
 /// (which appends a transcript to the input, then submits via the same route),
 /// so both honor the staged model override and the same ack handling.
+///
+/// The connected/streaming gates run BEFORE any state mutation
+/// (`App::prepare_submission`, TUI-2/TUI-7), and a failed send RPC rolls the
+/// optimistic transcript append back and refills the composer
+/// (`App::restore_failed_submission`).
 async fn send_prompt_from_input(app: &mut App, connector: &Option<Connector>) {
-    if let Some((conv_id, prompt)) = app.submit_prompt()
+    if let Some((conv_id, prompt)) = app.prepare_submission(connector.is_some())
         && let Some(connector) = connector.as_ref()
     {
         let client = connector.client();
@@ -1279,7 +1336,10 @@ async fn send_prompt_from_input(app: &mut App, connector: &Option<Connector>) {
         };
         match result {
             Ok(task_id) => app.apply_prompt_ack(task_id),
-            Err(e) => app.status_message = format!("Send error: {e}"),
+            Err(e) => {
+                app.restore_failed_submission(&conv_id, &prompt);
+                app.status_message = format!("Send error: {e} (your text is preserved)");
+            }
         }
     }
 }
@@ -1437,6 +1497,34 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("ws"));
         assert!(rendered.contains("dbus"));
+    }
+
+    // --- Panic hook (TUI-1) ---
+
+    #[test]
+    fn panic_hook_chains_the_previously_installed_hook() {
+        // Acceptance: installing our hook must not swallow the previous one —
+        // the default hook's backtrace/message printing has to still run after
+        // the terminal is restored.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static PREV_CALLED: AtomicBool = AtomicBool::new(false);
+
+        let original = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| PREV_CALLED.store(true, Ordering::SeqCst)));
+        install_panic_hook();
+
+        let result = std::panic::catch_unwind(|| panic!("deliberate test panic"));
+        assert!(result.is_err());
+
+        // Put the original hook back before asserting so a failure here
+        // doesn't leave the silent test hook installed for other tests.
+        let _ = std::panic::take_hook();
+        std::panic::set_hook(original);
+
+        assert!(
+            PREV_CALLED.load(Ordering::SeqCst),
+            "previous panic hook must be chained, not replaced"
+        );
     }
 
     // --- Reconnect backoff tests ---
