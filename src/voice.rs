@@ -68,6 +68,32 @@ pub fn into_speakable_sentences(text: &str) -> Vec<String> {
     sentences
 }
 
+/// Drive a serialized narration loop: pull utterances off `rx` and speak each
+/// one to completion before starting the next (TUI-11).
+///
+/// Reply narration and `say_this` asides previously each `tokio::spawn`ed their
+/// own playback task, so a `say_this` aside firing mid-reply interleaved
+/// sentence-by-sentence with the reply on the shared audio sink. Funnelling both
+/// through this one loop makes utterances strictly sequential: the next text is
+/// not even dequeued until `speak` for the current one has returned.
+///
+/// `speak` is the per-utterance side effect (in production: chunk + route the
+/// utterance daemon-first); it is injected, and the item type `T` is generic, so
+/// the serialization invariant can be unit-tested without an audio device. The
+/// loop returns when the channel closes (all senders dropped), so a sender held
+/// by the app for its lifetime keeps it alive and a clean shutdown ends it.
+pub async fn run_narration_loop<T, F, Fut>(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<T>,
+    speak: F,
+) where
+    F: Fn(T) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    while let Some(item) = rx.recv().await {
+        speak(item).await;
+    }
+}
+
 /// How the TUI sources voice. Defaults to [`VoiceMode::Off`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -368,8 +394,11 @@ mod tests {
                     }
                     // The first utterance blocks on the barrier; later ones run
                     // immediately. If serialization is broken the second would
-                    // start while the first is parked here.
-                    if let Some(rx) = release_first.lock().unwrap().take() {
+                    // start while the first is parked here. Take the receiver
+                    // out (dropping the guard) BEFORE awaiting so the closure's
+                    // future stays `Send`.
+                    let held = release_first.lock().unwrap().take();
+                    if let Some(rx) = held {
                         let _ = rx.await;
                     }
                     {

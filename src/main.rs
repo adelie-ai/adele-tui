@@ -43,7 +43,7 @@ use desktop_assistant_client_common::{
 use futures::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::{
-    sync::mpsc::{UnboundedReceiver, unbounded_channel},
+    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     time::{Instant, sleep_until},
 };
 
@@ -424,6 +424,17 @@ async fn run(
     // — a missing daemon yields an inert controller probed per-utterance.
     let voice_daemon = VoiceController::connect().await;
     let mut voice_session: Option<VoiceSession> = None;
+    // Single serialized narration queue (TUI-11): both reply narration and
+    // `say_this` asides enqueue here, and one long-lived task speaks them
+    // strictly one-at-a-time, so a `say_this` aside firing mid-reply no longer
+    // interleaves sentence-by-sentence on the shared sink. The task ends when
+    // this sender is dropped (loop teardown). Spawned, not awaited, so synth +
+    // playback never block the UI.
+    let (narration_tx, narration_rx) = unbounded_channel::<NarrationRequest>();
+    tokio::spawn(voice::run_narration_loop(
+        narration_rx,
+        |req: NarrationRequest| speak_text(req.voice, req.embedded, req.text),
+    ));
     let mut dictating = false;
     let (dictation_tx, mut dictation_rx) = unbounded_channel::<DictationOutcome>();
     let mut session_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<VoiceSession>>> = None;
@@ -614,19 +625,23 @@ async fn run(
                         // to, not whichever is open now — and the narration
                         // gate (adele-tui#77: `Adele == Always` OR `Adele ==
                         // OnDemand` AND `You == Enabled`) is evaluated against
-                        // THAT conversation's settings. Route daemon-first +
-                        // chunked via `speak_text`; fire-and-forget so synth
-                        // never blocks the UI. Gated entirely here so the
-                        // cut-off holds: when the gate is false nothing is
-                        // spoken on any path.
+                        // THAT conversation's settings. Routed daemon-first +
+                        // chunked through the single narration queue (TUI-11) so
+                        // it can't interleave with a `say_this` aside; the queue
+                        // task speaks it so synth never blocks the UI. Gated
+                        // entirely here so the cut-off holds: when the gate is
+                        // false nothing is spoken on any path.
                         let origin = app.complete_streaming(&request_id, &full_response);
                         if let Some(origin) = origin
                             && app.narrate_for(&origin)
                             && !full_response.trim().is_empty()
                         {
-                            let voice = Some(voice_daemon.clone());
-                            let embedded = voice_session.as_ref().map(VoiceSession::speaker);
-                            tokio::spawn(speak_text(voice, embedded, full_response));
+                            enqueue_narration(
+                                &narration_tx,
+                                &voice_daemon,
+                                &voice_session,
+                                full_response,
+                            );
                         }
                     }
                     SignalEvent::Error { request_id, error } => {
@@ -712,6 +727,7 @@ async fn run(
                             &connector,
                             &voice_daemon,
                             &voice_session,
+                            &narration_tx,
                             call,
                         )
                         .await;
@@ -1111,11 +1127,41 @@ async fn handle_action(app: &mut App, connector: &Option<Connector>, action: Act
     }
 }
 
+/// One utterance to narrate, with the backends resolved at enqueue time
+/// (adele-tui#77 / TUI-11). Carried over the narration queue so the single
+/// serializing task can speak it; the backend handles are captured here (the
+/// daemon controller is cheap to clone, the embedded `Speaker` shares `Arc`s) so
+/// the queue task needs no shared mutable view of voice state.
+struct NarrationRequest {
+    voice: Option<VoiceController>,
+    embedded: Option<adele_voice_module::Speaker<adele_voice_module::TtsBackend>>,
+    text: String,
+}
+
+/// Enqueue `text` onto the single narration queue (TUI-11) so it plays after any
+/// in-flight utterance rather than interleaving with it. The backends are
+/// resolved now (daemon clone + the current embedded speaker, if any). A closed
+/// queue (app shutting down) silently drops the request — narration is a
+/// convenience, never load-bearing.
+fn enqueue_narration(
+    tx: &UnboundedSender<NarrationRequest>,
+    voice_daemon: &VoiceController,
+    voice_session: &Option<VoiceSession>,
+    text: String,
+) {
+    let _ = tx.send(NarrationRequest {
+        voice: Some(voice_daemon.clone()),
+        embedded: voice_session.as_ref().map(VoiceSession::speaker),
+        text,
+    });
+}
+
 /// Speak `text` aloud, daemon-first and chunked (adele-tui#77, mirroring
 /// adele-gtk#80's `window::speak_text`).
 ///
-/// Single entry point shared by reply narration and `say_this` asides so routing
-/// + chunking live in one place:
+/// The narration queue loop (TUI-11) invokes this one utterance at a time, so
+/// reply narration and `say_this` asides never overlap on the sink. It is the
+/// single entry point where routing + chunking live, in three steps:
 ///
 /// 1. **Chunk.** `text` is split into one-short-sentence-per-call pieces via
 ///    [`voice::into_speakable_sentences`]. Both backends' synth is one-shot with
@@ -1128,8 +1174,8 @@ async fn handle_action(app: &mut App, connector: &Option<Connector>, action: Act
 /// 3. **Order.** Sentences are awaited **sequentially**, so the daemon/embedded
 ///    sink receives — and plays — them in order; they are never fired unordered.
 ///
-/// Spawned fire-and-forget by callers so synthesis + playback never blocks the
-/// UI. Errors are logged once (the first failing sentence) and the rest of the
+/// Run on the narration queue task so synthesis + playback never block the UI.
+/// Errors are logged once (the first failing sentence) and the rest of the
 /// utterance is abandoned.
 async fn speak_text(
     voice: Option<VoiceController>,
@@ -1177,6 +1223,7 @@ async fn handle_client_tool_call(
     connector: &Option<Connector>,
     voice_daemon: &VoiceController,
     voice_session: &Option<VoiceSession>,
+    narration_tx: &UnboundedSender<NarrationRequest>,
     call: client_tools::ClientToolCall,
 ) {
     // Gate on the call's OWN conversation, not the open one, so the per-
@@ -1187,15 +1234,15 @@ async fn handle_client_tool_call(
 
     match outcome.effect {
         client_tools::ToolEffect::Speak(text) => {
-            // Speak the aside daemon-first + chunked, fire-and-forget so we don't
+            // Speak the aside daemon-first + chunked through the single narration
+            // queue (TUI-11) so it serializes behind any in-flight reply
+            // narration instead of interleaving on the sink; enqueueing doesn't
             // block submitting the result. When neither the daemon nor the
-            // embedded engine is present, `speak_text` is a no-op; degrade to
+            // embedded engine is present there is nothing to speak; degrade to
             // showing the text inline instead of dropping it silently.
             let has_backend = voice_daemon.is_available().await || voice_session.is_some();
             if has_backend {
-                let voice = Some(voice_daemon.clone());
-                let embedded = voice_session.as_ref().map(VoiceSession::speaker);
-                tokio::spawn(speak_text(voice, embedded, text));
+                enqueue_narration(narration_tx, voice_daemon, voice_session, text);
             } else {
                 app.push_speech_disabled_note(&call.conversation_id, &text);
             }
