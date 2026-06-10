@@ -609,16 +609,21 @@ async fn run(
                         app.receive_chunk(&request_id, &chunk);
                     }
                     SignalEvent::Complete { request_id, full_response } => {
-                        app.complete_streaming(&request_id, &full_response);
-                        // Narrate the finalized reply only when the OPEN
-                        // conversation's gate holds (adele-tui#77): `Adele ==
-                        // Always` OR (`Adele == OnDemand` AND `You == Enabled`).
-                        // The completing reply streams into the open conversation,
-                        // so that gate is right. Route daemon-first + chunked via
-                        // `speak_text`; fire-and-forget so synth never blocks the
-                        // UI. Gated entirely here so the cut-off holds: when the
-                        // gate is false nothing is spoken on any path.
-                        if app.current_narrate() && !full_response.trim().is_empty() {
+                        // `complete_streaming` reports the ORIGINATING
+                        // conversation (TUI-4) — the one the prompt was sent
+                        // to, not whichever is open now — and the narration
+                        // gate (adele-tui#77: `Adele == Always` OR `Adele ==
+                        // OnDemand` AND `You == Enabled`) is evaluated against
+                        // THAT conversation's settings. Route daemon-first +
+                        // chunked via `speak_text`; fire-and-forget so synth
+                        // never blocks the UI. Gated entirely here so the
+                        // cut-off holds: when the gate is false nothing is
+                        // spoken on any path.
+                        let origin = app.complete_streaming(&request_id, &full_response);
+                        if let Some(origin) = origin
+                            && app.narrate_for(&origin)
+                            && !full_response.trim().is_empty()
+                        {
                             let voice = Some(voice_daemon.clone());
                             let embedded = voice_session.as_ref().map(VoiceSession::speaker);
                             tokio::spawn(speak_text(voice, embedded, full_response));
@@ -637,7 +642,11 @@ async fn run(
                     SignalEvent::Disconnected { reason } => {
                         // Drop the connector (closing its transport + fanout
                         // task) and reset to the not-connected sentinel receiver
-                        // so the backoff loop owns reconnection.
+                        // so the backoff loop owns reconnection. Any in-flight
+                        // stream died with the connection (TUI-8): clear it so
+                        // no frozen ▌ buffer lingers and the ack sentinel can't
+                        // mis-claim the first post-reconnect stream.
+                        app.clear_streaming_state();
                         connector = None;
                         signal_rx = unbounded_channel().1;
                         reconnect = schedule_reconnect(None);
@@ -727,6 +736,24 @@ async fn run(
                         match conn.client().list_conversations().await {
                             Ok(convs) => app.set_conversations(convs),
                             Err(e) => app.status_message = format!("Error loading conversations: {e}"),
+                        }
+                        // Resync the open conversation after the gap (TUI-8):
+                        // re-fetch its transcript (turns may have completed
+                        // while we were away — the dead stream's reply only
+                        // exists daemon-side) and reselect it by ID — the
+                        // sidebar selection is positional and the refreshed
+                        // list may have reordered.
+                        if let Some(open_id) =
+                            app.current_conversation.as_ref().map(|c| c.id.clone())
+                        {
+                            app.select_conversation_by_id(&open_id);
+                            match conn.client().get_conversation(&open_id).await {
+                                Ok(detail) => app.load_conversation(detail),
+                                Err(e) => {
+                                    app.status_message =
+                                        format!("Error refreshing conversation: {e}");
+                                }
+                            }
                         }
                         init_background_tasks(&mut app, conn.client()).await;
                         // Re-advertise client tools — the daemon replaces the

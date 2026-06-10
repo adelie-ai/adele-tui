@@ -310,15 +310,6 @@ impl App {
         }
     }
 
-    /// Whether a reply is spoken for the currently-open conversation. `false`
-    /// when no conversation is open. The reply-narration gate the streaming
-    /// completion path consults.
-    pub fn current_narrate(&self) -> bool {
-        self.current_conversation
-            .as_ref()
-            .is_some_and(|c| self.narrate_for(&c.id))
-    }
-
     /// Whether a `say_this` aside is spoken for `conversation_id` (adele-tui#77):
     /// spoken iff `Adele ∈ {OnDemand, Always}` (independent of `You`). `Disabled`
     /// downgrades the aside to inline text.
@@ -677,23 +668,32 @@ impl App {
     /// Gates rendering of the live streaming buffer so a backgrounded turn's
     /// chunks never paint into a conversation the user switched to.
     pub fn streaming_is_for_current(&self) -> bool {
-        // Stubbed pending TUI-4 implementation.
         self.pending_request_id.is_some()
+            && self.streaming_conversation_id.as_deref()
+                == self.current_conversation.as_ref().map(|c| c.id.as_str())
     }
 
     /// Reset all in-flight streaming state (TUI-8). Called on `Disconnected`:
     /// the stream is dead, so the frozen `▌` buffer must not linger and the
     /// ack sentinel must not mis-claim the first stream after reconnecting.
     pub fn clear_streaming_state(&mut self) {
-        // Stubbed pending TUI-8 implementation.
+        self.pending_request_id = None;
+        self.streaming_conversation_id = None;
+        self.streaming_buffer.clear();
+        self.assistant_status = None;
     }
 
     /// Move the sidebar selection to the conversation with `id`, returning
     /// whether it was found (TUI-8: selection is positional, so after a
     /// reconnect's list refresh we reselect by id, not index).
-    pub fn select_conversation_by_id(&mut self, _id: &str) -> bool {
-        // Stubbed pending TUI-8 implementation.
-        false
+    pub fn select_conversation_by_id(&mut self, id: &str) -> bool {
+        match self.conversations.iter().position(|c| c.id == id) {
+            Some(idx) => {
+                self.selected_conversation = Some(idx);
+                true
+            }
+            None => false,
+        }
     }
 
     fn stream_matches_or_claims_request_id(&mut self, request_id: &str) -> bool {
@@ -712,7 +712,11 @@ impl App {
             return;
         }
         self.streaming_buffer.push_str(chunk);
-        self.scroll_offset = 0;
+        // Follow-only-at-bottom (TUI-10): the transcript renders anchored to
+        // the bottom, so `scroll_offset == 0` keeps following new chunks by
+        // itself. A non-zero offset means the user scrolled up to read —
+        // never yank them back down (and a backgrounded stream's chunks must
+        // never touch the OPEN conversation's scroll at all, TUI-4).
     }
 
     /// Finish the in-flight stream. Returns the ORIGINATING conversation id
@@ -722,12 +726,15 @@ impl App {
     /// conversation is the open one; otherwise the daemon already persisted it
     /// and it appears when that conversation is next opened.
     pub fn complete_streaming(&mut self, request_id: &str, full_response: &str) -> Option<String> {
-        // Stubbed pending TUI-4 implementation (legacy behavior: appends to
-        // whichever conversation is open).
         if !self.stream_matches_or_claims_request_id(request_id) {
             return None;
         }
-        if let Some(conv) = self.current_conversation.as_mut() {
+        let origin = self.streaming_conversation_id.take();
+        if let Some(conv) = self
+            .current_conversation
+            .as_mut()
+            .filter(|c| origin.as_deref() == Some(c.id.as_str()))
+        {
             conv.messages.push(ChatMessage {
                 role: "assistant".to_string(),
                 content: full_response.to_string(),
@@ -736,7 +743,7 @@ impl App {
         self.streaming_buffer.clear();
         self.pending_request_id = None;
         self.assistant_status = None;
-        self.streaming_conversation_id.take()
+        origin
     }
 
     pub fn streaming_error(&mut self, request_id: &str, error: &str) {
@@ -2095,7 +2102,7 @@ mod tests {
             "Adele defaults Disabled"
         );
         assert!(
-            !app.current_narrate(),
+            !app.narrate_for("c1"),
             "default gate is closed (no narration)"
         );
         assert!(
@@ -2150,7 +2157,7 @@ mod tests {
             let mut app = app_with_open_conversation("c1");
             app.voice_in.insert("c1".to_string(), you);
             app.set_adele_output("c1", AdeleOutput::Always);
-            assert!(app.current_narrate(), "Always must narrate (You={you})");
+            assert!(app.narrate_for("c1"), "Always must narrate (You={you})");
             assert!(
                 app.say_this_spoken_for("c1"),
                 "Always always speaks say_this (You={you})"
@@ -2167,7 +2174,7 @@ mod tests {
         // You Disabled → reply text-only, but say_this aside still spoken.
         app.voice_in.insert("c1".to_string(), false);
         assert!(
-            !app.current_narrate(),
+            !app.narrate_for("c1"),
             "OnDemand + You=Disabled: no narration"
         );
         assert!(
@@ -2177,7 +2184,7 @@ mod tests {
 
         // You Enabled → reply narrated.
         app.voice_in.insert("c1".to_string(), true);
-        assert!(app.current_narrate(), "OnDemand + You=Enabled narrates");
+        assert!(app.narrate_for("c1"), "OnDemand + You=Enabled narrates");
         assert!(app.say_this_spoken_for("c1"));
     }
 
@@ -2188,7 +2195,7 @@ mod tests {
         for you in [false, true] {
             app.voice_in.insert("c1".to_string(), you);
             assert!(
-                !app.current_narrate(),
+                !app.narrate_for("c1"),
                 "Disabled never narrates (You={you})"
             );
             assert!(
@@ -2230,11 +2237,20 @@ mod tests {
     }
 
     #[test]
-    fn current_narrate_is_false_without_a_conversation() {
-        let mut app = App::new();
-        // Even with stale per-conversation state, no open conversation → silent.
+    fn narration_gates_on_the_originating_conversation_not_the_open_one() {
+        // TUI-4: a backgrounded turn's reply is narrated per ITS
+        // conversation's settings, not the open conversation's. c1 narrates
+        // (Always), the open c2 is Disabled — the completion still reports c1
+        // and the c1 gate holds.
+        let mut app = app_with_open_conversation("c1");
         app.set_adele_output("c1", AdeleOutput::Always);
-        assert!(!app.current_narrate());
+        app.apply_prompt_ack("task-1".into(), "c1".into());
+        app.load_conversation(detail("c2"));
+
+        let origin = app.complete_streaming("req-1", "spoken reply");
+        assert_eq!(origin.as_deref(), Some("c1"));
+        assert!(app.narrate_for("c1"), "origin's gate holds");
+        assert!(!app.narrate_for("c2"), "open conversation stays silent");
     }
 
     #[test]
