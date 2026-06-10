@@ -344,8 +344,11 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
         // Show streaming buffer as in-progress assistant message. Markdown is
         // applied to the partial buffer too — unclosed fences just show
-        // their literal backticks until the stream catches up.
-        if !app.streaming_buffer.is_empty() {
+        // their literal backticks until the stream catches up. Only painted
+        // when the in-flight stream belongs to THIS conversation (TUI-4): a
+        // backgrounded turn keeps buffering invisibly and re-appears when the
+        // user switches back to its conversation.
+        if !app.streaming_buffer.is_empty() && app.streaming_is_for_current() {
             let style = Style::default().fg(COLOR_ASSISTANT_STREAMING);
             push_assistant_markdown(&mut lines, &app.streaming_buffer, style);
             // Cursor on last line
@@ -611,7 +614,7 @@ mod tests {
             model_selection: None,
             conversation_personality: None,
         });
-        app.start_streaming("req1".into());
+        app.start_streaming("req1".into(), "1".into());
         app.receive_chunk("req1", "Partial response...");
         terminal.draw(|f| draw(f, &mut app)).unwrap();
     }

@@ -120,6 +120,10 @@ pub struct App {
     pub textarea: TextArea<'static>,
     pub streaming_buffer: String,
     pub pending_request_id: Option<String>,
+    /// The conversation the in-flight stream was sent to (TUI-4). `Some` iff
+    /// `pending_request_id` is `Some`. Completion appends to — and narration
+    /// gates on — THIS conversation, not whichever one is open at the time.
+    pub streaming_conversation_id: Option<String>,
     pub mode: InputMode,
     pub status_message: String,
     pub should_quit: bool,
@@ -201,6 +205,7 @@ impl App {
             textarea: new_textarea(),
             streaming_buffer: String::new(),
             pending_request_id: None,
+            streaming_conversation_id: None,
             mode: InputMode::Normal,
             status_message: "Connected".to_string(),
             should_quit: false,
@@ -303,15 +308,6 @@ impl App {
             AdeleOutput::OnDemand => self.voice_in_for(conversation_id),
             AdeleOutput::Disabled => false,
         }
-    }
-
-    /// Whether a reply is spoken for the currently-open conversation. `false`
-    /// when no conversation is open. The reply-narration gate the streaming
-    /// completion path consults.
-    pub fn current_narrate(&self) -> bool {
-        self.current_conversation
-            .as_ref()
-            .is_some_and(|c| self.narrate_for(&c.id))
     }
 
     /// Whether a `say_this` aside is spoken for `conversation_id` (adele-tui#77):
@@ -639,17 +635,24 @@ impl App {
     }
 
     // --- Streaming ---
+    //
+    // The stream knows its conversation (TUI-4): `start_streaming` records the
+    // conversation the prompt was sent to, and completion/rendering/narration
+    // all target THAT conversation rather than whichever one is open when the
+    // event arrives.
 
-    pub fn start_streaming(&mut self, request_id: String) {
+    pub fn start_streaming(&mut self, request_id: String, conversation_id: String) {
         self.pending_request_id = Some(request_id);
+        self.streaming_conversation_id = Some(conversation_id);
         self.streaming_buffer.clear();
     }
 
-    pub fn start_streaming_without_request_id(&mut self) {
-        self.start_streaming(Self::PENDING_STREAM_REQUEST_ID.to_string());
+    pub fn start_streaming_without_request_id(&mut self, conversation_id: String) {
+        self.start_streaming(Self::PENDING_STREAM_REQUEST_ID.to_string(), conversation_id);
     }
 
-    /// Apply the result of a `send_prompt` ack from the daemon.
+    /// Apply the result of a `send_prompt` ack from the daemon, recording the
+    /// conversation the prompt targeted (TUI-4).
     ///
     /// The wire value is either a `task_id` (post-desktop-assistant #114
     /// `SendMessageAck`) or an empty string (legacy `Ack`). Neither is the
@@ -657,8 +660,40 @@ impl App {
     /// embedded in the first `AssistantDelta`. We therefore ignore the
     /// ack payload and seed the sentinel; the first chunk claims it via
     /// `stream_matches_or_claims_request_id`. See issue #52.
-    pub fn apply_prompt_ack(&mut self, _task_id: String) {
-        self.start_streaming_without_request_id();
+    pub fn apply_prompt_ack(&mut self, _task_id: String, conversation_id: String) {
+        self.start_streaming_without_request_id(conversation_id);
+    }
+
+    /// Whether the in-flight stream belongs to the open conversation (TUI-4).
+    /// Gates rendering of the live streaming buffer so a backgrounded turn's
+    /// chunks never paint into a conversation the user switched to.
+    pub fn streaming_is_for_current(&self) -> bool {
+        self.pending_request_id.is_some()
+            && self.streaming_conversation_id.as_deref()
+                == self.current_conversation.as_ref().map(|c| c.id.as_str())
+    }
+
+    /// Reset all in-flight streaming state (TUI-8). Called on `Disconnected`:
+    /// the stream is dead, so the frozen `▌` buffer must not linger and the
+    /// ack sentinel must not mis-claim the first stream after reconnecting.
+    pub fn clear_streaming_state(&mut self) {
+        self.pending_request_id = None;
+        self.streaming_conversation_id = None;
+        self.streaming_buffer.clear();
+        self.assistant_status = None;
+    }
+
+    /// Move the sidebar selection to the conversation with `id`, returning
+    /// whether it was found (TUI-8: selection is positional, so after a
+    /// reconnect's list refresh we reselect by id, not index).
+    pub fn select_conversation_by_id(&mut self, id: &str) -> bool {
+        match self.conversations.iter().position(|c| c.id == id) {
+            Some(idx) => {
+                self.selected_conversation = Some(idx);
+                true
+            }
+            None => false,
+        }
     }
 
     fn stream_matches_or_claims_request_id(&mut self, request_id: &str) -> bool {
@@ -677,14 +712,29 @@ impl App {
             return;
         }
         self.streaming_buffer.push_str(chunk);
-        self.scroll_offset = 0;
+        // Follow-only-at-bottom (TUI-10): the transcript renders anchored to
+        // the bottom, so `scroll_offset == 0` keeps following new chunks by
+        // itself. A non-zero offset means the user scrolled up to read —
+        // never yank them back down (and a backgrounded stream's chunks must
+        // never touch the OPEN conversation's scroll at all, TUI-4).
     }
 
-    pub fn complete_streaming(&mut self, request_id: &str, full_response: &str) {
+    /// Finish the in-flight stream. Returns the ORIGINATING conversation id
+    /// when the event matched the pending stream (TUI-4) — the caller gates
+    /// narration on that conversation — or `None` when the event was unrelated.
+    /// The reply is appended to the transcript only when the originating
+    /// conversation is the open one; otherwise the daemon already persisted it
+    /// and it appears when that conversation is next opened.
+    pub fn complete_streaming(&mut self, request_id: &str, full_response: &str) -> Option<String> {
         if !self.stream_matches_or_claims_request_id(request_id) {
-            return;
+            return None;
         }
-        if let Some(conv) = self.current_conversation.as_mut() {
+        let origin = self.streaming_conversation_id.take();
+        if let Some(conv) = self
+            .current_conversation
+            .as_mut()
+            .filter(|c| origin.as_deref() == Some(c.id.as_str()))
+        {
             conv.messages.push(ChatMessage {
                 role: "assistant".to_string(),
                 content: full_response.to_string(),
@@ -693,6 +743,7 @@ impl App {
         self.streaming_buffer.clear();
         self.pending_request_id = None;
         self.assistant_status = None;
+        origin
     }
 
     pub fn streaming_error(&mut self, request_id: &str, error: &str) {
@@ -702,6 +753,7 @@ impl App {
         self.status_message = format!("Error: {error}");
         self.streaming_buffer.clear();
         self.pending_request_id = None;
+        self.streaming_conversation_id = None;
         self.assistant_status = None;
     }
 
@@ -1170,7 +1222,7 @@ mod tests {
         // send while a reply streams is refused with a status message and the
         // composer keeps its text.
         let mut app = app_ready_to_send("c1", "second question");
-        app.start_streaming("req-in-flight".into());
+        app.start_streaming("req-in-flight".into(), "c1".into());
         app.status_message.clear();
 
         let result = app.prepare_submission(true);
@@ -1192,7 +1244,7 @@ mod tests {
         // Unhappy path: the window between send and the first chunk uses the
         // pending sentinel; a send in that window must be blocked too.
         let mut app = app_ready_to_send("c1", "rapid second send");
-        app.start_streaming_without_request_id();
+        app.start_streaming_without_request_id("c1".into());
 
         assert!(app.prepare_submission(true).is_none());
         assert_eq!(app.textarea_content(), "rapid second send");
@@ -1279,6 +1331,150 @@ mod tests {
         assert_eq!(app.textarea_content(), "prompt");
     }
 
+    // --- Conversation-id threading (TUI-4) + disconnect reset (TUI-8) ---
+
+    fn detail(id: &str) -> ConversationDetail {
+        ConversationDetail {
+            id: id.into(),
+            title: format!("Conv {id}"),
+            messages: vec![],
+            model_selection: None,
+            conversation_personality: None,
+        }
+    }
+
+    #[test]
+    fn complete_after_switching_conversations_targets_the_originating_one() {
+        // Acceptance (TUI-4): a Complete arriving after the user switched
+        // conversations must NOT append to the newly opened conversation; it
+        // reports the ORIGINATING conversation id so narration gates there.
+        let mut app = App::new();
+        app.current_conversation = Some(detail("c1"));
+        app.apply_prompt_ack("task-1".into(), "c1".into());
+        app.receive_chunk("req-1", "partial ");
+
+        // User switches to c2 mid-stream.
+        app.load_conversation(detail("c2"));
+
+        let origin = app.complete_streaming("req-1", "partial reply done");
+        assert_eq!(origin.as_deref(), Some("c1"), "origin must be reported");
+        assert!(
+            app.current_conversation
+                .as_ref()
+                .unwrap()
+                .messages
+                .is_empty(),
+            "the reply must not bleed into the switched-to conversation"
+        );
+        assert_eq!(app.pending_request_id, None, "stream state must clear");
+        assert_eq!(app.streaming_buffer, "");
+    }
+
+    #[test]
+    fn complete_appends_when_user_switched_away_and_back() {
+        // Switching away and back re-opens the originating conversation; the
+        // completion then lands in its transcript.
+        let mut app = App::new();
+        app.current_conversation = Some(detail("c1"));
+        app.apply_prompt_ack("task-1".into(), "c1".into());
+        app.load_conversation(detail("c2"));
+        app.load_conversation(detail("c1")); // back again (fresh fetch)
+
+        let origin = app.complete_streaming("req-1", "the reply");
+        assert_eq!(origin.as_deref(), Some("c1"));
+        let msgs = &app.current_conversation.as_ref().unwrap().messages;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "the reply");
+    }
+
+    #[test]
+    fn unmatched_complete_reports_no_origin() {
+        // An unrelated Complete (wrong request id) must not be narrated or
+        // appended anywhere — no origin is reported.
+        let mut app = App::new();
+        app.current_conversation = Some(detail("c1"));
+        app.start_streaming("req-1".into(), "c1".into());
+        assert_eq!(app.complete_streaming("other-req", "noise"), None);
+        assert!(app.pending_request_id.is_some(), "stream still pending");
+    }
+
+    #[test]
+    fn streaming_buffer_renders_only_into_the_originating_conversation() {
+        // The UI gate (TUI-4): mid-stream chunks must not paint into a
+        // conversation the user switched to.
+        let mut app = App::new();
+        app.current_conversation = Some(detail("c1"));
+        app.start_streaming("req-1".into(), "c1".into());
+        app.receive_chunk("req-1", "partial");
+        assert!(app.streaming_is_for_current());
+
+        app.load_conversation(detail("c2"));
+        assert!(
+            !app.streaming_is_for_current(),
+            "stream belongs to c1, not the open c2"
+        );
+    }
+
+    #[test]
+    fn chunks_for_a_backgrounded_stream_do_not_reset_scroll() {
+        // Scroll position belongs to the OPEN conversation; a backgrounded
+        // stream's chunks must not yank it.
+        let mut app = App::new();
+        app.current_conversation = Some(detail("c1"));
+        app.start_streaming("req-1".into(), "c1".into());
+        app.load_conversation(detail("c2"));
+        app.scroll_up(7);
+        app.receive_chunk("req-1", "background chunk");
+        assert_eq!(app.scroll_offset, 7);
+    }
+
+    #[test]
+    fn clear_streaming_state_resets_everything_on_disconnect() {
+        // Acceptance (TUI-8): after a disconnect there is no frozen ▌ buffer
+        // and no stale pending id.
+        let mut app = App::new();
+        app.current_conversation = Some(detail("c1"));
+        app.apply_prompt_ack("task-1".into(), "c1".into());
+        app.receive_chunk("req-1", "now-dead partial");
+        app.set_assistant_status("Calling tool…");
+
+        app.clear_streaming_state();
+
+        assert_eq!(app.pending_request_id, None);
+        assert_eq!(app.streaming_buffer, "");
+        assert!(app.streaming_conversation_id.is_none());
+        assert!(app.assistant_status.is_none());
+    }
+
+    #[test]
+    fn cleared_sentinel_cannot_misclaim_the_next_stream() {
+        // Unhappy path (TUI-8): a leftover ack sentinel from before the
+        // disconnect must not claim the first post-reconnect stream.
+        let mut app = App::new();
+        app.current_conversation = Some(detail("c1"));
+        app.apply_prompt_ack("task-1".into(), "c1".into()); // sentinel armed
+        app.clear_streaming_state();
+
+        app.receive_chunk("post-reconnect-req", "someone else's chunk");
+        assert_eq!(app.streaming_buffer, "", "chunk must be ignored");
+        assert_eq!(app.pending_request_id, None);
+    }
+
+    #[test]
+    fn select_conversation_by_id_moves_selection() {
+        let mut app = app_with_conversations();
+        assert!(app.select_conversation_by_id("3"));
+        assert_eq!(app.selected_conversation, Some(2));
+    }
+
+    #[test]
+    fn select_conversation_by_id_missing_keeps_selection() {
+        let mut app = app_with_conversations();
+        app.selected_conversation = Some(1);
+        assert!(!app.select_conversation_by_id("nope"));
+        assert_eq!(app.selected_conversation, Some(1));
+    }
+
     // --- Streaming tests ---
 
     #[test]
@@ -1292,7 +1488,7 @@ mod tests {
             conversation_personality: None,
         });
 
-        app.start_streaming("req1".into());
+        app.start_streaming("req1".into(), "c1".into());
         assert_eq!(app.pending_request_id, Some("req1".to_string()));
 
         app.receive_chunk("req1", "Hello ");
@@ -1320,7 +1516,7 @@ mod tests {
             conversation_personality: None,
         });
 
-        app.start_streaming("req1".into());
+        app.start_streaming("req1".into(), "c1".into());
         app.receive_chunk("wrong_id", "bad data");
         assert_eq!(app.streaming_buffer, "");
 
@@ -1331,7 +1527,7 @@ mod tests {
     #[test]
     fn streaming_error_sets_status() {
         let mut app = App::new();
-        app.start_streaming("req1".into());
+        app.start_streaming("req1".into(), "c1".into());
         app.streaming_error("req1", "LLM timeout");
         assert_eq!(app.status_message, "Error: LLM timeout");
         assert_eq!(app.pending_request_id, None);
@@ -1348,7 +1544,7 @@ mod tests {
             model_selection: None,
             conversation_personality: None,
         });
-        app.start_streaming("req1".into());
+        app.start_streaming("req1".into(), "c1".into());
         app.set_assistant_status("Searching knowledge base...");
         assert_eq!(
             app.assistant_status.as_deref(),
@@ -1362,7 +1558,7 @@ mod tests {
     #[test]
     fn assistant_status_cleared_on_error() {
         let mut app = App::new();
-        app.start_streaming("req1".into());
+        app.start_streaming("req1".into(), "c1".into());
         app.set_assistant_status("Calling tool...");
         app.streaming_error("req1", "boom");
         assert!(app.assistant_status.is_none());
@@ -1387,7 +1583,7 @@ mod tests {
             conversation_personality: None,
         });
 
-        app.start_streaming_without_request_id();
+        app.start_streaming_without_request_id("c1".into());
         app.receive_chunk("ws-req-1", "Hello ");
         app.receive_chunk("ws-req-1", "world");
         app.complete_streaming("ws-req-1", "Hello world");
@@ -1401,7 +1597,7 @@ mod tests {
     #[test]
     fn pending_stream_rejects_unrelated_request_after_claim() {
         let mut app = App::new();
-        app.start_streaming_without_request_id();
+        app.start_streaming_without_request_id("c1".into());
 
         app.receive_chunk("ws-req-1", "good");
         app.receive_chunk("ws-req-2", "ignored");
@@ -1435,7 +1631,7 @@ mod tests {
         });
 
         // Daemon ack carries a task_id (post-#114 wire protocol).
-        app.apply_prompt_ack("task-abc123".to_string());
+        app.apply_prompt_ack("task-abc123".to_string(), "c1".to_string());
 
         // Streaming chunks then arrive with a *different* server-generated
         // request_id. They must be accepted, not filtered out.
@@ -1713,12 +1909,27 @@ mod tests {
     }
 
     #[test]
-    fn receive_chunk_resets_scroll() {
+    fn receive_chunk_at_bottom_keeps_following() {
+        // TUI-10: when the user is at the bottom (offset 0), streaming keeps
+        // auto-following.
         let mut app = App::new();
-        app.start_streaming("req1".into());
-        app.scroll_up(10);
+        app.current_conversation = Some(detail("c1"));
+        app.start_streaming("req1".into(), "c1".into());
         app.receive_chunk("req1", "data");
         assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn receive_chunk_while_scrolled_up_preserves_position() {
+        // Acceptance (TUI-10): the user can read scrollback during a long
+        // reply — chunks must not yank the view back to the bottom.
+        let mut app = App::new();
+        app.current_conversation = Some(detail("c1"));
+        app.start_streaming("req1".into(), "c1".into());
+        app.scroll_up(10);
+        app.receive_chunk("req1", "data");
+        assert_eq!(app.scroll_offset, 10);
+        assert_eq!(app.streaming_buffer, "data", "chunk still buffered");
     }
 
     #[test]
@@ -1891,7 +2102,7 @@ mod tests {
             "Adele defaults Disabled"
         );
         assert!(
-            !app.current_narrate(),
+            !app.narrate_for("c1"),
             "default gate is closed (no narration)"
         );
         assert!(
@@ -1946,7 +2157,7 @@ mod tests {
             let mut app = app_with_open_conversation("c1");
             app.voice_in.insert("c1".to_string(), you);
             app.set_adele_output("c1", AdeleOutput::Always);
-            assert!(app.current_narrate(), "Always must narrate (You={you})");
+            assert!(app.narrate_for("c1"), "Always must narrate (You={you})");
             assert!(
                 app.say_this_spoken_for("c1"),
                 "Always always speaks say_this (You={you})"
@@ -1963,7 +2174,7 @@ mod tests {
         // You Disabled → reply text-only, but say_this aside still spoken.
         app.voice_in.insert("c1".to_string(), false);
         assert!(
-            !app.current_narrate(),
+            !app.narrate_for("c1"),
             "OnDemand + You=Disabled: no narration"
         );
         assert!(
@@ -1973,7 +2184,7 @@ mod tests {
 
         // You Enabled → reply narrated.
         app.voice_in.insert("c1".to_string(), true);
-        assert!(app.current_narrate(), "OnDemand + You=Enabled narrates");
+        assert!(app.narrate_for("c1"), "OnDemand + You=Enabled narrates");
         assert!(app.say_this_spoken_for("c1"));
     }
 
@@ -1984,7 +2195,7 @@ mod tests {
         for you in [false, true] {
             app.voice_in.insert("c1".to_string(), you);
             assert!(
-                !app.current_narrate(),
+                !app.narrate_for("c1"),
                 "Disabled never narrates (You={you})"
             );
             assert!(
@@ -2026,11 +2237,20 @@ mod tests {
     }
 
     #[test]
-    fn current_narrate_is_false_without_a_conversation() {
-        let mut app = App::new();
-        // Even with stale per-conversation state, no open conversation → silent.
+    fn narration_gates_on_the_originating_conversation_not_the_open_one() {
+        // TUI-4: a backgrounded turn's reply is narrated per ITS
+        // conversation's settings, not the open conversation's. c1 narrates
+        // (Always), the open c2 is Disabled — the completion still reports c1
+        // and the c1 gate holds.
+        let mut app = app_with_open_conversation("c1");
         app.set_adele_output("c1", AdeleOutput::Always);
-        assert!(!app.current_narrate());
+        app.apply_prompt_ack("task-1".into(), "c1".into());
+        app.load_conversation(detail("c2"));
+
+        let origin = app.complete_streaming("req-1", "spoken reply");
+        assert_eq!(origin.as_deref(), Some("c1"));
+        assert!(app.narrate_for("c1"), "origin's gate holds");
+        assert!(!app.narrate_for("c2"), "open conversation stays silent");
     }
 
     #[test]

@@ -68,6 +68,32 @@ pub fn into_speakable_sentences(text: &str) -> Vec<String> {
     sentences
 }
 
+/// Drive a serialized narration loop: pull utterances off `rx` and speak each
+/// one to completion before starting the next (TUI-11).
+///
+/// Reply narration and `say_this` asides previously each `tokio::spawn`ed their
+/// own playback task, so a `say_this` aside firing mid-reply interleaved
+/// sentence-by-sentence with the reply on the shared audio sink. Funnelling both
+/// through this one loop makes utterances strictly sequential: the next text is
+/// not even dequeued until `speak` for the current one has returned.
+///
+/// `speak` is the per-utterance side effect (in production: chunk + route the
+/// utterance daemon-first); it is injected, and the item type `T` is generic, so
+/// the serialization invariant can be unit-tested without an audio device. The
+/// loop returns when the channel closes (all senders dropped), so a sender held
+/// by the app for its lifetime keeps it alive and a clean shutdown ends it.
+pub async fn run_narration_loop<T, F, Fut>(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<T>,
+    speak: F,
+) where
+    F: Fn(T) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    while let Some(item) = rx.recv().await {
+        speak(item).await;
+    }
+}
+
 /// How the TUI sources voice. Defaults to [`VoiceMode::Off`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -317,5 +343,102 @@ mod tests {
             chunks.len()
         );
         assert!(chunks.iter().all(|c| !c.trim().is_empty()));
+    }
+
+    // --- Narration queue (TUI-11) ---
+    //
+    // Reply narration and `say_this` asides both speak through ONE serialized
+    // queue, so two utterances never interleave sentence-by-sentence on the
+    // shared sink. The serialization invariant is testable without real audio
+    // by driving the shared loop with a stub `speak` that records start/end
+    // ordering and flags any overlap.
+
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::sync::oneshot;
+
+    /// Records each utterance's start/end and whether any two overlapped.
+    #[derive(Default)]
+    struct SpeakRecorder {
+        active: usize,
+        overlapped: bool,
+        log: Vec<String>,
+    }
+
+    #[tokio::test]
+    async fn narration_queue_serializes_overlapping_utterances() {
+        // Two utterances are queued back to back while the first is still
+        // "playing"; the loop must finish the first before starting the second
+        // (no overlap) and preserve submission order.
+        let recorder = Arc::new(StdMutex::new(SpeakRecorder::default()));
+        let (tx, rx) = unbounded_channel::<String>();
+
+        // A barrier so the first utterance can be held "in flight" until both
+        // requests are queued, proving the second waits rather than racing.
+        let (release_first_tx, release_first_rx) = oneshot::channel::<()>();
+        let release_first = Arc::new(StdMutex::new(Some(release_first_rx)));
+
+        let rec = Arc::clone(&recorder);
+        let loop_handle = tokio::spawn(async move {
+            run_narration_loop(rx, move |text| {
+                let rec = Arc::clone(&rec);
+                let release_first = Arc::clone(&release_first);
+                async move {
+                    {
+                        let mut r = rec.lock().unwrap();
+                        if r.active > 0 {
+                            r.overlapped = true;
+                        }
+                        r.active += 1;
+                        r.log.push(format!("start:{text}"));
+                    }
+                    // The first utterance blocks on the barrier; later ones run
+                    // immediately. If serialization is broken the second would
+                    // start while the first is parked here. Take the receiver
+                    // out (dropping the guard) BEFORE awaiting so the closure's
+                    // future stays `Send`.
+                    let held = release_first.lock().unwrap().take();
+                    if let Some(rx) = held {
+                        let _ = rx.await;
+                    }
+                    {
+                        let mut r = rec.lock().unwrap();
+                        r.active -= 1;
+                        r.log.push(format!("end:{text}"));
+                    }
+                }
+            })
+            .await;
+        });
+
+        tx.send("first".to_string()).unwrap();
+        tx.send("second".to_string()).unwrap();
+
+        // Give the loop a chance to (incorrectly) start the second before the
+        // first is released.
+        tokio::task::yield_now().await;
+        release_first_tx.send(()).unwrap();
+
+        drop(tx); // closes the channel so the loop exits
+        loop_handle.await.unwrap();
+
+        let r = recorder.lock().unwrap();
+        assert!(!r.overlapped, "utterances must never overlap on the sink");
+        assert_eq!(
+            r.log,
+            vec!["start:first", "end:first", "start:second", "end:second"],
+            "utterances must play fully, in submission order"
+        );
+    }
+
+    #[tokio::test]
+    async fn narration_loop_exits_when_the_sender_is_dropped() {
+        // The queue task is long-lived but must terminate cleanly when the app
+        // drops its sender (shutdown), not hang forever.
+        let (tx, rx) = unbounded_channel::<String>();
+        let handle = tokio::spawn(run_narration_loop(rx, |_text| async {}));
+        drop(tx);
+        // Must return promptly; the test harness would hang otherwise.
+        handle.await.unwrap();
     }
 }
