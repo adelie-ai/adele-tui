@@ -569,6 +569,14 @@ impl App {
         }
     }
 
+    /// TEMPORARY shim (issue #84): currently delegates to the destructive
+    /// `rewrap_textarea_to_width`, which is exactly the bug under test. The
+    /// fix commit replaces this with a non-mutating implementation.
+    pub fn wrapped_display_textarea(&mut self, width: usize) -> TextArea<'static> {
+        self.rewrap_textarea_to_width(width);
+        self.textarea.clone()
+    }
+
     /// Hard-wrap textarea lines to fit the available editor width.
     ///
     /// This gives the TUI composer word-wrap behavior even though the backing
@@ -1044,23 +1052,120 @@ mod tests {
     }
 
     #[test]
-    fn rewrap_textarea_to_width_wraps_long_lines_on_word_boundaries() {
+    fn wrapped_display_textarea_wraps_long_lines_on_word_boundaries() {
         let mut app = App::new();
         app.textarea.insert_str("hello world again");
 
-        app.rewrap_textarea_to_width(8);
+        let display = app.wrapped_display_textarea(8);
 
-        assert_eq!(app.textarea.lines(), ["hello ", "world ", "again"]);
+        assert_eq!(display.lines(), ["hello ", "world ", "again"]);
     }
 
     #[test]
-    fn rewrap_textarea_to_width_preserves_explicit_newlines() {
+    fn wrapped_display_textarea_preserves_explicit_newlines() {
         let mut app = App::new();
         app.textarea.insert_str("alpha beta\ngamma delta");
 
-        app.rewrap_textarea_to_width(7);
+        let display = app.wrapped_display_textarea(7);
 
-        assert_eq!(app.textarea.lines(), ["alpha ", "beta", "gamma ", "delta"]);
+        assert_eq!(display.lines(), ["alpha ", "beta", "gamma ", "delta"]);
+    }
+
+    // --- TUI-6: display wrap must NOT mutate the logical prompt -----------
+
+    /// The core bug (issue #84): a long line that the composer must visually
+    /// wrap is still sent verbatim — no terminal-width-dependent newlines get
+    /// baked into the outgoing payload.
+    #[test]
+    fn display_wrap_does_not_inject_newlines_into_sent_prompt() {
+        let mut app = App::new();
+        let typed = "the quick brown fox jumps over the lazy dog again and again";
+        app.textarea.insert_str(typed);
+
+        // Simulate several render frames at a narrow width (this is what
+        // `draw_input` does every frame).
+        let _ = app.wrapped_display_textarea(8);
+        let _ = app.wrapped_display_textarea(8);
+
+        // Logical content is untouched: exactly what was typed, no '\n'.
+        assert_eq!(app.textarea_content(), typed);
+        assert!(!app.textarea_content().contains('\n'));
+    }
+
+    /// End-to-end: type a long line, render-wrap, then submit; the outgoing
+    /// payload equals the original typed text.
+    #[test]
+    fn submit_prompt_sends_unwrapped_text_after_display_wrap() {
+        let mut app = App::new();
+        app.current_conversation = Some(ConversationDetail {
+            id: "c1".into(),
+            title: "t".into(),
+            messages: vec![],
+            model_selection: None,
+            conversation_personality: None,
+        });
+        let typed = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        app.textarea.insert_str(typed);
+
+        // A render frame wraps for display only.
+        let _ = app.wrapped_display_textarea(10);
+
+        let (conv_id, payload) = app.submit_prompt().expect("submission");
+        assert_eq!(conv_id, "c1");
+        assert_eq!(payload, typed);
+        assert!(!payload.contains('\n'));
+    }
+
+    /// Shrinking then regrowing the terminal must not leave wrap newlines
+    /// baked in: the logical content is identical before and after.
+    #[test]
+    fn display_wrap_shrink_then_grow_preserves_logical_content() {
+        let mut app = App::new();
+        let typed = "one two three four five six seven eight nine ten";
+        app.textarea.insert_str(typed);
+
+        let _ = app.wrapped_display_textarea(60); // wide: no wrap
+        let _ = app.wrapped_display_textarea(8); // narrow: wraps for display
+        let _ = app.wrapped_display_textarea(60); // wide again
+
+        assert_eq!(app.textarea_content(), typed);
+    }
+
+    /// User-entered (explicit) newlines survive a submit unchanged — only
+    /// wrap-injected ones are forbidden.
+    #[test]
+    fn submit_prompt_preserves_explicit_user_newlines() {
+        let mut app = App::new();
+        app.current_conversation = Some(ConversationDetail {
+            id: "c1".into(),
+            title: "t".into(),
+            messages: vec![],
+            model_selection: None,
+            conversation_personality: None,
+        });
+        let typed = "first paragraph here\nsecond paragraph here";
+        app.textarea.insert_str(typed);
+
+        let _ = app.wrapped_display_textarea(8);
+
+        let (_id, payload) = app.submit_prompt().expect("submission");
+        assert_eq!(payload, typed);
+    }
+
+    /// CJK (wide) glyphs are measured by display width, not char count, so a
+    /// run of full-width characters wraps at the column it actually occupies.
+    #[test]
+    fn wrapped_display_textarea_measures_wide_glyphs_by_display_width() {
+        let mut app = App::new();
+        // Each CJK glyph is 2 display columns wide.
+        app.textarea.insert_str("一二三四五");
+
+        // Width 6 columns = room for 3 wide glyphs per display row.
+        let display = app.wrapped_display_textarea(6);
+
+        assert_eq!(display.lines(), ["一二三", "四五"]);
+        // And the logical content is still the full string.
+        assert_eq!(app.textarea_content(), "一二三四五");
     }
 
     #[test]
