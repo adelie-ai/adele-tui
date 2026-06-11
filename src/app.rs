@@ -13,6 +13,23 @@ fn new_textarea() -> TextArea<'static> {
     ta
 }
 
+/// Display width of a single character in terminal columns, treating
+/// control/zero-width characters as one column so they still advance the
+/// wrap cursor and never panic the width budget.
+fn char_display_width(c: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(c)
+        .unwrap_or(0)
+        .max(1)
+}
+
+/// Split `line` into display rows no wider than `width` terminal columns,
+/// preferring whitespace break points. Measurement is by Unicode display
+/// width (`unicode-width`) so wide glyphs (CJK, many emoji) wrap at the
+/// column they actually occupy rather than at a raw char count.
+///
+/// This is purely presentational: the joined segments reproduce `line`
+/// exactly, so callers must never treat the segment boundaries as logical
+/// newlines (issue #84).
 fn wrap_line_for_width(line: &str, width: usize) -> Vec<String> {
     if line.is_empty() {
         return vec![String::new()];
@@ -23,22 +40,35 @@ fn wrap_line_for_width(line: &str, width: usize) -> Vec<String> {
     let mut start = 0usize;
 
     while start < chars.len() {
-        let remaining = chars.len() - start;
-        if remaining <= width {
+        // Walk forward accumulating display width until we'd exceed `width`.
+        let mut end = start;
+        let mut used = 0usize;
+        while end < chars.len() {
+            let w = char_display_width(chars[end]);
+            if used + w > width && end > start {
+                break;
+            }
+            used += w;
+            end += 1;
+        }
+
+        if end >= chars.len() {
             out.push(chars[start..].iter().collect());
             break;
         }
 
-        let hard_end = start + width;
-        let mut split_at = hard_end;
-        for i in (start..hard_end).rev() {
+        // Prefer breaking just after the last whitespace in [start, end).
+        let mut split_at = end;
+        for i in (start..end).rev() {
             if chars[i].is_whitespace() {
                 split_at = i + 1;
                 break;
             }
         }
+        // No whitespace to break on (or it's at the very start): hard-break
+        // at the column limit so we always make progress.
         if split_at == start {
-            split_at = hard_end;
+            split_at = end;
         }
 
         out.push(chars[start..split_at].iter().collect());
@@ -569,24 +599,31 @@ impl App {
         }
     }
 
-    /// TEMPORARY shim (issue #84): currently delegates to the destructive
-    /// `rewrap_textarea_to_width`, which is exactly the bug under test. The
-    /// fix commit replaces this with a non-mutating implementation.
-    pub fn wrapped_display_textarea(&mut self, width: usize) -> TextArea<'static> {
-        self.rewrap_textarea_to_width(width);
-        self.textarea.clone()
-    }
-
-    /// Hard-wrap textarea lines to fit the available editor width.
+    /// Build a **display-only** word-wrapped copy of the composer for the
+    /// given editor width (in terminal columns).
     ///
-    /// This gives the TUI composer word-wrap behavior even though the backing
-    /// textarea widget is single-line-scroll based.
-    pub fn rewrap_textarea_to_width(&mut self, width: usize) {
+    /// This is the fix for issue #84 (TUI-6). The backing `ratatui_textarea`
+    /// widget has no soft-wrap, so to show long lines wrapped we used to
+    /// *rewrite* `self.textarea` with the wrapped lines — which baked
+    /// terminal-width newlines into `textarea_content()`/`submit_prompt`,
+    /// mutating the prompt actually sent. Instead, `self.textarea` remains the
+    /// untouched logical source of truth (exactly what the user typed) and
+    /// this returns a throwaway `TextArea` to render. The wrap is purely
+    /// presentational; the segments concatenate back to the original lines, so
+    /// no wrap point can ever reach the wire.
+    ///
+    /// The live cursor is mapped from its logical (row, col) into the wrapped
+    /// coordinate space so editing still tracks correctly on screen. Wrapping
+    /// is measured by Unicode display width, so CJK/emoji wrap at the column
+    /// they occupy.
+    pub fn wrapped_display_textarea(&self, width: usize) -> TextArea<'static> {
+        let original_lines = self.textarea.lines().to_vec();
         if width == 0 {
-            return;
+            let mut display = TextArea::from(original_lines);
+            display.set_cursor_line_style(Style::default());
+            return display;
         }
 
-        let original_lines = self.textarea.lines().to_vec();
         let DataCursor(cursor_row, cursor_col) = self.textarea.cursor();
         let mut wrapped_lines: Vec<String> = Vec::new();
         let mut wrapped_cursor_row = 0usize;
@@ -617,19 +654,13 @@ impl App {
                 wrapped_cursor_col.min(wrapped_lines[wrapped_cursor_row].chars().count());
         }
 
-        if wrapped_lines == original_lines
-            && (cursor_row, cursor_col) == (wrapped_cursor_row, wrapped_cursor_col)
-        {
-            return;
-        }
-
-        let mut textarea = TextArea::from(wrapped_lines);
-        textarea.set_cursor_line_style(Style::default());
-        textarea.move_cursor(CursorMove::Jump(
+        let mut display = TextArea::from(wrapped_lines);
+        display.set_cursor_line_style(Style::default());
+        display.move_cursor(CursorMove::Jump(
             wrapped_cursor_row.min(u16::MAX as usize) as u16,
             wrapped_cursor_col.min(u16::MAX as usize) as u16,
         ));
-        self.textarea = textarea;
+        display
     }
 
     // --- Mode transitions ---
