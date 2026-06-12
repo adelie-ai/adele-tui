@@ -100,48 +100,16 @@ pub enum InputMode {
     Renaming,
 }
 
-/// The `Adele:` voice-output level for a conversation (adele-tui#77, mirroring
-/// adele-gtk#80's `AdeleOutput`). Decides reply narration (with `You`), the
-/// `say_this` aside gate, and the send-time `system_refinement`. Defaults to
-/// [`AdeleOutput::Disabled`].
+/// The `Adele:` voice-output level for a conversation. Decides reply narration
+/// (with `You`), the `say_this` aside gate, and the send-time
+/// `system_refinement`. Defaults to `Disabled`.
 ///
-/// * `Disabled` — never speaks; a `say_this` aside downgrades to inline text.
-/// * `OnDemand` — speaks replies only while `You == Enabled` (shaped for the ear,
-///   brief and conversational) and always speaks `say_this` asides. Selected by
-///   the model's `request_voice`.
-/// * `Always` — reads every reply aloud, in full but made speakable (not
-///   shortened).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AdeleOutput {
-    /// Never speaks (the default). `say_this` → inline note.
-    #[default]
-    Disabled,
-    /// Speaks replies when `You == Enabled`; always speaks `say_this` asides.
-    OnDemand,
-    /// Reads every reply aloud, in full, made speakable.
-    Always,
-}
-
-impl AdeleOutput {
-    /// The next level when the user cycles the control
-    /// (`Disabled → OnDemand → Always → Disabled`).
-    pub fn next(self) -> Self {
-        match self {
-            Self::Disabled => Self::OnDemand,
-            Self::OnDemand => Self::Always,
-            Self::Always => Self::Disabled,
-        }
-    }
-
-    /// Short label for the status line / chat title cue.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Disabled => "Disabled",
-            Self::OnDemand => "On Demand",
-            Self::Always => "Always",
-        }
-    }
-}
+/// Now owned by the shared `adele-voice-client-common` crate
+/// (desktop-assistant#274) so the GTK and TUI clients share one definition + the
+/// narration gate (`next`/`label`/`narrates_reply`/`speaks_aside`/
+/// `send_refinement`); re-exported here so existing `crate::app::AdeleOutput`
+/// paths keep resolving unchanged.
+pub use adele_voice_client_common::AdeleOutput;
 
 pub struct App {
     pub conversations: Vec<ConversationSummary>,
@@ -331,23 +299,19 @@ impl App {
 
     /// Whether a *reply* is spoken for `conversation_id` (adele-tui#77, the
     /// narration gate): `Adele == Always` OR (`Adele == OnDemand` AND
-    /// `You == Enabled`). `Disabled` never narrates.
+    /// `You == Enabled`). `Disabled` never narrates. Delegates to the shared
+    /// gate (desktop-assistant#274).
     pub fn narrate_for(&self, conversation_id: &str) -> bool {
-        match self.adele_output_for(conversation_id) {
-            AdeleOutput::Always => true,
-            AdeleOutput::OnDemand => self.voice_in_for(conversation_id),
-            AdeleOutput::Disabled => false,
-        }
+        self.adele_output_for(conversation_id)
+            .narrates_reply(self.voice_in_for(conversation_id))
     }
 
     /// Whether a `say_this` aside is spoken for `conversation_id` (adele-tui#77):
     /// spoken iff `Adele ∈ {OnDemand, Always}` (independent of `You`). `Disabled`
-    /// downgrades the aside to inline text.
+    /// downgrades the aside to inline text. Delegates to the shared gate
+    /// (desktop-assistant#274).
     pub fn say_this_spoken_for(&self, conversation_id: &str) -> bool {
-        !matches!(
-            self.adele_output_for(conversation_id),
-            AdeleOutput::Disabled
-        )
+        self.adele_output_for(conversation_id).speaks_aside()
     }
 
     /// Render a `say_this` call whose aside is NOT spoken (Adele == Disabled) as
