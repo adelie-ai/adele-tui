@@ -421,7 +421,10 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
 fn draw_input(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let wrap_width = usize::from(area.width.saturating_sub(2)).max(1);
-    app.rewrap_textarea_to_width(wrap_width);
+    // Display-only wrap (issue #84): render a throwaway wrapped copy so the
+    // logical composer text (`app.textarea`) — and thus the prompt that gets
+    // sent — is never mutated by terminal-width line breaks.
+    let mut display = app.wrapped_display_textarea(wrap_width);
 
     let (title, border_color) = match app.mode {
         InputMode::Normal => ("Input (press 'i' to edit)", COLOR_INPUT_BORDER_IDLE),
@@ -432,7 +435,7 @@ fn draw_input(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         InputMode::Renaming => ("Input", COLOR_INPUT_BORDER_IDLE),
     };
 
-    app.textarea.set_block(
+    display.set_block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border_color))
@@ -442,7 +445,7 @@ fn draw_input(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             ))),
     );
 
-    f.render_widget(&app.textarea, area);
+    f.render_widget(&display, area);
 }
 
 fn draw_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {

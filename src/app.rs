@@ -13,6 +13,23 @@ fn new_textarea() -> TextArea<'static> {
     ta
 }
 
+/// Display width of a single character in terminal columns, treating
+/// control/zero-width characters as one column so they still advance the
+/// wrap cursor and never panic the width budget.
+fn char_display_width(c: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(c)
+        .unwrap_or(0)
+        .max(1)
+}
+
+/// Split `line` into display rows no wider than `width` terminal columns,
+/// preferring whitespace break points. Measurement is by Unicode display
+/// width (`unicode-width`) so wide glyphs (CJK, many emoji) wrap at the
+/// column they actually occupy rather than at a raw char count.
+///
+/// This is purely presentational: the joined segments reproduce `line`
+/// exactly, so callers must never treat the segment boundaries as logical
+/// newlines (issue #84).
 fn wrap_line_for_width(line: &str, width: usize) -> Vec<String> {
     if line.is_empty() {
         return vec![String::new()];
@@ -23,22 +40,35 @@ fn wrap_line_for_width(line: &str, width: usize) -> Vec<String> {
     let mut start = 0usize;
 
     while start < chars.len() {
-        let remaining = chars.len() - start;
-        if remaining <= width {
+        // Walk forward accumulating display width until we'd exceed `width`.
+        let mut end = start;
+        let mut used = 0usize;
+        while end < chars.len() {
+            let w = char_display_width(chars[end]);
+            if used + w > width && end > start {
+                break;
+            }
+            used += w;
+            end += 1;
+        }
+
+        if end >= chars.len() {
             out.push(chars[start..].iter().collect());
             break;
         }
 
-        let hard_end = start + width;
-        let mut split_at = hard_end;
-        for i in (start..hard_end).rev() {
+        // Prefer breaking just after the last whitespace in [start, end).
+        let mut split_at = end;
+        for i in (start..end).rev() {
             if chars[i].is_whitespace() {
                 split_at = i + 1;
                 break;
             }
         }
+        // No whitespace to break on (or it's at the very start): hard-break
+        // at the column limit so we always make progress.
         if split_at == start {
-            split_at = hard_end;
+            split_at = end;
         }
 
         out.push(chars[start..split_at].iter().collect());
@@ -569,16 +599,31 @@ impl App {
         }
     }
 
-    /// Hard-wrap textarea lines to fit the available editor width.
+    /// Build a **display-only** word-wrapped copy of the composer for the
+    /// given editor width (in terminal columns).
     ///
-    /// This gives the TUI composer word-wrap behavior even though the backing
-    /// textarea widget is single-line-scroll based.
-    pub fn rewrap_textarea_to_width(&mut self, width: usize) {
+    /// This is the fix for issue #84 (TUI-6). The backing `ratatui_textarea`
+    /// widget has no soft-wrap, so to show long lines wrapped we used to
+    /// *rewrite* `self.textarea` with the wrapped lines — which baked
+    /// terminal-width newlines into `textarea_content()`/`submit_prompt`,
+    /// mutating the prompt actually sent. Instead, `self.textarea` remains the
+    /// untouched logical source of truth (exactly what the user typed) and
+    /// this returns a throwaway `TextArea` to render. The wrap is purely
+    /// presentational; the segments concatenate back to the original lines, so
+    /// no wrap point can ever reach the wire.
+    ///
+    /// The live cursor is mapped from its logical (row, col) into the wrapped
+    /// coordinate space so editing still tracks correctly on screen. Wrapping
+    /// is measured by Unicode display width, so CJK/emoji wrap at the column
+    /// they occupy.
+    pub fn wrapped_display_textarea(&self, width: usize) -> TextArea<'static> {
+        let original_lines = self.textarea.lines().to_vec();
         if width == 0 {
-            return;
+            let mut display = TextArea::from(original_lines);
+            display.set_cursor_line_style(Style::default());
+            return display;
         }
 
-        let original_lines = self.textarea.lines().to_vec();
         let DataCursor(cursor_row, cursor_col) = self.textarea.cursor();
         let mut wrapped_lines: Vec<String> = Vec::new();
         let mut wrapped_cursor_row = 0usize;
@@ -609,19 +654,13 @@ impl App {
                 wrapped_cursor_col.min(wrapped_lines[wrapped_cursor_row].chars().count());
         }
 
-        if wrapped_lines == original_lines
-            && (cursor_row, cursor_col) == (wrapped_cursor_row, wrapped_cursor_col)
-        {
-            return;
-        }
-
-        let mut textarea = TextArea::from(wrapped_lines);
-        textarea.set_cursor_line_style(Style::default());
-        textarea.move_cursor(CursorMove::Jump(
+        let mut display = TextArea::from(wrapped_lines);
+        display.set_cursor_line_style(Style::default());
+        display.move_cursor(CursorMove::Jump(
             wrapped_cursor_row.min(u16::MAX as usize) as u16,
             wrapped_cursor_col.min(u16::MAX as usize) as u16,
         ));
-        self.textarea = textarea;
+        display
     }
 
     // --- Mode transitions ---
@@ -1044,23 +1083,120 @@ mod tests {
     }
 
     #[test]
-    fn rewrap_textarea_to_width_wraps_long_lines_on_word_boundaries() {
+    fn wrapped_display_textarea_wraps_long_lines_on_word_boundaries() {
         let mut app = App::new();
         app.textarea.insert_str("hello world again");
 
-        app.rewrap_textarea_to_width(8);
+        let display = app.wrapped_display_textarea(8);
 
-        assert_eq!(app.textarea.lines(), ["hello ", "world ", "again"]);
+        assert_eq!(display.lines(), ["hello ", "world ", "again"]);
     }
 
     #[test]
-    fn rewrap_textarea_to_width_preserves_explicit_newlines() {
+    fn wrapped_display_textarea_preserves_explicit_newlines() {
         let mut app = App::new();
         app.textarea.insert_str("alpha beta\ngamma delta");
 
-        app.rewrap_textarea_to_width(7);
+        let display = app.wrapped_display_textarea(7);
 
-        assert_eq!(app.textarea.lines(), ["alpha ", "beta", "gamma ", "delta"]);
+        assert_eq!(display.lines(), ["alpha ", "beta", "gamma ", "delta"]);
+    }
+
+    // --- TUI-6: display wrap must NOT mutate the logical prompt -----------
+
+    /// The core bug (issue #84): a long line that the composer must visually
+    /// wrap is still sent verbatim — no terminal-width-dependent newlines get
+    /// baked into the outgoing payload.
+    #[test]
+    fn display_wrap_does_not_inject_newlines_into_sent_prompt() {
+        let mut app = App::new();
+        let typed = "the quick brown fox jumps over the lazy dog again and again";
+        app.textarea.insert_str(typed);
+
+        // Simulate several render frames at a narrow width (this is what
+        // `draw_input` does every frame).
+        let _ = app.wrapped_display_textarea(8);
+        let _ = app.wrapped_display_textarea(8);
+
+        // Logical content is untouched: exactly what was typed, no '\n'.
+        assert_eq!(app.textarea_content(), typed);
+        assert!(!app.textarea_content().contains('\n'));
+    }
+
+    /// End-to-end: type a long line, render-wrap, then submit; the outgoing
+    /// payload equals the original typed text.
+    #[test]
+    fn submit_prompt_sends_unwrapped_text_after_display_wrap() {
+        let mut app = App::new();
+        app.current_conversation = Some(ConversationDetail {
+            id: "c1".into(),
+            title: "t".into(),
+            messages: vec![],
+            model_selection: None,
+            conversation_personality: None,
+        });
+        let typed = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        app.textarea.insert_str(typed);
+
+        // A render frame wraps for display only.
+        let _ = app.wrapped_display_textarea(10);
+
+        let (conv_id, payload) = app.submit_prompt().expect("submission");
+        assert_eq!(conv_id, "c1");
+        assert_eq!(payload, typed);
+        assert!(!payload.contains('\n'));
+    }
+
+    /// Shrinking then regrowing the terminal must not leave wrap newlines
+    /// baked in: the logical content is identical before and after.
+    #[test]
+    fn display_wrap_shrink_then_grow_preserves_logical_content() {
+        let mut app = App::new();
+        let typed = "one two three four five six seven eight nine ten";
+        app.textarea.insert_str(typed);
+
+        let _ = app.wrapped_display_textarea(60); // wide: no wrap
+        let _ = app.wrapped_display_textarea(8); // narrow: wraps for display
+        let _ = app.wrapped_display_textarea(60); // wide again
+
+        assert_eq!(app.textarea_content(), typed);
+    }
+
+    /// User-entered (explicit) newlines survive a submit unchanged — only
+    /// wrap-injected ones are forbidden.
+    #[test]
+    fn submit_prompt_preserves_explicit_user_newlines() {
+        let mut app = App::new();
+        app.current_conversation = Some(ConversationDetail {
+            id: "c1".into(),
+            title: "t".into(),
+            messages: vec![],
+            model_selection: None,
+            conversation_personality: None,
+        });
+        let typed = "first paragraph here\nsecond paragraph here";
+        app.textarea.insert_str(typed);
+
+        let _ = app.wrapped_display_textarea(8);
+
+        let (_id, payload) = app.submit_prompt().expect("submission");
+        assert_eq!(payload, typed);
+    }
+
+    /// CJK (wide) glyphs are measured by display width, not char count, so a
+    /// run of full-width characters wraps at the column it actually occupies.
+    #[test]
+    fn wrapped_display_textarea_measures_wide_glyphs_by_display_width() {
+        let mut app = App::new();
+        // Each CJK glyph is 2 display columns wide.
+        app.textarea.insert_str("一二三四五");
+
+        // Width 6 columns = room for 3 wide glyphs per display row.
+        let display = app.wrapped_display_textarea(6);
+
+        assert_eq!(display.lines(), ["一二三", "四五"]);
+        // And the logical content is still the full string.
+        assert_eq!(app.textarea_content(), "一二三四五");
     }
 
     #[test]
