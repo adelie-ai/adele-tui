@@ -31,10 +31,9 @@
 
 use std::{io, time::Duration};
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use desktop_assistant_api_model::KnowledgeEntryView;
-use desktop_assistant_client_common::{AssistantClient, TransportClient};
-use futures::StreamExt;
+use desktop_assistant_client_common::{AssistantClient, SignalEvent, TransportClient};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -44,7 +43,9 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use ratatui_textarea::{CursorMove, TextArea};
-use tokio::time::{Instant, sleep_until};
+use tokio::time::Instant;
+
+use crate::screen::Screen;
 
 const LIST_LIMIT: u32 = 100;
 const SEARCH_LIMIT: u32 = 50;
@@ -221,61 +222,72 @@ struct State {
     closing: bool,
 }
 
+/// The KB browser as a [`Screen`]: its mutable [`State`] plus the borrowed
+/// transport client the key/timer handlers need. The shared driver supplies the
+/// event loop and — the reason it's shared — drains daemon signals while this
+/// screen is open (TUI-12).
+struct KbScreen<'a> {
+    state: State,
+    client: &'a TransportClient,
+}
+
+impl Screen for KbScreen<'_> {
+    type Outcome = ();
+
+    fn draw(&mut self, frame: &mut Frame) {
+        draw(frame, &self.state);
+    }
+
+    async fn handle_key(&mut self, key: KeyEvent) {
+        handle_key(&mut self.state, key, self.client).await;
+    }
+
+    fn take_outcome(&mut self) -> Option<()> {
+        self.state.closing.then_some(())
+    }
+
+    fn next_timer(&self) -> Option<Instant> {
+        self.state.search_deadline
+    }
+
+    async fn on_timer(&mut self) {
+        self.state.search_deadline = None;
+        let query = self.state.search.lines().join(" ").trim().to_string();
+        run_search(&mut self.state, self.client, query).await;
+    }
+}
+
 /// Run the KB browser until the user closes it. Returns when `Esc/q` is
 /// pressed in list mode or any unrecoverable transport error surfaces.
+///
+/// `signal_rx` + `sink` are forwarded to the shared driver so daemon signals keep
+/// flowing while the browser is open (TUI-12).
 pub async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     client: &TransportClient,
+    signal_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SignalEvent>,
+    sink: &mut impl crate::screen::SignalSink,
 ) -> anyhow::Result<()> {
-    let mut state = State {
-        entries: Vec::new(),
-        selected: 0,
-        mode: Mode::List,
-        return_mode: Mode::List,
-        search: single_line_textarea(),
-        search_deadline: None,
-        edit: EditForm::empty(),
-        error: None,
-        busy: Some("Loading entries...".into()),
-        closing: false,
+    let mut screen = KbScreen {
+        state: State {
+            entries: Vec::new(),
+            selected: 0,
+            mode: Mode::List,
+            return_mode: Mode::List,
+            search: single_line_textarea(),
+            search_deadline: None,
+            edit: EditForm::empty(),
+            error: None,
+            busy: Some("Loading entries...".into()),
+            closing: false,
+        },
+        client,
     };
 
     // Initial fetch.
-    refresh_list(&mut state, client).await;
+    refresh_list(&mut screen.state, client).await;
 
-    let mut events = crossterm::event::EventStream::new();
-    loop {
-        terminal.draw(|f| draw(f, &state))?;
-
-        if state.closing {
-            return Ok(());
-        }
-
-        // Compute the next debounce deadline.
-        let next_debounce = state.search_deadline;
-
-        tokio::select! {
-            evt = events.next() => {
-                match evt {
-                    Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {
-                        handle_key(&mut state, key, client).await;
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(_)) | None => return Ok(()),
-                }
-            }
-            _ = async {
-                match next_debounce {
-                    Some(deadline) => sleep_until(deadline).await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => {
-                state.search_deadline = None;
-                let query = state.search.lines().join(" ").trim().to_string();
-                run_search(&mut state, client, query).await;
-            }
-        }
-    }
+    crate::screen::run_screen(terminal, &mut screen, signal_rx, sink).await
 }
 
 async fn handle_key(state: &mut State, key: KeyEvent, client: &TransportClient) {

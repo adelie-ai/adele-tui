@@ -69,33 +69,44 @@ pub trait Screen {
     }
 }
 
+/// Sink for daemon signals drained while a modal screen is open (TUI-12).
+///
+/// [`run_screen`] hands every [`SignalEvent`] it drains to this sink the moment
+/// it arrives. It's a trait (rather than a closure) because the production
+/// implementation borrows `&mut App` plus the voice plumbing, and an async method
+/// taking `&mut self` expresses that re-borrow per call cleanly — something an
+/// `FnMut` returning a borrowing future cannot. Injecting it also keeps the
+/// driver unit-testable without a terminal or a live daemon.
+pub trait SignalSink {
+    /// Handle one drained signal (e.g. dispatch a `ClientToolCall` and submit its
+    /// result, unwedging a parked turn).
+    fn handle(&mut self, signal: SignalEvent) -> impl Future<Output = ()>;
+}
+
 /// Drive a modal [`Screen`] to completion while concurrently draining daemon
 /// signals (TUI-12).
 ///
 /// The loop selects over three sources, mirroring the chat loop's own `select!`:
 ///   1. **input** — terminal key events (release events and non-key events are
 ///      dropped here so screens never see them);
-///   2. **signals** — every [`SignalEvent`] is handed to `on_signal` the moment it
+///   2. **signals** — every [`SignalEvent`] is handed to `sink` the moment it
 ///      arrives, so a `say_this`/`ClientToolCall` turn parked behind this screen
 ///      is answered without waiting for the screen to close;
 ///   3. **timer** — the optional debounce deadline ([`Screen::next_timer`]).
 ///
-/// `on_signal` is injected (rather than the driver knowing about `App`) so this
-/// stays unit-testable without a terminal or a live daemon. Returns the screen's
-/// outcome once it settles, or when the input stream ends (treated as a close,
-/// matching the old per-screen behavior — the caller's `take_outcome` decides
-/// what that means).
-pub async fn run_screen<S, F, Fut>(
+/// Returns the screen's outcome once it settles, or when the input stream ends
+/// (treated as a close, matching the old per-screen behavior — the caller's
+/// `take_outcome` decides what that means).
+pub async fn run_screen<S, K>(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     screen: &mut S,
     signal_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SignalEvent>,
-    mut on_signal: F,
+    sink: &mut K,
 ) -> anyhow::Result<S::Outcome>
 where
     S: Screen,
     S::Outcome: Default,
-    F: FnMut(SignalEvent) -> Fut,
-    Fut: Future<Output = ()>,
+    K: SignalSink,
 {
     let mut events = crossterm::event::EventStream::new();
     loop {
@@ -125,7 +136,7 @@ where
             // TUI-12: drain daemon signals while the screen is open so a parked
             // client-tool turn resumes immediately instead of looking hung.
             Some(signal) = signal_rx.recv() => {
-                on_signal(signal).await;
+                sink.handle(signal).await;
             }
             _ = async {
                 match next_timer {
@@ -166,45 +177,56 @@ mod tests {
         }
     }
 
+    /// A [`SignalSink`] that records each drained signal and flips the screen's
+    /// `done` flag — standing in for the production sink that dispatches a
+    /// `ClientToolCall` and submits its result, unwedging the parked turn.
+    struct RecordingSink {
+        handled: Arc<Mutex<Vec<String>>>,
+        done: Arc<Mutex<bool>>,
+    }
+
+    impl SignalSink for RecordingSink {
+        async fn handle(&mut self, signal: SignalEvent) {
+            self.handled.lock().unwrap().push(format!("{signal:?}"));
+            *self.done.lock().unwrap() = true;
+        }
+    }
+
     /// The TUI-12 regression test: with no input events at all, a signal that
     /// arrives while the screen is open is still handled. Before the fix the
     /// signal sat unread until the screen closed (it never would here), so this
     /// would hang.
     ///
-    /// We exercise the select loop's signal-drain arm directly — `run_screen`
-    /// itself needs a real terminal, but the loop body that matters (drain a
-    /// signal while blocked, with no input) is reproduced here against the same
-    /// channel + handler contract.
+    /// We exercise the select loop's signal-drain arm against the real
+    /// [`SignalSink`] contract — `run_screen` itself needs a terminal, but the
+    /// loop body that matters (drain a signal while blocked, with no input) is
+    /// reproduced here with the same screen + sink the driver uses.
     #[tokio::test]
     async fn signals_are_drained_while_screen_is_open_without_input() {
         let handled: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let done = Arc::new(Mutex::new(false));
         let (tx, mut rx) = unbounded_channel::<SignalEvent>();
 
-        let handled_c = Arc::clone(&handled);
-        let done_c = Arc::clone(&done);
         let mut screen = StallScreen {
             done: Arc::clone(&done),
         };
+        let mut sink = RecordingSink {
+            handled: Arc::clone(&handled),
+            done: Arc::clone(&done),
+        };
 
-        // A handler that records the drained signal and then marks the screen
-        // done (mirroring how the real handler submits the client-tool result,
-        // unwedging the turn).
-        let driver = async move {
+        let driver = async {
             // Inline the part of `run_screen` that doesn't need a terminal: poll
-            // the screen for an outcome, otherwise drain a signal. With no input
-            // source, the ONLY way forward is the signal arm — which is exactly
-            // the stall scenario.
+            // the screen for an outcome, otherwise drain a signal into the sink.
+            // With no input source, the ONLY way forward is the signal arm —
+            // exactly the stall scenario.
             loop {
                 if screen.take_outcome().is_some() {
                     return;
                 }
                 tokio::select! {
                     Some(signal) = rx.recv() => {
-                        let mut h = handled_c.lock().unwrap();
-                        h.push(format!("{signal:?}"));
-                        // Simulate answering the parked turn.
-                        *done_c.lock().unwrap() = true;
+                        sink.handle(signal).await;
                     }
                 }
             }

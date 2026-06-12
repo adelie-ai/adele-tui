@@ -481,13 +481,36 @@ async fn run(
             ReconnectState::Connected => None,
         };
 
+        // Sub-screens (TUI-12): each modal screen now runs over the shared
+        // `screen::run_screen` driver, which drains the daemon signal stream via
+        // `handle_signal` while the screen is open so a turn parked on the TUI's
+        // `say_this` client tool is answered immediately instead of stalling
+        // until the screen closes. A `Disconnected` that arrives mid-screen is
+        // recorded by the drain callback and actioned right after the screen
+        // returns (the teardown touches loop-local state the callback can't own).
         if app.kb_requested {
             app.kb_requested = false;
-            if let Some(conn) = connector.as_ref()
-                && let Err(e) = kb::run(terminal, conn.client()).await
-            {
-                app.status_message = format!("KB error: {e}");
+            let mut disconnect: Option<String> = None;
+            if let Some(conn) = connector.clone() {
+                let mut sink = SubScreenSink {
+                    app: &mut app,
+                    connector: &connector,
+                    voice_daemon: &voice_daemon,
+                    voice_session: &voice_session,
+                    narration_tx: &narration_tx,
+                    disconnect: &mut disconnect,
+                };
+                if let Err(e) = kb::run(terminal, conn.client(), &mut signal_rx, &mut sink).await {
+                    sink.app.status_message = format!("KB error: {e}");
+                }
             }
+            apply_sub_screen_disconnect(
+                &mut app,
+                &mut connector,
+                &mut signal_rx,
+                &mut reconnect,
+                disconnect,
+            );
             // Force a redraw on the next iteration so the chat reappears
             // immediately instead of waiting for the next event.
             continue;
@@ -495,69 +518,157 @@ async fn run(
 
         if app.connections_requested {
             app.connections_requested = false;
-            if let Some(conn) = connector.as_ref()
-                && let Err(e) = connections::run(terminal, conn.client()).await
-            {
-                app.status_message = format!("Connections error: {e}");
+            let mut disconnect: Option<String> = None;
+            if let Some(conn) = connector.clone() {
+                let mut sink = SubScreenSink {
+                    app: &mut app,
+                    connector: &connector,
+                    voice_daemon: &voice_daemon,
+                    voice_session: &voice_session,
+                    narration_tx: &narration_tx,
+                    disconnect: &mut disconnect,
+                };
+                if let Err(e) =
+                    connections::run(terminal, conn.client(), &mut signal_rx, &mut sink).await
+                {
+                    sink.app.status_message = format!("Connections error: {e}");
+                }
             }
+            apply_sub_screen_disconnect(
+                &mut app,
+                &mut connector,
+                &mut signal_rx,
+                &mut reconnect,
+                disconnect,
+            );
             continue;
         }
 
         if app.purposes_requested {
             app.purposes_requested = false;
-            if let Some(conn) = connector.as_ref()
-                && let Err(e) = purposes::run(terminal, conn.client()).await
-            {
-                app.status_message = format!("Purposes error: {e}");
+            let mut disconnect: Option<String> = None;
+            if let Some(conn) = connector.clone() {
+                let mut sink = SubScreenSink {
+                    app: &mut app,
+                    connector: &connector,
+                    voice_daemon: &voice_daemon,
+                    voice_session: &voice_session,
+                    narration_tx: &narration_tx,
+                    disconnect: &mut disconnect,
+                };
+                if let Err(e) =
+                    purposes::run(terminal, conn.client(), &mut signal_rx, &mut sink).await
+                {
+                    sink.app.status_message = format!("Purposes error: {e}");
+                }
             }
+            apply_sub_screen_disconnect(
+                &mut app,
+                &mut connector,
+                &mut signal_rx,
+                &mut reconnect,
+                disconnect,
+            );
             continue;
         }
 
         if app.model_picker_requested {
             app.model_picker_requested = false;
-            if let Some(conn) = connector.as_ref() {
-                let client = conn.client();
+            let mut disconnect: Option<String> = None;
+            let mut picked_outcome = None;
+            if let Some(conn) = connector.clone() {
                 let current = app
                     .current_conversation
                     .as_ref()
                     .and_then(|c| c.model_selection.clone());
-                match model_selector::run(terminal, client, current).await {
-                    Ok(model_selector::Outcome::Selected(picked)) => {
-                        let label = format!("{} · {}", picked.connection_id, picked.model_id);
-                        app.apply_model_override(picked);
-                        app.status_message = format!("Model: {label} (applies to next message)");
-                    }
-                    Ok(model_selector::Outcome::Cancelled) => {}
-                    Err(e) => app.status_message = format!("Model picker error: {e}"),
+                let mut sink = SubScreenSink {
+                    app: &mut app,
+                    connector: &connector,
+                    voice_daemon: &voice_daemon,
+                    voice_session: &voice_session,
+                    narration_tx: &narration_tx,
+                    disconnect: &mut disconnect,
+                };
+                match model_selector::run(
+                    terminal,
+                    conn.client(),
+                    current,
+                    &mut signal_rx,
+                    &mut sink,
+                )
+                .await
+                {
+                    Ok(outcome) => picked_outcome = Some(outcome),
+                    Err(e) => sink.app.status_message = format!("Model picker error: {e}"),
                 }
             }
+            // Apply the selection AFTER the sink's borrow of `app` ends.
+            if let Some(model_selector::Outcome::Selected(picked)) = picked_outcome {
+                let label = format!("{} · {}", picked.connection_id, picked.model_id);
+                app.apply_model_override(picked);
+                app.status_message = format!("Model: {label} (applies to next message)");
+            }
+            apply_sub_screen_disconnect(
+                &mut app,
+                &mut connector,
+                &mut signal_rx,
+                &mut reconnect,
+                disconnect,
+            );
             continue;
         }
 
         if app.personality_picker_requested {
             app.personality_picker_requested = false;
+            let mut disconnect: Option<String> = None;
+            let mut saved_outcome = None;
             // Only reachable with a loaded conversation (handle_action gates on
             // `current_conversation`), but re-check so the borrow stays clean.
-            if let (Some(conn), Some(conv)) =
-                (connector.as_ref(), app.current_conversation.as_ref())
-            {
-                let conv_id = conv.id.clone();
-                let current = conv.conversation_personality;
-                match personality_selector::run(terminal, conn.client(), conv_id, current).await {
-                    Ok(personality_selector::Outcome::Saved(stored)) => {
-                        if let Some(c) = app.current_conversation.as_mut() {
-                            c.conversation_personality = Some(stored);
-                        }
-                        app.status_message = if stored == Default::default() {
-                            "Personality cleared (using global)".into()
-                        } else {
-                            "Personality saved for this conversation".into()
-                        };
-                    }
-                    Ok(personality_selector::Outcome::Cancelled) => {}
-                    Err(e) => app.status_message = format!("Personality picker error: {e}"),
+            let conv_info = app
+                .current_conversation
+                .as_ref()
+                .map(|conv| (conv.id.clone(), conv.conversation_personality));
+            if let (Some(conn), Some((conv_id, current))) = (connector.clone(), conv_info) {
+                let mut sink = SubScreenSink {
+                    app: &mut app,
+                    connector: &connector,
+                    voice_daemon: &voice_daemon,
+                    voice_session: &voice_session,
+                    narration_tx: &narration_tx,
+                    disconnect: &mut disconnect,
+                };
+                match personality_selector::run(
+                    terminal,
+                    conn.client(),
+                    conv_id,
+                    current,
+                    &mut signal_rx,
+                    &mut sink,
+                )
+                .await
+                {
+                    Ok(outcome) => saved_outcome = Some(outcome),
+                    Err(e) => sink.app.status_message = format!("Personality picker error: {e}"),
                 }
             }
+            // Apply the result AFTER the sink's borrow of `app` ends.
+            if let Some(personality_selector::Outcome::Saved(stored)) = saved_outcome {
+                if let Some(c) = app.current_conversation.as_mut() {
+                    c.conversation_personality = Some(stored);
+                }
+                app.status_message = if stored == Default::default() {
+                    "Personality cleared (using global)".into()
+                } else {
+                    "Personality saved for this conversation".into()
+                };
+            }
+            apply_sub_screen_disconnect(
+                &mut app,
+                &mut connector,
+                &mut signal_rx,
+                &mut reconnect,
+                disconnect,
+            );
             continue;
         }
 
@@ -1049,6 +1160,62 @@ async fn handle_signal(
         }
     }
     SignalAction::None
+}
+
+/// The [`SignalSink`](screen::SignalSink) used while a modal sub-screen is open
+/// (TUI-12): it forwards each drained signal through the same [`handle_signal`]
+/// the chat loop uses, so a parked `say_this` turn is answered immediately. A
+/// `Disconnected` can't be torn down here (the connection state is loop-local),
+/// so its reason is stashed in `disconnect` for [`apply_sub_screen_disconnect`]
+/// to action once the screen returns.
+struct SubScreenSink<'a> {
+    app: &'a mut App,
+    connector: &'a Option<Rc<Connector>>,
+    voice_daemon: &'a VoiceController,
+    voice_session: &'a Option<VoiceSession>,
+    narration_tx: &'a UnboundedSender<NarrationRequest>,
+    disconnect: &'a mut Option<String>,
+}
+
+impl screen::SignalSink for SubScreenSink<'_> {
+    async fn handle(&mut self, signal: SignalEvent) {
+        if let SignalAction::Disconnected { reason } = handle_signal(
+            self.app,
+            self.connector,
+            self.voice_daemon,
+            self.voice_session,
+            self.narration_tx,
+            signal,
+        )
+        .await
+        {
+            // Keep the FIRST disconnect reason; further signals on a dead
+            // connection are moot (the stream is about to be torn down anyway).
+            self.disconnect.get_or_insert(reason);
+        }
+    }
+}
+
+/// Action a disconnect that arrived while a sub-screen was open (TUI-12). Same
+/// teardown the chat loop's `Disconnected` arm performs: drop the connector,
+/// reset to the not-connected sentinel receiver, and schedule reconnect. No-op
+/// when `reason` is `None` (the common case — no disconnect occurred).
+fn apply_sub_screen_disconnect(
+    app: &mut App,
+    connector: &mut Option<Rc<Connector>>,
+    signal_rx: &mut UnboundedReceiver<SignalEvent>,
+    reconnect: &mut ReconnectState,
+    reason: Option<String>,
+) {
+    let Some(reason) = reason else {
+        return;
+    };
+    app.clear_streaming_state();
+    *connector = None;
+    *signal_rx = unbounded_channel().1;
+    *reconnect = schedule_reconnect(None);
+    app.status_message =
+        format!("Disconnected: {reason}. Reconnecting in {RECONNECT_INITIAL_SECS}s...");
 }
 
 async fn handle_action(

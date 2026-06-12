@@ -20,12 +20,11 @@
 
 use std::io;
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use desktop_assistant_api_model::{
     ConversationModelSelectionView, ModelListing, SendPromptOverride,
 };
-use desktop_assistant_client_common::TransportClient;
-use futures::StreamExt;
+use desktop_assistant_client_common::{SignalEvent, TransportClient};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -34,6 +33,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
+
+use crate::screen::Screen;
 
 const COLOR_BORDER: Color = Color::Rgb(82, 104, 173);
 const COLOR_TITLE: Color = Color::Rgb(166, 182, 255);
@@ -46,11 +47,14 @@ const COLOR_ERROR: Color = Color::Rgb(232, 130, 130);
 const COLOR_CURRENT_PICK: Color = Color::Rgb(255, 207, 119);
 
 /// Outcome of running the picker.
+#[derive(Default)]
 pub enum Outcome {
     /// User picked a model. Caller should stage this as a one-shot
     /// override on the next `SendPrompt`.
     Selected(SendPromptOverride),
-    /// User pressed Esc / q without picking.
+    /// User pressed Esc / q without picking. The default outcome — also what the
+    /// shared driver returns if the input stream ends.
+    #[default]
     Cancelled,
 }
 
@@ -65,42 +69,54 @@ struct State {
     outcome: Option<Outcome>,
 }
 
+/// The model picker as a [`Screen`]: its [`State`] plus the borrowed client. The
+/// shared driver supplies the loop and drains daemon signals while the picker is
+/// open (TUI-12).
+struct ModelSelectorScreen<'a> {
+    state: State,
+    client: &'a TransportClient,
+}
+
+impl Screen for ModelSelectorScreen<'_> {
+    type Outcome = Outcome;
+
+    fn draw(&mut self, frame: &mut Frame) {
+        draw(frame, &self.state);
+    }
+
+    async fn handle_key(&mut self, key: KeyEvent) {
+        handle_key(&mut self.state, key, self.client).await;
+    }
+
+    fn take_outcome(&mut self) -> Option<Outcome> {
+        self.state.outcome.take()
+    }
+}
+
 /// Run the picker until the user confirms or cancels.
 pub async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     client: &TransportClient,
     current: Option<ConversationModelSelectionView>,
+    signal_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SignalEvent>,
+    sink: &mut impl crate::screen::SignalSink,
 ) -> anyhow::Result<Outcome> {
-    let mut state = State {
-        models: Vec::new(),
-        selected: 0,
-        current,
-        error: None,
-        busy: Some("Loading models...".into()),
-        outcome: None,
+    let mut screen = ModelSelectorScreen {
+        state: State {
+            models: Vec::new(),
+            selected: 0,
+            current,
+            error: None,
+            busy: Some("Loading models...".into()),
+            outcome: None,
+        },
+        client,
     };
 
-    refresh(&mut state, client, false).await;
-    seed_selection(&mut state);
+    refresh(&mut screen.state, client, false).await;
+    seed_selection(&mut screen.state);
 
-    let mut events = crossterm::event::EventStream::new();
-    loop {
-        terminal.draw(|f| draw(f, &state))?;
-
-        if let Some(outcome) = state.outcome.take() {
-            return Ok(outcome);
-        }
-
-        let evt = match events.next().await {
-            Some(Ok(e)) => e,
-            Some(Err(_)) | None => return Ok(Outcome::Cancelled),
-        };
-        let Event::Key(key) = evt else { continue };
-        if key.kind == KeyEventKind::Release {
-            continue;
-        }
-        handle_key(&mut state, key, client).await;
-    }
+    crate::screen::run_screen(terminal, &mut screen, signal_rx, sink).await
 }
 
 async fn handle_key(state: &mut State, key: KeyEvent, client: &TransportClient) {
