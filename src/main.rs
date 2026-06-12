@@ -26,6 +26,7 @@ mod voice_client;
 
 use std::io;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches, Parser, parser::ValueSource};
@@ -38,7 +39,8 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use desktop_assistant_client_common::{
-    AssistantClient, ConnectionConfig, Connector, SignalEvent, TransportClient, TransportMode,
+    AssistantClient, ConnectionConfig, Connector, ConversationDetail, ConversationSummary,
+    SignalEvent, TransportClient, TransportMode,
 };
 use futures::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
@@ -47,6 +49,7 @@ use tokio::{
     time::{Instant, sleep_until},
 };
 
+use adele::in_flight::InFlight;
 use app::{AdeleOutput, App, InputMode};
 use keys::{Action, handle_key_event};
 use picker::PickerOutcome;
@@ -377,9 +380,21 @@ async fn run(
     // rebuild it) plus one `subscribe()`d receiver that feeds the `select!`
     // loop. Before there's a live connection both are the not-connected
     // sentinels: `connector = None` and a closed `signal_rx`.
-    let mut connector: Option<Connector> = None;
+    // The connector is held behind an `Rc` so an in-flight RPC future (TUI-5 /
+    // #83) can hold its own clone, keeping the connection alive independently of
+    // this `connector` variable — which the reconnect/disconnect arms reassign.
+    // Without that, the borrow checker couldn't let a future borrow `connector`
+    // across a reassignment.
+    let mut connector: Option<Rc<Connector>> = None;
     let mut signal_rx: UnboundedReceiver<SignalEvent> = unbounded_channel().1;
     let mut reconnect = ReconnectState::Connected;
+
+    // Off-loop RPC driver (TUI-5 / #83). Daemon round-trips triggered by user
+    // actions (open/create/delete/rename/archive a conversation, cancel a task)
+    // are pushed here as futures and polled as one more `select!` branch, so a
+    // slow or wedged RPC no longer blocks redraw or input. The futures borrow
+    // the `connector`'s client, so this is dropped/rebuilt with the connection.
+    let mut in_flight: InFlight<'static, RpcOutcome> = InFlight::new();
 
     // Initial connect — on failure, fall straight into the backoff loop
     // instead of running with no connection.
@@ -397,7 +412,7 @@ async fn run(
             // session's tools never fire on a TUI turn.
             register_client_tools(&conn).await;
             app.status_message = conn.label().to_string();
-            connector = Some(conn);
+            connector = Some(Rc::new(conn));
         }
         Err(e) => {
             reconnect = schedule_reconnect(None);
@@ -599,7 +614,7 @@ async fn run(
                                 );
                             }
                         } else {
-                            handle_action(&mut app, &connector, action).await;
+                            handle_action(&mut app, &connector, &mut in_flight, action).await;
                         }
                     } else {
                         match app.mode {
@@ -777,7 +792,7 @@ async fn run(
                         register_client_tools(&conn).await;
                         reconnect = ReconnectState::Connected;
                         app.status_message = conn.label().to_string();
-                        connector = Some(conn);
+                        connector = Some(Rc::new(conn));
                     }
                     Err(e) => {
                         reconnect = schedule_reconnect(prev_delay);
@@ -831,73 +846,262 @@ async fn run(
                     }
                 }
             }
+            // An off-loop RPC finished (TUI-5 / #83): apply its outcome to App.
+            // While RPCs sit in flight the other arms above keep firing — input
+            // and redraw never wait on a slow/wedged daemon round-trip. When no
+            // RPC is in flight this arm is pending-forever (an inert branch).
+            Some(outcome) = in_flight.next() => {
+                apply_rpc_outcome(&mut app, outcome);
+            }
         }
     }
 }
 
-async fn handle_action(app: &mut App, connector: &Option<Connector>, action: Action) {
-    // The action handlers all want the transport client; pull it out once as an
-    // `Option<&TransportClient>` so each arm reads the same as before.
-    let client: Option<&TransportClient> = connector.as_ref().map(Connector::client);
+/// The result of an off-loop RPC, carrying everything the event loop needs to
+/// apply it to [`App`] (TUI-5 / #83). The RPC future itself touches no `App`
+/// state — it captures only the borrowed transport client plus owned args, runs
+/// off the event loop (so the UI keeps drawing + handling input while it's in
+/// flight), and resolves to one of these. The loop applies it via
+/// [`apply_rpc_outcome`].
+///
+/// Multi-step chains (e.g. create → refresh list → open) run their steps
+/// *sequentially inside the future*, so the whole chain stays off the loop; the
+/// variant just carries the already-combined result.
+enum RpcOutcome {
+    /// `OpenConversation` / `OpenSelectedTaskConversation`: a fetched detail (or
+    /// error). `enter_editing` distinguishes the "open & start typing" path from
+    /// the task-jump path (which only loads).
+    ConversationOpened {
+        result: Result<ConversationDetail, String>,
+        enter_editing: bool,
+    },
+    /// `NewConversation`: the create+refresh+open chain. `created_id` is the new
+    /// conversation's id; `list` refreshes the sidebar; `detail` is the opened
+    /// transcript.
+    ConversationCreated {
+        created: Result<String, String>,
+        list: Option<Result<Vec<ConversationSummary>, String>>,
+        detail: Option<Result<ConversationDetail, String>>,
+    },
+    /// `DeleteConversation`: the daemon delete result, plus an optional sidebar
+    /// resync fetched only when the delete failed (to undo the optimistic local
+    /// removal).
+    ConversationDeleted {
+        result: Result<(), String>,
+        resync: Option<Result<Vec<ConversationSummary>, String>>,
+    },
+    /// `SubmitRename`: the rename result for `(id, title)`.
+    ConversationRenamed {
+        id: String,
+        title: String,
+        result: Result<(), String>,
+    },
+    /// `ArchiveConversation` / `ToggleShowArchived`: a list refresh, with a
+    /// status string to show on success.
+    ConversationsRefreshed {
+        list: Result<Vec<ConversationSummary>, String>,
+        on_success: Option<String>,
+    },
+    /// The RPC completed with nothing for the loop to apply (e.g. a successful
+    /// task-cancel command, whose effect arrives later via `TaskCompleted`).
+    Noop,
+    /// A terminal error that just needs surfacing in the status line verbatim
+    /// (e.g. an (un)archive RPC that failed before any refresh).
+    StatusError(String),
+    /// `CancelSelectedTask`: only the FAILURE is surfaced here — success is
+    /// resolved authoritatively by the `TaskCompleted` signal, so a successful
+    /// cancel command produces no outcome. On failure we clear the pending
+    /// spinner for `task_id`.
+    TaskCancelFailed { task_id: String, error: String },
+}
+
+/// Apply a completed [`RpcOutcome`] to `App` (TUI-5 / #83). This is the only
+/// place RPC results touch `App`; it runs on the event loop after the RPC has
+/// resolved off it.
+fn apply_rpc_outcome(app: &mut App, outcome: RpcOutcome) {
+    match outcome {
+        RpcOutcome::ConversationOpened {
+            result,
+            enter_editing,
+        } => match result {
+            Ok(detail) => {
+                app.load_conversation(detail);
+                if enter_editing {
+                    app.enter_editing_mode();
+                }
+            }
+            Err(e) => app.status_message = format!("Error: {e}"),
+        },
+        RpcOutcome::ConversationCreated {
+            created,
+            list,
+            detail,
+        } => {
+            let created_id = match created {
+                Ok(id) => id,
+                Err(e) => {
+                    app.status_message = format!("Create error: {e}");
+                    return;
+                }
+            };
+            match list {
+                Some(Ok(convs)) => {
+                    let new_idx = convs.iter().position(|c| c.id == created_id);
+                    app.set_conversations(convs);
+                    if let Some(idx) = new_idx {
+                        app.selected_conversation = Some(idx);
+                    }
+                }
+                Some(Err(e)) => app.status_message = format!("Error refreshing: {e}"),
+                None => {}
+            }
+            match detail {
+                Some(Ok(detail)) => {
+                    app.load_conversation(detail);
+                    app.enter_editing_mode();
+                }
+                Some(Err(e)) => app.status_message = format!("Error opening: {e}"),
+                None => {}
+            }
+        }
+        RpcOutcome::ConversationDeleted { result, resync } => {
+            if let Err(e) = result {
+                app.status_message = format!("Delete error: {e}");
+                // Resync the sidebar so the optimistic local removal doesn't
+                // linger after a failed delete.
+                if let Some(Ok(convs)) = resync {
+                    app.set_conversations(convs);
+                }
+            }
+        }
+        RpcOutcome::ConversationRenamed { id, title, result } => match result {
+            Ok(()) => {
+                app.apply_rename(&id, &title);
+                app.status_message = format!("Renamed to \"{title}\"");
+            }
+            Err(e) => app.status_message = format!("Rename error: {e}"),
+        },
+        RpcOutcome::ConversationsRefreshed { list, on_success } => match list {
+            Ok(convs) => {
+                app.set_conversations(convs);
+                if let Some(msg) = on_success {
+                    app.status_message = msg;
+                }
+            }
+            Err(e) => app.status_message = format!("Error refreshing: {e}"),
+        },
+        RpcOutcome::Noop => {}
+        RpcOutcome::StatusError(msg) => app.status_message = msg,
+        RpcOutcome::TaskCancelFailed { task_id, error } => {
+            app.status_message = format!("Cancel failed: {error}");
+            if app.pending_task_cancel.as_ref().map(|t| t.0.as_str()) == Some(task_id.as_str()) {
+                app.pending_task_cancel = None;
+            }
+        }
+    }
+}
+
+async fn handle_action(
+    app: &mut App,
+    connector: &Option<Rc<Connector>>,
+    in_flight: &mut InFlight<'static, RpcOutcome>,
+    action: Action,
+) {
+    // RPC arms clone the `Rc<Connector>` into an off-loop future pushed onto
+    // `in_flight` (TUI-5 / #83) rather than awaiting the RPC here, so the event
+    // loop keeps drawing + handling input while the RPC runs; the clone keeps
+    // the connection alive even when the loop reassigns its `connector` on
+    // reconnect. The non-RPC arms only need a connectivity check, for which a
+    // borrow suffices.
+    let client: Option<&TransportClient> = connector.as_ref().map(|c| c.client());
     match action {
         Action::Quit => app.quit(),
         Action::NextConversation => app.next_conversation(),
         Action::PreviousConversation => app.previous_conversation(),
         Action::OpenConversation => {
-            if let (Some(client), Some(id)) = (client, app.selected_conversation_id()) {
+            if let (Some(conn), Some(id)) = (connector.as_ref(), app.selected_conversation_id()) {
+                let conn = Rc::clone(conn);
                 let id = id.to_string();
-                match client.get_conversation(&id).await {
-                    Ok(detail) => {
-                        app.load_conversation(detail);
-                        app.enter_editing_mode();
+                in_flight.push(async move {
+                    RpcOutcome::ConversationOpened {
+                        result: conn
+                            .client()
+                            .get_conversation(&id)
+                            .await
+                            .map_err(|e| e.to_string()),
+                        enter_editing: true,
                     }
-                    Err(e) => app.status_message = format!("Error: {e}"),
-                }
+                });
             }
         }
         Action::DeleteConversation => {
             // Check connectivity BEFORE mutating local state (TUI-2's shape):
             // previously the row vanished locally while the daemon never heard
             // about the delete, resurrecting it on the next refresh.
-            let Some(client) = client else {
+            let Some(conn) = connector.as_ref() else {
                 app.status_message = "Not connected — conversation not deleted".into();
                 return;
             };
-            if let Some(id) = app.delete_selected_conversation()
-                && let Err(e) = client.delete_conversation(&id).await
-            {
-                app.status_message = format!("Delete error: {e}");
-                // Resync the sidebar with the daemon so the optimistic local
-                // removal doesn't linger after a failed delete.
-                if let Ok(convs) = fetch_conversations(client, app.show_archived).await {
-                    app.set_conversations(convs);
-                }
+            let conn = Rc::clone(conn);
+            // Optimistically remove locally (TUI-2 shape), then delete off-loop.
+            // The future only resyncs the sidebar when the delete fails, so a
+            // failed delete can't leave the row missing; success is silent.
+            if let Some(id) = app.delete_selected_conversation() {
+                let show_archived = app.show_archived;
+                in_flight.push(async move {
+                    match conn.client().delete_conversation(&id).await {
+                        Ok(()) => RpcOutcome::ConversationDeleted {
+                            result: Ok(()),
+                            resync: None,
+                        },
+                        Err(e) => RpcOutcome::ConversationDeleted {
+                            result: Err(e.to_string()),
+                            resync: Some(
+                                fetch_conversations(conn.client(), show_archived)
+                                    .await
+                                    .map_err(|e| e.to_string()),
+                            ),
+                        },
+                    }
+                });
             }
         }
         Action::NewConversation => {
-            if let Some(client) = client {
-                match client.create_conversation("New Conversation").await {
-                    Ok(id) => {
-                        match fetch_conversations(client, app.show_archived).await {
-                            Ok(convs) => {
-                                let new_idx = convs.iter().position(|c| c.id == id);
-                                app.set_conversations(convs);
-                                if let Some(idx) = new_idx {
-                                    app.selected_conversation = Some(idx);
-                                }
-                            }
-                            Err(e) => app.status_message = format!("Error refreshing: {e}"),
+            if let Some(conn) = connector.as_ref() {
+                let conn = Rc::clone(conn);
+                // create → refresh sidebar → open: all three steps run
+                // sequentially INSIDE the future, so the whole chain stays off
+                // the loop and the UI never freezes while it runs.
+                let show_archived = app.show_archived;
+                in_flight.push(async move {
+                    let client = conn.client();
+                    let created = match client.create_conversation("New Conversation").await {
+                        Ok(id) => id,
+                        Err(e) => {
+                            return RpcOutcome::ConversationCreated {
+                                created: Err(e.to_string()),
+                                list: None,
+                                detail: None,
+                            };
                         }
-                        match client.get_conversation(&id).await {
-                            Ok(detail) => {
-                                app.load_conversation(detail);
-                                app.enter_editing_mode();
-                            }
-                            Err(e) => app.status_message = format!("Error opening: {e}"),
-                        }
+                    };
+                    let list = Some(
+                        fetch_conversations(client, show_archived)
+                            .await
+                            .map_err(|e| e.to_string()),
+                    );
+                    let detail = Some(
+                        client
+                            .get_conversation(&created)
+                            .await
+                            .map_err(|e| e.to_string()),
+                    );
+                    RpcOutcome::ConversationCreated {
+                        created: Ok(created),
+                        list,
+                        detail,
                     }
-                    Err(e) => app.status_message = format!("Create error: {e}"),
-                }
+                });
             }
         }
         Action::EnterEditMode => {
@@ -953,45 +1157,63 @@ async fn handle_action(app: &mut App, connector: &Option<Connector>, action: Act
         }
         Action::ToggleShowArchived => {
             app.show_archived = !app.show_archived;
-            if let Some(client) = client {
-                match fetch_conversations(client, app.show_archived).await {
-                    Ok(convs) => app.set_conversations(convs),
-                    Err(e) => app.status_message = format!("Error refreshing: {e}"),
-                }
-            }
-            app.status_message = if app.show_archived {
-                "Showing all conversations (including archived)".into()
+            let on_success = if app.show_archived {
+                "Showing all conversations (including archived)".to_string()
             } else {
-                "Showing active conversations only".into()
+                "Showing active conversations only".to_string()
             };
+            if let Some(conn) = connector.as_ref() {
+                let conn = Rc::clone(conn);
+                let show_archived = app.show_archived;
+                in_flight.push(async move {
+                    RpcOutcome::ConversationsRefreshed {
+                        list: fetch_conversations(conn.client(), show_archived)
+                            .await
+                            .map_err(|e| e.to_string()),
+                        on_success: Some(on_success),
+                    }
+                });
+            } else {
+                app.status_message = on_success;
+            }
         }
         Action::ArchiveConversation => {
-            if let (Some(client), Some(id)) = (client, app.selected_conversation_id()) {
+            if let (Some(conn), Some(id)) = (connector.as_ref(), app.selected_conversation_id()) {
+                let conn = Rc::clone(conn);
                 let id = id.to_string();
                 // Determine if conversation is currently archived
                 let is_archived = app
                     .conversations
                     .get(app.selected_conversation.unwrap_or(0))
                     .is_some_and(|c| c.archived);
-                let result = if is_archived {
-                    client.unarchive_conversation(&id).await
-                } else {
-                    client.archive_conversation(&id).await
-                };
-                match result {
-                    Ok(()) => {
-                        match fetch_conversations(client, app.show_archived).await {
-                            Ok(convs) => app.set_conversations(convs),
-                            Err(e) => app.status_message = format!("Error refreshing: {e}"),
-                        }
-                        app.status_message = if is_archived {
-                            "Conversation unarchived".into()
-                        } else {
-                            "Conversation archived".into()
-                        };
+                let show_archived = app.show_archived;
+                // (un)archive → refresh, off-loop. On the archive RPC erroring
+                // the chain surfaces it as a status error carrying the archive
+                // error message.
+                in_flight.push(async move {
+                    let client = conn.client();
+                    let result = if is_archived {
+                        client.unarchive_conversation(&id).await
+                    } else {
+                        client.archive_conversation(&id).await
+                    };
+                    match result {
+                        Ok(()) => RpcOutcome::ConversationsRefreshed {
+                            list: fetch_conversations(client, show_archived)
+                                .await
+                                .map_err(|e| e.to_string()),
+                            on_success: Some(
+                                if is_archived {
+                                    "Conversation unarchived"
+                                } else {
+                                    "Conversation archived"
+                                }
+                                .to_string(),
+                            ),
+                        },
+                        Err(e) => RpcOutcome::StatusError(format!("Archive error: {e}")),
                     }
-                    Err(e) => app.status_message = format!("Archive error: {e}"),
-                }
+                });
             }
         }
         Action::ScrollUp => app.scroll_up(5),
@@ -1006,15 +1228,17 @@ async fn handle_action(app: &mut App, connector: &Option<Connector>, action: Act
         }
         Action::SubmitRename => {
             if let Some((id, title)) = app.submit_rename()
-                && let Some(client) = client
+                && let Some(conn) = connector.as_ref()
             {
-                match client.rename_conversation(&id, &title).await {
-                    Ok(()) => {
-                        app.apply_rename(&id, &title);
-                        app.status_message = format!("Renamed to \"{title}\"");
-                    }
-                    Err(e) => app.status_message = format!("Rename error: {e}"),
-                }
+                let conn = Rc::clone(conn);
+                in_flight.push(async move {
+                    let result = conn
+                        .client()
+                        .rename_conversation(&id, &title)
+                        .await
+                        .map_err(|e| e.to_string());
+                    RpcOutcome::ConversationRenamed { id, title, result }
+                });
             }
         }
         Action::CancelRename => app.cancel_rename(),
@@ -1095,33 +1319,47 @@ async fn handle_action(app: &mut App, connector: &Option<Connector>, action: Act
         Action::PreviousTask => app.tasks.move_selection(-1),
         Action::CancelSelectedTask => {
             if let Some(id) = app.request_cancel_selected_task()
-                && let Some(client) = client
-                && let Some(commands) = client.as_commands()
+                && let Some(conn) = connector.as_ref()
+                // Only proceed when the transport offers a command channel.
+                && conn.client().as_commands().is_some()
             {
-                let cmd =
-                    desktop_assistant_api_model::Command::CancelBackgroundTask { id: id.0.clone() };
-                match commands.send_command(cmd).await {
-                    Ok(_) => {
-                        // Status will move to "Cancelling..." then resolve
-                        // when `TaskCompleted { status: Cancelled }` arrives.
+                let conn = Rc::clone(conn);
+                let task_id = id.0.clone();
+                in_flight.push(async move {
+                    let Some(commands) = conn.client().as_commands() else {
+                        return RpcOutcome::Noop;
+                    };
+                    let cmd = desktop_assistant_api_model::Command::CancelBackgroundTask {
+                        id: task_id.clone(),
+                    };
+                    // Success is resolved authoritatively by the `TaskCompleted`
+                    // signal (status moves to "Cancelling..." then resolves), so
+                    // only a failed cancel command produces an outcome here.
+                    match commands.send_command(cmd).await {
+                        Ok(_) => RpcOutcome::Noop,
+                        Err(e) => RpcOutcome::TaskCancelFailed {
+                            task_id,
+                            error: e.to_string(),
+                        },
                     }
-                    Err(e) => {
-                        app.status_message = format!("Cancel failed: {e}");
-                        app.pending_task_cancel = None;
-                    }
-                }
+                });
             }
         }
         Action::OpenSelectedTaskConversation => {
             if let Some(conv_id) = app.jump_to_selected_task_conversation()
-                && let Some(client) = client
+                && let Some(conn) = connector.as_ref()
             {
-                match client.get_conversation(&conv_id).await {
-                    Ok(detail) => {
-                        app.load_conversation(detail);
+                let conn = Rc::clone(conn);
+                in_flight.push(async move {
+                    RpcOutcome::ConversationOpened {
+                        result: conn
+                            .client()
+                            .get_conversation(&conv_id)
+                            .await
+                            .map_err(|e| e.to_string()),
+                        enter_editing: false,
                     }
-                    Err(e) => app.status_message = format!("Open conversation error: {e}"),
-                }
+                });
             }
         }
     }
@@ -1220,7 +1458,7 @@ async fn speak_text(
 /// (even on a transport/submit error we log rather than wedge silently).
 async fn handle_client_tool_call(
     app: &mut App,
-    connector: &Option<Connector>,
+    connector: &Option<Rc<Connector>>,
     voice_daemon: &VoiceController,
     voice_session: &Option<VoiceSession>,
     narration_tx: &UnboundedSender<NarrationRequest>,
@@ -1371,7 +1609,7 @@ fn insert_dictated_text(app: &mut App, text: &str) {
 /// (`App::prepare_submission`, TUI-2/TUI-7), and a failed send RPC rolls the
 /// optimistic transcript append back and refills the composer
 /// (`App::restore_failed_submission`).
-async fn send_prompt_from_input(app: &mut App, connector: &Option<Connector>) {
+async fn send_prompt_from_input(app: &mut App, connector: &Option<Rc<Connector>>) {
     if let Some((conv_id, prompt)) = app.prepare_submission(connector.is_some())
         && let Some(connector) = connector.as_ref()
     {

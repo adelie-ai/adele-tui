@@ -10,7 +10,6 @@
 use std::time::Duration;
 
 use adele::in_flight::InFlight;
-use futures::StreamExt;
 use tokio::time::{sleep, timeout};
 
 /// A completed RPC's outcome is delivered exactly once, and the driver reports
@@ -28,9 +27,11 @@ async fn completed_rpc_yields_its_outcome_once() {
     assert!(inflight.is_empty());
     // Nothing left to drive: an empty driver never resolves (it must be a
     // pending branch in `select!`, not a busy-spinning one that returns None).
-    assert!(timeout(Duration::from_millis(50), inflight.next())
-        .await
-        .is_err());
+    assert!(
+        timeout(Duration::from_millis(50), inflight.next())
+            .await
+            .is_err()
+    );
 }
 
 /// Unhappy path — SLOW RPC MUST NOT BLOCK INPUT/OTHER WORK. With a never-
@@ -70,7 +71,10 @@ async fn slow_rpc_does_not_block_fast_rpc_or_the_loop() {
 
     assert_eq!(fast_outcome, Some("fast"));
     // The input branch kept firing while the slow RPC sat in flight.
-    assert!(input_ticks >= 1, "input handling never progressed while an RPC was in flight");
+    assert!(
+        input_ticks >= 1,
+        "input handling never progressed while an RPC was in flight"
+    );
     // The wedged RPC is still pending — it didn't block anything.
     assert_eq!(inflight.len(), 1);
 }
@@ -96,11 +100,11 @@ async fn concurrent_rpcs_each_deliver_their_outcome() {
     });
     assert_eq!(inflight.len(), 3);
 
+    // Drain every outcome. An empty driver is pending-forever (so it's an inert
+    // `select!` branch, not a busy-spin), so we detect "drained" via a timeout:
+    // a short stall with nothing left means all three have been delivered.
     let mut got = Vec::new();
-    while let Some(v) = timeout(Duration::from_secs(1), inflight.next())
-        .await
-        .expect("all RPCs must complete")
-    {
+    while let Ok(Some(v)) = timeout(Duration::from_millis(200), inflight.next()).await {
         got.push(v);
     }
 
