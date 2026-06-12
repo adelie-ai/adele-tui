@@ -17,6 +17,7 @@ mod personality_selector;
 mod picker;
 mod profile;
 mod purposes;
+mod screen;
 mod settings;
 mod tasks;
 mod toolbar;
@@ -630,123 +631,34 @@ async fn run(
                 }
             }
             Some(signal) = signal_rx.recv() => {
-                match signal {
-                    SignalEvent::Chunk { request_id, chunk } => {
-                        app.receive_chunk(&request_id, &chunk);
-                    }
-                    SignalEvent::Complete { request_id, full_response } => {
-                        // `complete_streaming` reports the ORIGINATING
-                        // conversation (TUI-4) — the one the prompt was sent
-                        // to, not whichever is open now — and the narration
-                        // gate (adele-tui#77: `Adele == Always` OR `Adele ==
-                        // OnDemand` AND `You == Enabled`) is evaluated against
-                        // THAT conversation's settings. Routed daemon-first +
-                        // chunked through the single narration queue (TUI-11) so
-                        // it can't interleave with a `say_this` aside; the queue
-                        // task speaks it so synth never blocks the UI. Gated
-                        // entirely here so the cut-off holds: when the gate is
-                        // false nothing is spoken on any path.
-                        let origin = app.complete_streaming(&request_id, &full_response);
-                        if let Some(origin) = origin
-                            && app.narrate_for(&origin)
-                            && !full_response.trim().is_empty()
-                        {
-                            enqueue_narration(
-                                &narration_tx,
-                                &voice_daemon,
-                                &voice_session,
-                                full_response,
-                            );
-                        }
-                    }
-                    SignalEvent::Error { request_id, error } => {
-                        app.streaming_error(&request_id, &error);
-                        app.status_message = format!("Error: {error}");
-                    }
-                    SignalEvent::Status { request_id: _, message } => {
-                        app.set_assistant_status(message);
-                    }
-                    SignalEvent::TitleChanged { conversation_id, title } => {
-                        app.update_conversation_title(&conversation_id, &title);
-                    }
-                    SignalEvent::Disconnected { reason } => {
-                        // Drop the connector (closing its transport + fanout
-                        // task) and reset to the not-connected sentinel receiver
-                        // so the backoff loop owns reconnection. Any in-flight
-                        // stream died with the connection (TUI-8): clear it so
-                        // no frozen ▌ buffer lingers and the ack sentinel can't
-                        // mis-claim the first post-reconnect stream.
-                        app.clear_streaming_state();
-                        connector = None;
-                        signal_rx = unbounded_channel().1;
-                        reconnect = schedule_reconnect(None);
-                        app.status_message = format!(
-                            "Disconnected: {reason}. Reconnecting in {RECONNECT_INITIAL_SECS}s..."
-                        );
-                    }
-                    SignalEvent::ConversationWarning { warning, .. } => {
-                        // Currently only the dangling-model-selection warning is
-                        // emitted. Surface a hint in the status bar; richer
-                        // handling (auto-pick fallback, etc.) belongs upstream
-                        // with the per-conversation model selector (#1).
-                        app.status_message = format!("Warning: {warning:?}");
-                    }
-                    // --- Background task events (issue #45 / desktop-assistant#114) ---
-                    //
-                    // Each event is forwarded verbatim into `app.tasks`. The
-                    // map's invariants are enforced inside `TaskPane` so this
-                    // call site stays one-liner-thin.
-                    SignalEvent::TaskStarted { task } => {
-                        app.tasks.apply_task_started(task);
-                    }
-                    SignalEvent::TaskProgress { id, progress_hint } => {
-                        app.tasks.apply_task_progress(&id, progress_hint);
-                    }
-                    SignalEvent::TaskLogAppended { id, entry } => {
-                        app.tasks.apply_task_log_appended(&id, entry);
-                    }
-                    SignalEvent::TaskCompleted { id, .. } => {
-                        // Clear the cancel spinner if we were waiting on this
-                        // task; the terminal event is the authoritative
-                        // resolution.
-                        if app.pending_task_cancel.as_ref().map(|t| t.0.as_str()) == Some(id.as_str()) {
-                            app.pending_task_cancel = None;
-                        }
-                        app.tasks.apply_task_completed(&id);
-                    }
-                    // The TUI has no scratchpad pane (that lives in the GTK/KDE
-                    // clients), so the change notification is a no-op here.
-                    SignalEvent::ScratchpadChanged { .. } => {}
-                    // The daemon suspended a turn on a client-local tool (#107)
-                    // — the TUI registers `say_this` (adele-tui#73). Dispatch
-                    // it, perform the side effect (speak / show inline), and
-                    // ALWAYS submit a result so the parked turn resumes. With
-                    // the per-session registry (desktop-assistant#261) a
-                    // concurrent voice session's tools no longer fire here.
-                    SignalEvent::ClientToolCall {
-                        task_id,
-                        conversation_id,
-                        tool_call_id,
-                        tool_name,
-                        arguments,
-                    } => {
-                        let call = client_tools::ClientToolCall {
-                            task_id,
-                            conversation_id,
-                            tool_call_id,
-                            tool_name,
-                            arguments,
-                        };
-                        handle_client_tool_call(
-                            &mut app,
-                            &connector,
-                            &voice_daemon,
-                            &voice_session,
-                            &narration_tx,
-                            call,
-                        )
-                        .await;
-                    }
+                // All signal handling lives in `handle_signal` (shared with the
+                // sub-screen driver, TUI-12) — it touches only `App` + the voice
+                // plumbing. The one thing it can't own is the loop-local
+                // connection teardown a `Disconnected` triggers, so it reports
+                // that back for the main loop to action here.
+                if let SignalAction::Disconnected { reason } = handle_signal(
+                    &mut app,
+                    &connector,
+                    &voice_daemon,
+                    &voice_session,
+                    &narration_tx,
+                    signal,
+                )
+                .await
+                {
+                    // Drop the connector (closing its transport + fanout task)
+                    // and reset to the not-connected sentinel receiver so the
+                    // backoff loop owns reconnection. Any in-flight stream died
+                    // with the connection (TUI-8): clear it so no frozen ▌ buffer
+                    // lingers and the ack sentinel can't mis-claim the first
+                    // post-reconnect stream.
+                    app.clear_streaming_state();
+                    connector = None;
+                    signal_rx = unbounded_channel().1;
+                    reconnect = schedule_reconnect(None);
+                    app.status_message = format!(
+                        "Disconnected: {reason}. Reconnecting in {RECONNECT_INITIAL_SECS}s..."
+                    );
                 }
             }
             _ = async {
@@ -999,6 +911,144 @@ fn apply_rpc_outcome(app: &mut App, outcome: RpcOutcome) {
             }
         }
     }
+}
+
+/// What [`handle_signal`] asks its caller to do after handling a signal. Almost
+/// every signal is fully handled inside `handle_signal` (it mutates `App` and the
+/// voice plumbing it was given) and yields [`SignalAction::None`]. The sole
+/// exception is `Disconnected`, whose connection teardown touches loop-local
+/// state (`connector`, `signal_rx`, `reconnect`) that `handle_signal` doesn't
+/// own — so it reports the reason back and the loop performs the teardown.
+enum SignalAction {
+    None,
+    Disconnected { reason: String },
+}
+
+/// Apply one daemon [`SignalEvent`] to `App` (+ voice). Extracted from the main
+/// `select!` so it can be reused by the sub-screen driver (TUI-12): while a modal
+/// screen is open, [`screen::run_screen`] drains the signal stream through this
+/// same function, so a turn parked on the TUI's `say_this` client tool is
+/// answered immediately instead of looking hung until the screen closes.
+///
+/// It deliberately handles only what depends on `App`/voice; the `Disconnected`
+/// teardown (loop-local) is returned for the caller to perform. During a
+/// sub-screen the sub-screen driver propagates that outcome so the disconnect is
+/// actioned once the screen returns.
+async fn handle_signal(
+    app: &mut App,
+    connector: &Option<Rc<Connector>>,
+    voice_daemon: &VoiceController,
+    voice_session: &Option<VoiceSession>,
+    narration_tx: &UnboundedSender<NarrationRequest>,
+    signal: SignalEvent,
+) -> SignalAction {
+    match signal {
+        SignalEvent::Chunk { request_id, chunk } => {
+            app.receive_chunk(&request_id, &chunk);
+        }
+        SignalEvent::Complete {
+            request_id,
+            full_response,
+        } => {
+            // `complete_streaming` reports the ORIGINATING conversation (TUI-4) —
+            // the one the prompt was sent to, not whichever is open now — and the
+            // narration gate (adele-tui#77: `Adele == Always` OR `Adele ==
+            // OnDemand` AND `You == Enabled`) is evaluated against THAT
+            // conversation's settings. Routed daemon-first + chunked through the
+            // single narration queue (TUI-11) so it can't interleave with a
+            // `say_this` aside; the queue task speaks it so synth never blocks the
+            // UI. Gated entirely here so the cut-off holds: when the gate is false
+            // nothing is spoken on any path.
+            let origin = app.complete_streaming(&request_id, &full_response);
+            if let Some(origin) = origin
+                && app.narrate_for(&origin)
+                && !full_response.trim().is_empty()
+            {
+                enqueue_narration(narration_tx, voice_daemon, voice_session, full_response);
+            }
+        }
+        SignalEvent::Error { request_id, error } => {
+            app.streaming_error(&request_id, &error);
+            app.status_message = format!("Error: {error}");
+        }
+        SignalEvent::Status {
+            request_id: _,
+            message,
+        } => {
+            app.set_assistant_status(message);
+        }
+        SignalEvent::TitleChanged {
+            conversation_id,
+            title,
+        } => {
+            app.update_conversation_title(&conversation_id, &title);
+        }
+        SignalEvent::Disconnected { reason } => {
+            return SignalAction::Disconnected { reason };
+        }
+        SignalEvent::ConversationWarning { warning, .. } => {
+            // Currently only the dangling-model-selection warning is emitted.
+            // Surface a hint in the status bar; richer handling (auto-pick
+            // fallback, etc.) belongs upstream with the per-conversation model
+            // selector (#1).
+            app.status_message = format!("Warning: {warning:?}");
+        }
+        // --- Background task events (issue #45 / desktop-assistant#114) ---
+        //
+        // Each event is forwarded verbatim into `app.tasks`. The map's invariants
+        // are enforced inside `TaskPane` so this call site stays one-liner-thin.
+        SignalEvent::TaskStarted { task } => {
+            app.tasks.apply_task_started(task);
+        }
+        SignalEvent::TaskProgress { id, progress_hint } => {
+            app.tasks.apply_task_progress(&id, progress_hint);
+        }
+        SignalEvent::TaskLogAppended { id, entry } => {
+            app.tasks.apply_task_log_appended(&id, entry);
+        }
+        SignalEvent::TaskCompleted { id, .. } => {
+            // Clear the cancel spinner if we were waiting on this task; the
+            // terminal event is the authoritative resolution.
+            if app.pending_task_cancel.as_ref().map(|t| t.0.as_str()) == Some(id.as_str()) {
+                app.pending_task_cancel = None;
+            }
+            app.tasks.apply_task_completed(&id);
+        }
+        // The TUI has no scratchpad pane (that lives in the GTK/KDE clients), so
+        // the change notification is a no-op here.
+        SignalEvent::ScratchpadChanged { .. } => {}
+        // The daemon suspended a turn on a client-local tool (#107) — the TUI
+        // registers `say_this` (adele-tui#73). Dispatch it, perform the side
+        // effect (speak / show inline), and ALWAYS submit a result so the parked
+        // turn resumes. With the per-session registry (desktop-assistant#261) a
+        // concurrent voice session's tools no longer fire here. Draining this
+        // while a sub-screen is open is the whole point of TUI-12.
+        SignalEvent::ClientToolCall {
+            task_id,
+            conversation_id,
+            tool_call_id,
+            tool_name,
+            arguments,
+        } => {
+            let call = client_tools::ClientToolCall {
+                task_id,
+                conversation_id,
+                tool_call_id,
+                tool_name,
+                arguments,
+            };
+            handle_client_tool_call(
+                app,
+                connector,
+                voice_daemon,
+                voice_session,
+                narration_tx,
+                call,
+            )
+            .await;
+        }
+    }
+    SignalAction::None
 }
 
 async fn handle_action(
