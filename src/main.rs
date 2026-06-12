@@ -238,44 +238,21 @@ enum ReconnectState {
 const RECONNECT_INITIAL_SECS: u64 = 2;
 const RECONNECT_MAX_SECS: u64 = 30;
 
-/// System refinement attached on send while `Adele == OnDemand` (adele-tui#77,
-/// mirroring adele-gtk#80). Replies are spoken only while conversing by voice,
-/// so shape them **for the ear**: brief, conversational, no markdown,
-/// symbols/acronyms spelled out. Deliberately free of markdown markers so it
-/// can't itself leak formatting. Refines the system prompt for THIS turn only —
-/// never stored, never in the transcript.
-const ON_DEMAND_SYSTEM_REFINEMENT: &str = "This reply will be read aloud, so write it to be heard, \
-    not read. Keep it brief and conversational — a few short sentences — and lead with the answer. \
-    Use no markdown or formatting of any kind (no asterisks, backticks, bullets, or emoji); write \
-    plain spoken prose. Spell out symbols, abbreviations, and acronyms as words (say \"and\" not \
-    \"&\", \"percent\" not \"%\", \"for example\" not \"e.g.\"), and don't read out URLs, file \
-    paths, or email addresses — describe them instead.";
-
-/// System refinement attached on send while `Adele == Always` (adele-tui#77,
-/// mirroring adele-gtk#80). Every reply is read aloud for accessibility, so make
-/// it **speakable but not shortened**: keep the full content, just strip
-/// formatting and spell out symbols. Crucially it does NOT ask for brevity
-/// (that's the OnDemand job) — Always reads the whole answer. Free of markdown
-/// markers itself.
-const ALWAYS_SYSTEM_REFINEMENT: &str = "This reply will be read aloud in full, so write it to be \
-    heard, not read, without leaving anything out. Do not shorten or summarize — cover everything \
-    you would normally say, just phrased for the ear. Use no markdown or formatting of any kind \
-    (no asterisks, backticks, bullets, or emoji); write plain spoken prose. Spell out symbols, \
-    abbreviations, and acronyms as words (say \"and\" not \"&\", \"percent\" not \"%\", \"for \
-    example\" not \"e.g.\"), and don't read out URLs, file paths, or email addresses — describe \
-    them instead.";
-
-/// The system refinement to attach on the next send for `conversation_id`
-/// (adele-tui#77), chosen by its `Adele:` level: `OnDemand` →
-/// brief/conversational/speakable; `Always` → speakable-but-full (don't
-/// shorten); `Disabled` → none. Pure decision the send path consults to choose
-/// the refinement string (empty = none).
+/// The system refinement to attach on the next send for `conversation_id`,
+/// chosen by its `Adele:` level: `OnDemand` → brief/conversational/speakable;
+/// `Always` → speakable-but-full (don't shorten); `Disabled` → none. Pure
+/// decision the send path consults to choose the refinement string (empty =
+/// none).
+///
+/// The refinement prose + the level→refinement mapping now live in the shared
+/// `adele-voice-client-common` crate (desktop-assistant#274) so the GTK and TUI
+/// clients send byte-identical refinements. The shared helper returns
+/// `Option<&str>`; we keep this client's empty-string-means-none convention so
+/// the send call sites are untouched.
 fn refinement_for_send(app: &App, conversation_id: &str) -> &'static str {
-    match app.adele_output_for(conversation_id) {
-        AdeleOutput::OnDemand => ON_DEMAND_SYSTEM_REFINEMENT,
-        AdeleOutput::Always => ALWAYS_SYSTEM_REFINEMENT,
-        AdeleOutput::Disabled => "",
-    }
+    app.adele_output_for(conversation_id)
+        .send_refinement()
+        .unwrap_or("")
 }
 
 fn next_backoff(prev_secs: u64) -> u64 {

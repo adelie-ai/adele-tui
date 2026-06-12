@@ -51,12 +51,15 @@ desktop-assistant-api-model = { git = "https://github.com/adelie-ai/desktop-assi
 [dependencies.adele-voice-module]
 path = "../voice/crates/module"
 
-# Shared voice domain crate: its `SentenceBuffer` carries the sentence-chunking
-# algorithm so a long reply is spoken one short sentence at a time (each synth is
-# one-shot with a ~20s timeout). Used by `voice::into_speakable_sentences`,
-# mirroring adele-gtk#80's `voice_embedded::into_speakable_sentences`.
-[dependencies.adele-voice-core]
-path = "../voice/crates/core"
+# Shared client-side voice-output plumbing (desktop-assistant#274): the
+# `AdeleOutput` level + narration gate, the byte-identical system-refinement
+# constants, and `into_speakable_sentences` (the sentence chunker, so a long
+# reply is spoken one short sentence at a time — each synth is one-shot with a
+# ~20s timeout). Owned once here instead of triplicated across the clients;
+# pulls in `adele-voice-core` transitively for its `SentenceBuffer`. Same
+# `../voice` symlink path-dep as the module above.
+[dependencies.adele-voice-client-common]
+path = "../voice/crates/client-voice"
 
 [dependencies.adele-voice-vad-silero]
 path = "../voice/crates/vad-silero"
