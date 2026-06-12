@@ -4,27 +4,6 @@
 //! daemon, and runs the interactive TUI event loop (chat plus the knowledge
 //! base, connections, and purposes management screens).
 
-mod app;
-mod client_tools;
-mod connections;
-mod credentials;
-mod kb;
-mod keys;
-mod markdown;
-mod model_selector;
-mod oauth;
-mod personality_selector;
-mod picker;
-mod profile;
-mod purposes;
-mod screen;
-mod settings;
-mod tasks;
-mod toolbar;
-mod ui;
-mod voice;
-mod voice_client;
-
 use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -50,14 +29,25 @@ use tokio::{
     time::{Instant, sleep_until},
 };
 
+// The binary is a thin shim over the `adele` library crate (refactor #3): every
+// screen/widget/helper module lives in `lib.rs` and is reached via `adele::`,
+// not re-declared with `mod`, so there is ONE module tree instead of two that
+// compile twice and silently drift (the old `mod` list had already lost
+// `personality_selector` + `voice_client` from `lib.rs`). Only the orchestration
+// wiring them together (the `run` event loop, its RPC/signal helpers, the voice
+// plumbing types) lives in this file.
+use adele::app::{AdeleOutput, App, InputMode};
 use adele::in_flight::InFlight;
-use app::{AdeleOutput, App, InputMode};
-use keys::{Action, handle_key_event};
-use picker::PickerOutcome;
-use profile::ProfileStore;
-use settings::Settings;
-use voice::{VoiceConfig, VoiceSession};
-use voice_client::VoiceController;
+use adele::keys::{Action, handle_key_event};
+use adele::picker::PickerOutcome;
+use adele::profile::ProfileStore;
+use adele::settings::Settings;
+use adele::voice::{VoiceConfig, VoiceSession};
+use adele::voice_client::VoiceController;
+use adele::{
+    client_tools, connections, credentials, kb, model_selector, personality_selector, picker,
+    purposes, screen, ui, voice,
+};
 
 const DEFAULT_WS_URL: &str = desktop_assistant_client_common::config::DEFAULT_WS_URL;
 const DEFAULT_WS_SUBJECT: &str = desktop_assistant_client_common::config::DEFAULT_WS_SUBJECT;
