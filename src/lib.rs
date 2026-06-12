@@ -9,6 +9,7 @@ pub mod app;
 pub mod client_tools;
 pub mod connections;
 pub mod credentials;
+pub mod in_flight;
 pub mod kb;
 pub mod keys;
 pub mod markdown;
