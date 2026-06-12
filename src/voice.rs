@@ -12,11 +12,10 @@
 //! the module's config sections are TOML-native (`Deserialize` + `Default`) and
 //! the daemon uses the same shapes. The [`VoiceMode`] toggle gates the embedded
 //! pipeline: it defaults to [`VoiceMode::Off`] so a TUI with no voice config
-//! behaves exactly as before. [`VoiceMode::Daemon`] is accepted but inert here —
-//! it does not wire the embedded mic/speaker; narration still routes through the
-//! voice daemon (`org.desktopAssistant.Voice`) via [`crate::voice_client`] when
-//! that daemon is running, regardless of this mode (the daemon path is probed
-//! independently and is the preferred speaker — see adele-tui#77).
+//! behaves exactly as before. Narration still routes through the voice daemon
+//! (`org.desktopAssistant.Voice`) via [`crate::voice_client`] when that daemon is
+//! running, regardless of this mode (the daemon path is probed independently and
+//! is the preferred speaker — see adele-tui#77).
 //!
 //! Building the embedded pipeline loads ONNX models (hundreds of MB), so it is
 //! done lazily on first use rather than at startup, and only when the mode is
@@ -103,11 +102,6 @@ pub enum VoiceMode {
     Off,
     /// In-process dictation + playback via the embedded module. No daemon.
     Embedded,
-    /// Defer to the system voice daemon. The TUI has no daemon voice client,
-    /// so this is currently treated the same as `Off` (inert). Reserved so
-    /// the toggle's vocabulary matches the epic without implying a capability
-    /// the TUI doesn't yet have.
-    Daemon,
 }
 
 /// User-facing voice configuration, parsed from `voice.toml`.
@@ -118,15 +112,8 @@ pub enum VoiceMode {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct VoiceConfig {
-    /// The capability toggle (`off` | `embedded` | `daemon`).
+    /// The capability toggle (`off` | `embedded`).
     pub mode: VoiceMode,
-    /// Accepted for config back-compat but no longer seeds any state
-    /// (adele-tui#77). The You/Adele model always starts each conversation at
-    /// `Adele = Disabled` (silent) and `You = Disabled`; voice output is an
-    /// explicit per-conversation choice (`Ctrl+S` cycles Adele), never
-    /// config-seeded. Retained only so an existing `play_replies = true` line
-    /// keeps parsing rather than erroring.
-    pub play_replies: bool,
     pub audio: AudioConfig,
     pub vad: VadConfig,
     pub stt: SttConfig,
@@ -188,9 +175,9 @@ impl VoiceSession {
     /// step; call it once, lazily, on the first dictate.
     ///
     /// Whether replies are *spoken* is no longer a property of the session: the
-    /// per-conversation `Ctrl+S` speech toggle (adele-tui#73) governs that, with
-    /// its default seeded from `cfg.play_replies`. The session just supplies the
-    /// `Speaker`; the caller decides per conversation whether to use it.
+    /// per-conversation `Ctrl+S` speech toggle (adele-tui#73) governs that. The
+    /// session just supplies the `Speaker`; the caller decides per conversation
+    /// whether to use it.
     pub async fn build(cfg: &VoiceConfig) -> anyhow::Result<Self> {
         let dictation = build_dictation(&cfg.audio, &cfg.vad, &cfg.stt)?;
         let speaker = build_speaker(&cfg.tts, &cfg.audio).await;
@@ -225,7 +212,6 @@ mod tests {
         let cfg = VoiceConfig::default();
         assert_eq!(cfg.mode, VoiceMode::Off);
         assert!(!cfg.embedded_enabled());
-        assert!(!cfg.play_replies);
     }
 
     #[test]
@@ -243,12 +229,11 @@ mod tests {
     }
 
     #[test]
-    fn mode_daemon_parses_but_is_inert() {
-        // `daemon` is a valid toggle value but the TUI has no daemon voice
-        // client, so it must NOT turn on the embedded pipeline.
-        let cfg: VoiceConfig = toml::from_str(r#"mode = "daemon""#).unwrap();
-        assert_eq!(cfg.mode, VoiceMode::Daemon);
-        assert!(!cfg.embedded_enabled());
+    fn mode_daemon_is_no_longer_a_valid_value() {
+        // The inert `daemon` toggle value was removed (refactor #5): the TUI has
+        // no daemon voice *client*, so `daemon` only ever meant `off`. It's now a
+        // parse error, which `load()` turns into off + a warning.
+        assert!(toml::from_str::<VoiceConfig>(r#"mode = "daemon""#).is_err());
     }
 
     #[test]
@@ -270,6 +255,8 @@ mod tests {
     fn partial_config_keeps_section_defaults() {
         // Toggling voice on shouldn't force the user to spell out every model
         // path; the nested module sections fall back to their own defaults.
+        // A legacy `play_replies = true` line (the key was removed in refactor
+        // #5) is harmlessly ignored rather than failing the parse.
         let cfg: VoiceConfig = toml::from_str(
             r#"
                 mode = "embedded"
@@ -280,7 +267,6 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.embedded_enabled());
-        assert!(cfg.play_replies);
         assert_eq!(cfg.tts.backend, "piper");
         // Untouched sections still have sensible defaults.
         assert_eq!(cfg.stt.language, "en");

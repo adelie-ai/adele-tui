@@ -43,13 +43,12 @@ daemon if you want hands-free "Hey Adele").
 It is **off by default**. Enable it in `~/.config/adele-tui/voice.toml`:
 
 ```toml
-# off (default) | embedded | daemon
+# off (default) | embedded
 #   embedded — in-process dictation + playback (this feature)
-#   daemon   — reserved; the TUI has no daemon voice client, so it acts as off
 mode = "embedded"
 
-# Speak assistant replies aloud after they finish streaming.
-play_replies = false
+# Whether replies are spoken is a per-conversation choice (Ctrl+S cycles the
+# Adele output level), not a config setting.
 
 # All sections below are optional; each falls back to the same defaults the
 # voice daemon uses (models under $XDG_DATA_HOME/adele-voice/models).

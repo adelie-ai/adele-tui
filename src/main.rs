@@ -1332,8 +1332,13 @@ async fn handle_action(
         Action::SubmitPrompt => send_prompt_from_input(app, connector).await,
         // Dictation is handled in the event loop (it needs the embedded voice
         // session + a result channel + a spawned capture task — loop-local
-        // resources that don't belong in `handle_action`'s signature).
-        Action::Dictate => {}
+        // resources that don't belong in `handle_action`'s signature), which
+        // intercepts `Dictate` BEFORE dispatching here. This arm is therefore
+        // unreachable; assert that rather than silently swallowing the action, so
+        // a future routing change that lets `Dictate` slip through is caught.
+        Action::Dictate => {
+            unreachable!("Dictate is intercepted in the event loop, never dispatched")
+        }
         Action::CycleAdeleOutput => match app.cycle_current_adele_output() {
             Some(AdeleOutput::Disabled) => {
                 app.status_message =
