@@ -27,13 +27,12 @@
 
 use std::io;
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use desktop_assistant_api_model::{
     Command, CommandResult, ConnectionView, EffortLevel, ModelListing, PurposeConfigView,
     PurposeKindApi, PurposesView,
 };
-use desktop_assistant_client_common::TransportClient;
-use futures::StreamExt;
+use desktop_assistant_client_common::{SignalEvent, TransportClient};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -42,6 +41,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
+
+use crate::screen::Screen;
 
 const COLOR_BORDER: Color = Color::Rgb(82, 104, 173);
 const COLOR_BORDER_ACTIVE: Color = Color::Rgb(120, 183, 109);
@@ -186,46 +187,57 @@ struct State {
 }
 
 /// Run the purposes screen until the user closes it.
+/// The purposes view as a [`Screen`]: its [`State`] plus the borrowed client.
+/// The shared driver supplies the loop and drains daemon signals while the screen
+/// is open (TUI-12).
+struct PurposesScreen<'a> {
+    state: State,
+    client: &'a TransportClient,
+}
+
+impl Screen for PurposesScreen<'_> {
+    type Outcome = ();
+
+    fn draw(&mut self, frame: &mut Frame) {
+        draw(frame, &self.state);
+    }
+
+    async fn handle_key(&mut self, key: KeyEvent) {
+        match self.state.mode {
+            Mode::List => handle_list_key(&mut self.state, key, self.client).await,
+            Mode::Edit => handle_edit_key(&mut self.state, key, self.client).await,
+        }
+    }
+
+    fn take_outcome(&mut self) -> Option<()> {
+        self.state.closing.then_some(())
+    }
+}
+
 pub async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     client: &TransportClient,
+    signal_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SignalEvent>,
+    sink: &mut impl crate::screen::SignalSink,
 ) -> anyhow::Result<()> {
-    let mut state = State {
-        connections: Vec::new(),
-        models: Vec::new(),
-        purposes: PurposesView::default(),
-        selected_row: 0,
-        mode: Mode::List,
-        edit: EditState::from_view(PurposeKindApi::Interactive, None),
-        error: None,
-        busy: Some("Loading...".into()),
-        closing: false,
+    let mut screen = PurposesScreen {
+        state: State {
+            connections: Vec::new(),
+            models: Vec::new(),
+            purposes: PurposesView::default(),
+            selected_row: 0,
+            mode: Mode::List,
+            edit: EditState::from_view(PurposeKindApi::Interactive, None),
+            error: None,
+            busy: Some("Loading...".into()),
+            closing: false,
+        },
+        client,
     };
 
-    refresh_all(&mut state, client).await;
+    refresh_all(&mut screen.state, client).await;
 
-    let mut events = crossterm::event::EventStream::new();
-    loop {
-        terminal.draw(|f| draw(f, &state))?;
-
-        if state.closing {
-            return Ok(());
-        }
-
-        let evt = match events.next().await {
-            Some(Ok(e)) => e,
-            Some(Err(_)) | None => return Ok(()),
-        };
-        let Event::Key(key) = evt else { continue };
-        if key.kind == KeyEventKind::Release {
-            continue;
-        }
-
-        match state.mode {
-            Mode::List => handle_list_key(&mut state, key, client).await,
-            Mode::Edit => handle_edit_key(&mut state, key, client).await,
-        }
-    }
+    crate::screen::run_screen(terminal, &mut screen, signal_rx, sink).await
 }
 
 async fn refresh_all(state: &mut State, client: &TransportClient) {

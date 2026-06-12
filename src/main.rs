@@ -4,26 +4,6 @@
 //! daemon, and runs the interactive TUI event loop (chat plus the knowledge
 //! base, connections, and purposes management screens).
 
-mod app;
-mod client_tools;
-mod connections;
-mod credentials;
-mod kb;
-mod keys;
-mod markdown;
-mod model_selector;
-mod oauth;
-mod personality_selector;
-mod picker;
-mod profile;
-mod purposes;
-mod settings;
-mod tasks;
-mod toolbar;
-mod ui;
-mod voice;
-mod voice_client;
-
 use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -49,14 +29,25 @@ use tokio::{
     time::{Instant, sleep_until},
 };
 
+// The binary is a thin shim over the `adele` library crate (refactor #3): every
+// screen/widget/helper module lives in `lib.rs` and is reached via `adele::`,
+// not re-declared with `mod`, so there is ONE module tree instead of two that
+// compile twice and silently drift (the old `mod` list had already lost
+// `personality_selector` + `voice_client` from `lib.rs`). Only the orchestration
+// wiring them together (the `run` event loop, its RPC/signal helpers, the voice
+// plumbing types) lives in this file.
+use adele::app::{AdeleOutput, App, InputMode};
 use adele::in_flight::InFlight;
-use app::{AdeleOutput, App, InputMode};
-use keys::{Action, handle_key_event};
-use picker::PickerOutcome;
-use profile::ProfileStore;
-use settings::Settings;
-use voice::{VoiceConfig, VoiceSession};
-use voice_client::VoiceController;
+use adele::keys::{Action, handle_key_event};
+use adele::picker::PickerOutcome;
+use adele::profile::ProfileStore;
+use adele::settings::Settings;
+use adele::voice::{VoiceConfig, VoiceSession};
+use adele::voice_client::VoiceController;
+use adele::{
+    client_tools, connections, credentials, kb, model_selector, personality_selector, picker,
+    purposes, screen, ui, voice,
+};
 
 const DEFAULT_WS_URL: &str = desktop_assistant_client_common::config::DEFAULT_WS_URL;
 const DEFAULT_WS_SUBJECT: &str = desktop_assistant_client_common::config::DEFAULT_WS_SUBJECT;
@@ -400,18 +391,8 @@ async fn run(
     // instead of running with no connection.
     match Connector::connect(config).await {
         Ok(conn) => {
-            // Subscribe before any prompt so no early streaming chunk is lost.
-            signal_rx = conn.subscribe();
-            match conn.client().list_conversations().await {
-                Ok(convs) => app.set_conversations(convs),
-                Err(e) => app.status_message = format!("Error loading conversations: {e}"),
-            }
-            init_background_tasks(&mut app, conn.client()).await;
-            // Advertise the TUI's `say_this` client tool (adele-tui#73). Scoped
-            // to this session via desktop-assistant#261, so a concurrent voice
-            // session's tools never fire on a TUI turn.
-            register_client_tools(&conn).await;
-            app.status_message = conn.label().to_string();
+            signal_rx = subscribe_and_load(&mut app, &conn).await;
+            finish_connection_init(&mut app, &conn).await;
             connector = Some(Rc::new(conn));
         }
         Err(e) => {
@@ -480,13 +461,36 @@ async fn run(
             ReconnectState::Connected => None,
         };
 
+        // Sub-screens (TUI-12): each modal screen now runs over the shared
+        // `screen::run_screen` driver, which drains the daemon signal stream via
+        // `handle_signal` while the screen is open so a turn parked on the TUI's
+        // `say_this` client tool is answered immediately instead of stalling
+        // until the screen closes. A `Disconnected` that arrives mid-screen is
+        // recorded by the drain callback and actioned right after the screen
+        // returns (the teardown touches loop-local state the callback can't own).
         if app.kb_requested {
             app.kb_requested = false;
-            if let Some(conn) = connector.as_ref()
-                && let Err(e) = kb::run(terminal, conn.client()).await
-            {
-                app.status_message = format!("KB error: {e}");
+            let mut disconnect: Option<String> = None;
+            if let Some(conn) = connector.clone() {
+                let mut sink = SubScreenSink {
+                    app: &mut app,
+                    connector: &connector,
+                    voice_daemon: &voice_daemon,
+                    voice_session: &voice_session,
+                    narration_tx: &narration_tx,
+                    disconnect: &mut disconnect,
+                };
+                if let Err(e) = kb::run(terminal, conn.client(), &mut signal_rx, &mut sink).await {
+                    sink.app.status_message = format!("KB error: {e}");
+                }
             }
+            apply_sub_screen_disconnect(
+                &mut app,
+                &mut connector,
+                &mut signal_rx,
+                &mut reconnect,
+                disconnect,
+            );
             // Force a redraw on the next iteration so the chat reappears
             // immediately instead of waiting for the next event.
             continue;
@@ -494,69 +498,157 @@ async fn run(
 
         if app.connections_requested {
             app.connections_requested = false;
-            if let Some(conn) = connector.as_ref()
-                && let Err(e) = connections::run(terminal, conn.client()).await
-            {
-                app.status_message = format!("Connections error: {e}");
+            let mut disconnect: Option<String> = None;
+            if let Some(conn) = connector.clone() {
+                let mut sink = SubScreenSink {
+                    app: &mut app,
+                    connector: &connector,
+                    voice_daemon: &voice_daemon,
+                    voice_session: &voice_session,
+                    narration_tx: &narration_tx,
+                    disconnect: &mut disconnect,
+                };
+                if let Err(e) =
+                    connections::run(terminal, conn.client(), &mut signal_rx, &mut sink).await
+                {
+                    sink.app.status_message = format!("Connections error: {e}");
+                }
             }
+            apply_sub_screen_disconnect(
+                &mut app,
+                &mut connector,
+                &mut signal_rx,
+                &mut reconnect,
+                disconnect,
+            );
             continue;
         }
 
         if app.purposes_requested {
             app.purposes_requested = false;
-            if let Some(conn) = connector.as_ref()
-                && let Err(e) = purposes::run(terminal, conn.client()).await
-            {
-                app.status_message = format!("Purposes error: {e}");
+            let mut disconnect: Option<String> = None;
+            if let Some(conn) = connector.clone() {
+                let mut sink = SubScreenSink {
+                    app: &mut app,
+                    connector: &connector,
+                    voice_daemon: &voice_daemon,
+                    voice_session: &voice_session,
+                    narration_tx: &narration_tx,
+                    disconnect: &mut disconnect,
+                };
+                if let Err(e) =
+                    purposes::run(terminal, conn.client(), &mut signal_rx, &mut sink).await
+                {
+                    sink.app.status_message = format!("Purposes error: {e}");
+                }
             }
+            apply_sub_screen_disconnect(
+                &mut app,
+                &mut connector,
+                &mut signal_rx,
+                &mut reconnect,
+                disconnect,
+            );
             continue;
         }
 
         if app.model_picker_requested {
             app.model_picker_requested = false;
-            if let Some(conn) = connector.as_ref() {
-                let client = conn.client();
+            let mut disconnect: Option<String> = None;
+            let mut picked_outcome = None;
+            if let Some(conn) = connector.clone() {
                 let current = app
                     .current_conversation
                     .as_ref()
                     .and_then(|c| c.model_selection.clone());
-                match model_selector::run(terminal, client, current).await {
-                    Ok(model_selector::Outcome::Selected(picked)) => {
-                        let label = format!("{} · {}", picked.connection_id, picked.model_id);
-                        app.apply_model_override(picked);
-                        app.status_message = format!("Model: {label} (applies to next message)");
-                    }
-                    Ok(model_selector::Outcome::Cancelled) => {}
-                    Err(e) => app.status_message = format!("Model picker error: {e}"),
+                let mut sink = SubScreenSink {
+                    app: &mut app,
+                    connector: &connector,
+                    voice_daemon: &voice_daemon,
+                    voice_session: &voice_session,
+                    narration_tx: &narration_tx,
+                    disconnect: &mut disconnect,
+                };
+                match model_selector::run(
+                    terminal,
+                    conn.client(),
+                    current,
+                    &mut signal_rx,
+                    &mut sink,
+                )
+                .await
+                {
+                    Ok(outcome) => picked_outcome = Some(outcome),
+                    Err(e) => sink.app.status_message = format!("Model picker error: {e}"),
                 }
             }
+            // Apply the selection AFTER the sink's borrow of `app` ends.
+            if let Some(model_selector::Outcome::Selected(picked)) = picked_outcome {
+                let label = format!("{} · {}", picked.connection_id, picked.model_id);
+                app.apply_model_override(picked);
+                app.status_message = format!("Model: {label} (applies to next message)");
+            }
+            apply_sub_screen_disconnect(
+                &mut app,
+                &mut connector,
+                &mut signal_rx,
+                &mut reconnect,
+                disconnect,
+            );
             continue;
         }
 
         if app.personality_picker_requested {
             app.personality_picker_requested = false;
+            let mut disconnect: Option<String> = None;
+            let mut saved_outcome = None;
             // Only reachable with a loaded conversation (handle_action gates on
             // `current_conversation`), but re-check so the borrow stays clean.
-            if let (Some(conn), Some(conv)) =
-                (connector.as_ref(), app.current_conversation.as_ref())
-            {
-                let conv_id = conv.id.clone();
-                let current = conv.conversation_personality;
-                match personality_selector::run(terminal, conn.client(), conv_id, current).await {
-                    Ok(personality_selector::Outcome::Saved(stored)) => {
-                        if let Some(c) = app.current_conversation.as_mut() {
-                            c.conversation_personality = Some(stored);
-                        }
-                        app.status_message = if stored == Default::default() {
-                            "Personality cleared (using global)".into()
-                        } else {
-                            "Personality saved for this conversation".into()
-                        };
-                    }
-                    Ok(personality_selector::Outcome::Cancelled) => {}
-                    Err(e) => app.status_message = format!("Personality picker error: {e}"),
+            let conv_info = app
+                .current_conversation
+                .as_ref()
+                .map(|conv| (conv.id.clone(), conv.conversation_personality));
+            if let (Some(conn), Some((conv_id, current))) = (connector.clone(), conv_info) {
+                let mut sink = SubScreenSink {
+                    app: &mut app,
+                    connector: &connector,
+                    voice_daemon: &voice_daemon,
+                    voice_session: &voice_session,
+                    narration_tx: &narration_tx,
+                    disconnect: &mut disconnect,
+                };
+                match personality_selector::run(
+                    terminal,
+                    conn.client(),
+                    conv_id,
+                    current,
+                    &mut signal_rx,
+                    &mut sink,
+                )
+                .await
+                {
+                    Ok(outcome) => saved_outcome = Some(outcome),
+                    Err(e) => sink.app.status_message = format!("Personality picker error: {e}"),
                 }
             }
+            // Apply the result AFTER the sink's borrow of `app` ends.
+            if let Some(personality_selector::Outcome::Saved(stored)) = saved_outcome {
+                if let Some(c) = app.current_conversation.as_mut() {
+                    c.conversation_personality = Some(stored);
+                }
+                app.status_message = if stored == Default::default() {
+                    "Personality cleared (using global)".into()
+                } else {
+                    "Personality saved for this conversation".into()
+                };
+            }
+            apply_sub_screen_disconnect(
+                &mut app,
+                &mut connector,
+                &mut signal_rx,
+                &mut reconnect,
+                disconnect,
+            );
             continue;
         }
 
@@ -630,123 +722,34 @@ async fn run(
                 }
             }
             Some(signal) = signal_rx.recv() => {
-                match signal {
-                    SignalEvent::Chunk { request_id, chunk } => {
-                        app.receive_chunk(&request_id, &chunk);
-                    }
-                    SignalEvent::Complete { request_id, full_response } => {
-                        // `complete_streaming` reports the ORIGINATING
-                        // conversation (TUI-4) — the one the prompt was sent
-                        // to, not whichever is open now — and the narration
-                        // gate (adele-tui#77: `Adele == Always` OR `Adele ==
-                        // OnDemand` AND `You == Enabled`) is evaluated against
-                        // THAT conversation's settings. Routed daemon-first +
-                        // chunked through the single narration queue (TUI-11) so
-                        // it can't interleave with a `say_this` aside; the queue
-                        // task speaks it so synth never blocks the UI. Gated
-                        // entirely here so the cut-off holds: when the gate is
-                        // false nothing is spoken on any path.
-                        let origin = app.complete_streaming(&request_id, &full_response);
-                        if let Some(origin) = origin
-                            && app.narrate_for(&origin)
-                            && !full_response.trim().is_empty()
-                        {
-                            enqueue_narration(
-                                &narration_tx,
-                                &voice_daemon,
-                                &voice_session,
-                                full_response,
-                            );
-                        }
-                    }
-                    SignalEvent::Error { request_id, error } => {
-                        app.streaming_error(&request_id, &error);
-                        app.status_message = format!("Error: {error}");
-                    }
-                    SignalEvent::Status { request_id: _, message } => {
-                        app.set_assistant_status(message);
-                    }
-                    SignalEvent::TitleChanged { conversation_id, title } => {
-                        app.update_conversation_title(&conversation_id, &title);
-                    }
-                    SignalEvent::Disconnected { reason } => {
-                        // Drop the connector (closing its transport + fanout
-                        // task) and reset to the not-connected sentinel receiver
-                        // so the backoff loop owns reconnection. Any in-flight
-                        // stream died with the connection (TUI-8): clear it so
-                        // no frozen ▌ buffer lingers and the ack sentinel can't
-                        // mis-claim the first post-reconnect stream.
-                        app.clear_streaming_state();
-                        connector = None;
-                        signal_rx = unbounded_channel().1;
-                        reconnect = schedule_reconnect(None);
-                        app.status_message = format!(
-                            "Disconnected: {reason}. Reconnecting in {RECONNECT_INITIAL_SECS}s..."
-                        );
-                    }
-                    SignalEvent::ConversationWarning { warning, .. } => {
-                        // Currently only the dangling-model-selection warning is
-                        // emitted. Surface a hint in the status bar; richer
-                        // handling (auto-pick fallback, etc.) belongs upstream
-                        // with the per-conversation model selector (#1).
-                        app.status_message = format!("Warning: {warning:?}");
-                    }
-                    // --- Background task events (issue #45 / desktop-assistant#114) ---
-                    //
-                    // Each event is forwarded verbatim into `app.tasks`. The
-                    // map's invariants are enforced inside `TaskPane` so this
-                    // call site stays one-liner-thin.
-                    SignalEvent::TaskStarted { task } => {
-                        app.tasks.apply_task_started(task);
-                    }
-                    SignalEvent::TaskProgress { id, progress_hint } => {
-                        app.tasks.apply_task_progress(&id, progress_hint);
-                    }
-                    SignalEvent::TaskLogAppended { id, entry } => {
-                        app.tasks.apply_task_log_appended(&id, entry);
-                    }
-                    SignalEvent::TaskCompleted { id, .. } => {
-                        // Clear the cancel spinner if we were waiting on this
-                        // task; the terminal event is the authoritative
-                        // resolution.
-                        if app.pending_task_cancel.as_ref().map(|t| t.0.as_str()) == Some(id.as_str()) {
-                            app.pending_task_cancel = None;
-                        }
-                        app.tasks.apply_task_completed(&id);
-                    }
-                    // The TUI has no scratchpad pane (that lives in the GTK/KDE
-                    // clients), so the change notification is a no-op here.
-                    SignalEvent::ScratchpadChanged { .. } => {}
-                    // The daemon suspended a turn on a client-local tool (#107)
-                    // — the TUI registers `say_this` (adele-tui#73). Dispatch
-                    // it, perform the side effect (speak / show inline), and
-                    // ALWAYS submit a result so the parked turn resumes. With
-                    // the per-session registry (desktop-assistant#261) a
-                    // concurrent voice session's tools no longer fire here.
-                    SignalEvent::ClientToolCall {
-                        task_id,
-                        conversation_id,
-                        tool_call_id,
-                        tool_name,
-                        arguments,
-                    } => {
-                        let call = client_tools::ClientToolCall {
-                            task_id,
-                            conversation_id,
-                            tool_call_id,
-                            tool_name,
-                            arguments,
-                        };
-                        handle_client_tool_call(
-                            &mut app,
-                            &connector,
-                            &voice_daemon,
-                            &voice_session,
-                            &narration_tx,
-                            call,
-                        )
-                        .await;
-                    }
+                // All signal handling lives in `handle_signal` (shared with the
+                // sub-screen driver, TUI-12) — it touches only `App` + the voice
+                // plumbing. The one thing it can't own is the loop-local
+                // connection teardown a `Disconnected` triggers, so it reports
+                // that back for the main loop to action here.
+                if let SignalAction::Disconnected { reason } = handle_signal(
+                    &mut app,
+                    &connector,
+                    &voice_daemon,
+                    &voice_session,
+                    &narration_tx,
+                    signal,
+                )
+                .await
+                {
+                    // Drop the connector (closing its transport + fanout task)
+                    // and reset to the not-connected sentinel receiver so the
+                    // backoff loop owns reconnection. Any in-flight stream died
+                    // with the connection (TUI-8): clear it so no frozen ▌ buffer
+                    // lingers and the ack sentinel can't mis-claim the first
+                    // post-reconnect stream.
+                    app.clear_streaming_state();
+                    connector = None;
+                    signal_rx = unbounded_channel().1;
+                    reconnect = schedule_reconnect(None);
+                    app.status_message = format!(
+                        "Disconnected: {reason}. Reconnecting in {RECONNECT_INITIAL_SECS}s..."
+                    );
                 }
             }
             _ = async {
@@ -762,12 +765,9 @@ async fn run(
                 app.status_message = "Reconnecting...".to_string();
                 match Connector::connect(config).await {
                     Ok(conn) => {
-                        // Subscribe before any prompt so no early chunk is lost.
-                        signal_rx = conn.subscribe();
-                        match conn.client().list_conversations().await {
-                            Ok(convs) => app.set_conversations(convs),
-                            Err(e) => app.status_message = format!("Error loading conversations: {e}"),
-                        }
+                        // Subscribe + refresh the sidebar first (so the resync's
+                        // by-id reselect runs against the FRESH list).
+                        signal_rx = subscribe_and_load(&mut app, &conn).await;
                         // Resync the open conversation after the gap (TUI-8):
                         // re-fetch its transcript (turns may have completed
                         // while we were away — the dead stream's reply only
@@ -786,12 +786,8 @@ async fn run(
                                 }
                             }
                         }
-                        init_background_tasks(&mut app, conn.client()).await;
-                        // Re-advertise client tools — the daemon replaces the
-                        // per-session set on each connect (adele-tui#73 / #231).
-                        register_client_tools(&conn).await;
+                        finish_connection_init(&mut app, &conn).await;
                         reconnect = ReconnectState::Connected;
-                        app.status_message = conn.label().to_string();
                         connector = Some(Rc::new(conn));
                     }
                     Err(e) => {
@@ -1001,6 +997,200 @@ fn apply_rpc_outcome(app: &mut App, outcome: RpcOutcome) {
     }
 }
 
+/// What [`handle_signal`] asks its caller to do after handling a signal. Almost
+/// every signal is fully handled inside `handle_signal` (it mutates `App` and the
+/// voice plumbing it was given) and yields [`SignalAction::None`]. The sole
+/// exception is `Disconnected`, whose connection teardown touches loop-local
+/// state (`connector`, `signal_rx`, `reconnect`) that `handle_signal` doesn't
+/// own — so it reports the reason back and the loop performs the teardown.
+enum SignalAction {
+    None,
+    Disconnected { reason: String },
+}
+
+/// Apply one daemon [`SignalEvent`] to `App` (+ voice). Extracted from the main
+/// `select!` so it can be reused by the sub-screen driver (TUI-12): while a modal
+/// screen is open, [`screen::run_screen`] drains the signal stream through this
+/// same function, so a turn parked on the TUI's `say_this` client tool is
+/// answered immediately instead of looking hung until the screen closes.
+///
+/// It deliberately handles only what depends on `App`/voice; the `Disconnected`
+/// teardown (loop-local) is returned for the caller to perform. During a
+/// sub-screen the sub-screen driver propagates that outcome so the disconnect is
+/// actioned once the screen returns.
+async fn handle_signal(
+    app: &mut App,
+    connector: &Option<Rc<Connector>>,
+    voice_daemon: &VoiceController,
+    voice_session: &Option<VoiceSession>,
+    narration_tx: &UnboundedSender<NarrationRequest>,
+    signal: SignalEvent,
+) -> SignalAction {
+    match signal {
+        SignalEvent::Chunk { request_id, chunk } => {
+            app.receive_chunk(&request_id, &chunk);
+        }
+        SignalEvent::Complete {
+            request_id,
+            full_response,
+        } => {
+            // `complete_streaming` reports the ORIGINATING conversation (TUI-4) —
+            // the one the prompt was sent to, not whichever is open now — and the
+            // narration gate (adele-tui#77: `Adele == Always` OR `Adele ==
+            // OnDemand` AND `You == Enabled`) is evaluated against THAT
+            // conversation's settings. Routed daemon-first + chunked through the
+            // single narration queue (TUI-11) so it can't interleave with a
+            // `say_this` aside; the queue task speaks it so synth never blocks the
+            // UI. Gated entirely here so the cut-off holds: when the gate is false
+            // nothing is spoken on any path.
+            let origin = app.complete_streaming(&request_id, &full_response);
+            if let Some(origin) = origin
+                && app.narrate_for(&origin)
+                && !full_response.trim().is_empty()
+            {
+                enqueue_narration(narration_tx, voice_daemon, voice_session, full_response);
+            }
+        }
+        SignalEvent::Error { request_id, error } => {
+            app.streaming_error(&request_id, &error);
+            app.status_message = format!("Error: {error}");
+        }
+        SignalEvent::Status {
+            request_id: _,
+            message,
+        } => {
+            app.set_assistant_status(message);
+        }
+        SignalEvent::TitleChanged {
+            conversation_id,
+            title,
+        } => {
+            app.update_conversation_title(&conversation_id, &title);
+        }
+        SignalEvent::Disconnected { reason } => {
+            return SignalAction::Disconnected { reason };
+        }
+        SignalEvent::ConversationWarning { warning, .. } => {
+            // Currently only the dangling-model-selection warning is emitted.
+            // Surface a hint in the status bar; richer handling (auto-pick
+            // fallback, etc.) belongs upstream with the per-conversation model
+            // selector (#1).
+            app.status_message = format!("Warning: {warning:?}");
+        }
+        // --- Background task events (issue #45 / desktop-assistant#114) ---
+        //
+        // Each event is forwarded verbatim into `app.tasks`. The map's invariants
+        // are enforced inside `TaskPane` so this call site stays one-liner-thin.
+        SignalEvent::TaskStarted { task } => {
+            app.tasks.apply_task_started(task);
+        }
+        SignalEvent::TaskProgress { id, progress_hint } => {
+            app.tasks.apply_task_progress(&id, progress_hint);
+        }
+        SignalEvent::TaskLogAppended { id, entry } => {
+            app.tasks.apply_task_log_appended(&id, entry);
+        }
+        SignalEvent::TaskCompleted { id, .. } => {
+            // Clear the cancel spinner if we were waiting on this task; the
+            // terminal event is the authoritative resolution.
+            if app.pending_task_cancel.as_ref().map(|t| t.0.as_str()) == Some(id.as_str()) {
+                app.pending_task_cancel = None;
+            }
+            app.tasks.apply_task_completed(&id);
+        }
+        // The TUI has no scratchpad pane (that lives in the GTK/KDE clients), so
+        // the change notification is a no-op here.
+        SignalEvent::ScratchpadChanged { .. } => {}
+        // The daemon suspended a turn on a client-local tool (#107) — the TUI
+        // registers `say_this` (adele-tui#73). Dispatch it, perform the side
+        // effect (speak / show inline), and ALWAYS submit a result so the parked
+        // turn resumes. With the per-session registry (desktop-assistant#261) a
+        // concurrent voice session's tools no longer fire here. Draining this
+        // while a sub-screen is open is the whole point of TUI-12.
+        SignalEvent::ClientToolCall {
+            task_id,
+            conversation_id,
+            tool_call_id,
+            tool_name,
+            arguments,
+        } => {
+            let call = client_tools::ClientToolCall {
+                task_id,
+                conversation_id,
+                tool_call_id,
+                tool_name,
+                arguments,
+            };
+            handle_client_tool_call(
+                app,
+                connector,
+                voice_daemon,
+                voice_session,
+                narration_tx,
+                call,
+            )
+            .await;
+        }
+    }
+    SignalAction::None
+}
+
+/// The [`SignalSink`](screen::SignalSink) used while a modal sub-screen is open
+/// (TUI-12): it forwards each drained signal through the same [`handle_signal`]
+/// the chat loop uses, so a parked `say_this` turn is answered immediately. A
+/// `Disconnected` can't be torn down here (the connection state is loop-local),
+/// so its reason is stashed in `disconnect` for [`apply_sub_screen_disconnect`]
+/// to action once the screen returns.
+struct SubScreenSink<'a> {
+    app: &'a mut App,
+    connector: &'a Option<Rc<Connector>>,
+    voice_daemon: &'a VoiceController,
+    voice_session: &'a Option<VoiceSession>,
+    narration_tx: &'a UnboundedSender<NarrationRequest>,
+    disconnect: &'a mut Option<String>,
+}
+
+impl screen::SignalSink for SubScreenSink<'_> {
+    async fn handle(&mut self, signal: SignalEvent) {
+        if let SignalAction::Disconnected { reason } = handle_signal(
+            self.app,
+            self.connector,
+            self.voice_daemon,
+            self.voice_session,
+            self.narration_tx,
+            signal,
+        )
+        .await
+        {
+            // Keep the FIRST disconnect reason; further signals on a dead
+            // connection are moot (the stream is about to be torn down anyway).
+            self.disconnect.get_or_insert(reason);
+        }
+    }
+}
+
+/// Action a disconnect that arrived while a sub-screen was open (TUI-12). Same
+/// teardown the chat loop's `Disconnected` arm performs: drop the connector,
+/// reset to the not-connected sentinel receiver, and schedule reconnect. No-op
+/// when `reason` is `None` (the common case — no disconnect occurred).
+fn apply_sub_screen_disconnect(
+    app: &mut App,
+    connector: &mut Option<Rc<Connector>>,
+    signal_rx: &mut UnboundedReceiver<SignalEvent>,
+    reconnect: &mut ReconnectState,
+    reason: Option<String>,
+) {
+    let Some(reason) = reason else {
+        return;
+    };
+    app.clear_streaming_state();
+    *connector = None;
+    *signal_rx = unbounded_channel().1;
+    *reconnect = schedule_reconnect(None);
+    app.status_message =
+        format!("Disconnected: {reason}. Reconnecting in {RECONNECT_INITIAL_SECS}s...");
+}
+
 async fn handle_action(
     app: &mut App,
     connector: &Option<Rc<Connector>>,
@@ -1115,8 +1305,13 @@ async fn handle_action(
         Action::SubmitPrompt => send_prompt_from_input(app, connector).await,
         // Dictation is handled in the event loop (it needs the embedded voice
         // session + a result channel + a spawned capture task — loop-local
-        // resources that don't belong in `handle_action`'s signature).
-        Action::Dictate => {}
+        // resources that don't belong in `handle_action`'s signature), which
+        // intercepts `Dictate` BEFORE dispatching here. This arm is therefore
+        // unreachable; assert that rather than silently swallowing the action, so
+        // a future routing change that lets `Dictate` slip through is caught.
+        Action::Dictate => {
+            unreachable!("Dictate is intercepted in the event loop, never dispatched")
+        }
         Action::CycleAdeleOutput => match app.cycle_current_adele_output() {
             Some(AdeleOutput::Disabled) => {
                 app.status_message =
@@ -1509,6 +1704,37 @@ async fn handle_client_tool_call(
         // disconnect; surface it rather than failing silently.
         app.status_message = "Client tool call arrived while disconnected".into();
     }
+}
+
+/// First half of bringing a freshly-`Connector::connect`ed connection online
+/// (refactor #4): subscribe to its signal stream and load the conversation list.
+/// Returns the new `signal_rx` for the event loop.
+///
+/// Subscribing happens *before* anything else so no early streaming chunk is lost
+/// (the connector buffers from subscribe onward). Split from
+/// [`finish_connection_init`] so the reconnect path can slot its open-conversation
+/// resync between the two — the resync's by-id reselect must run against the list
+/// this loads.
+async fn subscribe_and_load(app: &mut App, conn: &Connector) -> UnboundedReceiver<SignalEvent> {
+    let signal_rx = conn.subscribe();
+    match conn.client().list_conversations().await {
+        Ok(convs) => app.set_conversations(convs),
+        Err(e) => app.status_message = format!("Error loading conversations: {e}"),
+    }
+    signal_rx
+}
+
+/// Second half of bringing a connection online (refactor #4): populate the tasks
+/// pane, (re)advertise the TUI's client tools, and show the connection label.
+///
+/// The daemon scopes client tools per session and replaces the whole set on each
+/// connect (adele-tui#73 / desktop-assistant#261 / #231), so this runs on every
+/// (re)connect, not just the first. Shared verbatim by the initial-connect and
+/// reconnect paths so the two can't drift.
+async fn finish_connection_init(app: &mut App, conn: &Connector) {
+    init_background_tasks(app, conn.client()).await;
+    register_client_tools(conn).await;
+    app.status_message = conn.label().to_string();
 }
 
 /// Advertise the TUI's client tools to the daemon: `say_this` (adele-tui#73)

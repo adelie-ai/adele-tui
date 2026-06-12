@@ -21,10 +21,9 @@
 
 use std::io;
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent};
 use desktop_assistant_api_model::{ConversationPersonalityView, PersonalityLevel};
-use desktop_assistant_client_common::TransportClient;
-use futures::StreamExt;
+use desktop_assistant_client_common::{SignalEvent, TransportClient};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -33,6 +32,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
+
+use crate::screen::Screen;
 
 const COLOR_BORDER: Color = Color::Rgb(82, 104, 173);
 const COLOR_TITLE: Color = Color::Rgb(166, 182, 255);
@@ -130,10 +131,13 @@ fn level_label(level: Option<PersonalityLevel>) -> &'static str {
 }
 
 /// Outcome of running the picker.
+#[derive(Default)]
 pub enum Outcome {
     /// User saved. Carries the override the daemon stored (all-`None` = cleared).
     Saved(ConversationPersonalityView),
-    /// User pressed Esc / q without saving.
+    /// User pressed Esc / q without saving. The default outcome — also what the
+    /// shared driver returns if the input stream ends.
+    #[default]
     Cancelled,
 }
 
@@ -148,39 +152,51 @@ struct State {
 }
 
 /// Run the picker until the user saves or cancels.
+/// The personality picker as a [`Screen`]: its [`State`] plus the borrowed
+/// client. The shared driver supplies the loop and drains daemon signals while
+/// the picker is open (TUI-12).
+struct PersonalityScreen<'a> {
+    state: State,
+    client: &'a TransportClient,
+}
+
+impl Screen for PersonalityScreen<'_> {
+    type Outcome = Outcome;
+
+    fn draw(&mut self, frame: &mut Frame) {
+        draw(frame, &self.state);
+    }
+
+    async fn handle_key(&mut self, key: KeyEvent) {
+        handle_key(&mut self.state, key, self.client).await;
+    }
+
+    fn take_outcome(&mut self) -> Option<Outcome> {
+        self.state.outcome.take()
+    }
+}
+
 pub async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     client: &TransportClient,
     conversation_id: String,
     current: Option<ConversationPersonalityView>,
+    signal_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SignalEvent>,
+    sink: &mut impl crate::screen::SignalSink,
 ) -> anyhow::Result<Outcome> {
-    let mut state = State {
-        conversation_id,
-        draft: current.unwrap_or_default(),
-        selected: 0,
-        error: None,
-        busy: None,
-        outcome: None,
+    let mut screen = PersonalityScreen {
+        state: State {
+            conversation_id,
+            draft: current.unwrap_or_default(),
+            selected: 0,
+            error: None,
+            busy: None,
+            outcome: None,
+        },
+        client,
     };
 
-    let mut events = crossterm::event::EventStream::new();
-    loop {
-        terminal.draw(|f| draw(f, &state))?;
-
-        if let Some(outcome) = state.outcome.take() {
-            return Ok(outcome);
-        }
-
-        let evt = match events.next().await {
-            Some(Ok(e)) => e,
-            Some(Err(_)) | None => return Ok(Outcome::Cancelled),
-        };
-        let Event::Key(key) = evt else { continue };
-        if key.kind == KeyEventKind::Release {
-            continue;
-        }
-        handle_key(&mut state, key, client).await;
-    }
+    crate::screen::run_screen(terminal, &mut screen, signal_rx, sink).await
 }
 
 async fn handle_key(state: &mut State, key: KeyEvent, client: &TransportClient) {
