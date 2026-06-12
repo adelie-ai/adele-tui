@@ -391,18 +391,8 @@ async fn run(
     // instead of running with no connection.
     match Connector::connect(config).await {
         Ok(conn) => {
-            // Subscribe before any prompt so no early streaming chunk is lost.
-            signal_rx = conn.subscribe();
-            match conn.client().list_conversations().await {
-                Ok(convs) => app.set_conversations(convs),
-                Err(e) => app.status_message = format!("Error loading conversations: {e}"),
-            }
-            init_background_tasks(&mut app, conn.client()).await;
-            // Advertise the TUI's `say_this` client tool (adele-tui#73). Scoped
-            // to this session via desktop-assistant#261, so a concurrent voice
-            // session's tools never fire on a TUI turn.
-            register_client_tools(&conn).await;
-            app.status_message = conn.label().to_string();
+            signal_rx = subscribe_and_load(&mut app, &conn).await;
+            finish_connection_init(&mut app, &conn).await;
             connector = Some(Rc::new(conn));
         }
         Err(e) => {
@@ -775,12 +765,9 @@ async fn run(
                 app.status_message = "Reconnecting...".to_string();
                 match Connector::connect(config).await {
                     Ok(conn) => {
-                        // Subscribe before any prompt so no early chunk is lost.
-                        signal_rx = conn.subscribe();
-                        match conn.client().list_conversations().await {
-                            Ok(convs) => app.set_conversations(convs),
-                            Err(e) => app.status_message = format!("Error loading conversations: {e}"),
-                        }
+                        // Subscribe + refresh the sidebar first (so the resync's
+                        // by-id reselect runs against the FRESH list).
+                        signal_rx = subscribe_and_load(&mut app, &conn).await;
                         // Resync the open conversation after the gap (TUI-8):
                         // re-fetch its transcript (turns may have completed
                         // while we were away — the dead stream's reply only
@@ -799,12 +786,8 @@ async fn run(
                                 }
                             }
                         }
-                        init_background_tasks(&mut app, conn.client()).await;
-                        // Re-advertise client tools — the daemon replaces the
-                        // per-session set on each connect (adele-tui#73 / #231).
-                        register_client_tools(&conn).await;
+                        finish_connection_init(&mut app, &conn).await;
                         reconnect = ReconnectState::Connected;
-                        app.status_message = conn.label().to_string();
                         connector = Some(Rc::new(conn));
                     }
                     Err(e) => {
@@ -1721,6 +1704,37 @@ async fn handle_client_tool_call(
         // disconnect; surface it rather than failing silently.
         app.status_message = "Client tool call arrived while disconnected".into();
     }
+}
+
+/// First half of bringing a freshly-`Connector::connect`ed connection online
+/// (refactor #4): subscribe to its signal stream and load the conversation list.
+/// Returns the new `signal_rx` for the event loop.
+///
+/// Subscribing happens *before* anything else so no early streaming chunk is lost
+/// (the connector buffers from subscribe onward). Split from
+/// [`finish_connection_init`] so the reconnect path can slot its open-conversation
+/// resync between the two — the resync's by-id reselect must run against the list
+/// this loads.
+async fn subscribe_and_load(app: &mut App, conn: &Connector) -> UnboundedReceiver<SignalEvent> {
+    let signal_rx = conn.subscribe();
+    match conn.client().list_conversations().await {
+        Ok(convs) => app.set_conversations(convs),
+        Err(e) => app.status_message = format!("Error loading conversations: {e}"),
+    }
+    signal_rx
+}
+
+/// Second half of bringing a connection online (refactor #4): populate the tasks
+/// pane, (re)advertise the TUI's client tools, and show the connection label.
+///
+/// The daemon scopes client tools per session and replaces the whole set on each
+/// connect (adele-tui#73 / desktop-assistant#261 / #231), so this runs on every
+/// (re)connect, not just the first. Shared verbatim by the initial-connect and
+/// reconnect paths so the two can't drift.
+async fn finish_connection_init(app: &mut App, conn: &Connector) {
+    init_background_tasks(app, conn.client()).await;
+    register_client_tools(conn).await;
+    app.status_message = conn.label().to_string();
 }
 
 /// Advertise the TUI's client tools to the daemon: `say_this` (adele-tui#73)
