@@ -7,6 +7,84 @@ use ratatui_textarea::{CursorMove, DataCursor, TextArea};
 
 use crate::tasks::TaskPane;
 
+/// Context-window fill for the current conversation (desktop-assistant#341).
+/// Mirrors the daemon's `SignalEvent::ContextUsage` — token COUNTS only, no
+/// content. Drives the read-only status-bar indicator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextUsageView {
+    pub used_tokens: u64,
+    pub budget_tokens: u64,
+    pub compaction_active: bool,
+}
+
+/// Colour bucket for the context-fill indicator, decided by the daemon's
+/// proactive-compaction line (0.85 of budget). Green below 0.85, amber from
+/// 0.85 up to budget, red at/over budget (overflow).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextFillLevel {
+    Green,
+    Amber,
+    Red,
+}
+
+/// The proactive-compaction ratio the daemon uses (`COMPACTION_TOKEN_RATIO`).
+/// Kept in sync deliberately — this is the colour-threshold contract, not a
+/// recomputation of the budget (the daemon owns the numbers).
+const COMPACTION_RATIO: f64 = 0.85;
+
+impl ContextUsageView {
+    /// Fraction of budget consumed (0.0..). May exceed 1.0 on overflow.
+    /// Returns 0.0 for a zero/unknown budget to avoid a divide-by-zero and
+    /// to render neutrally rather than imply false precision.
+    pub fn fraction(&self) -> f64 {
+        if self.budget_tokens == 0 {
+            0.0
+        } else {
+            self.used_tokens as f64 / self.budget_tokens as f64
+        }
+    }
+
+    pub fn level(&self) -> ContextFillLevel {
+        let f = self.fraction();
+        if f >= 1.0 {
+            ContextFillLevel::Red
+        } else if f >= COMPACTION_RATIO {
+            // Inclusive at exactly 0.85: the daemon's strict-`>` compaction
+            // gate means we are AT the line, the moment to warn (amber).
+            ContextFillLevel::Amber
+        } else {
+            ContextFillLevel::Green
+        }
+    }
+
+    /// Compact human readout, e.g. `12k / 32k (38%)`. A trailing `⟳` marks an
+    /// active compaction/windowing pass. Budgets below 10k show exact counts;
+    /// larger ones are abbreviated to `k` for width.
+    pub fn readout(&self) -> String {
+        let pct = (self.fraction() * 100.0).round() as u64;
+        let mut s = format!(
+            "{} / {} ({pct}%)",
+            abbrev_tokens(self.used_tokens),
+            abbrev_tokens(self.budget_tokens),
+        );
+        if self.compaction_active {
+            s.push_str(" ⟳");
+        }
+        s
+    }
+}
+
+/// Abbreviate a token count for the narrow status bar: `12000 -> "12k"`,
+/// `512 -> "512"`. One decimal under 10k-with-fraction is avoided to keep it
+/// terse; this is a glanceable instrument, not an accounting figure.
+fn abbrev_tokens(n: u64) -> String {
+    if n >= 1_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        n.to_string()
+    }
+}
+
 fn new_textarea() -> TextArea<'static> {
     let mut ta = TextArea::default();
     ta.set_cursor_line_style(Style::default());
@@ -141,6 +219,12 @@ pub struct App {
     /// errors. Distinct from `status_message`, which is sticky user-facing
     /// feedback.
     pub assistant_status: Option<String>,
+    /// Most recent context-window fill for the open conversation (#341).
+    /// Updated by `SignalEvent::ContextUsage` each turn; cleared when the
+    /// open conversation changes so a stale reading never bleeds across
+    /// conversations. `None` = no reading yet (budget unknown / pre-first-turn),
+    /// rendered as nothing.
+    pub context_usage: Option<ContextUsageView>,
     /// Whether the conversation list pane is visible. When `false`, the chat
     /// panel takes the full window width.
     pub show_sidebar: bool,
@@ -213,6 +297,7 @@ impl App {
             renaming_id: None,
             show_debug: false,
             assistant_status: None,
+            context_usage: None,
             show_sidebar: true,
             switch_requested: false,
             kb_requested: false,
@@ -409,6 +494,17 @@ impl App {
             self.assistant_status = None;
         } else {
             self.assistant_status = Some(msg);
+        }
+    }
+
+    /// Record the latest context-window fill (#341). The daemon owns the
+    /// numbers; we only store and render. `conversation_id` lets us drop a
+    /// reading for a conversation that is not the one currently open (e.g. a
+    /// background turn), so the indicator always reflects the visible chat.
+    pub fn set_context_usage(&mut self, conversation_id: &str, usage: ContextUsageView) {
+        let open = self.current_conversation.as_ref().map(|c| c.id.as_str());
+        if open == Some(conversation_id) {
+            self.context_usage = Some(usage);
         }
     }
 
@@ -777,7 +873,14 @@ impl App {
     }
 
     pub fn load_conversation(&mut self, detail: ConversationDetail) {
+        let switching =
+            self.current_conversation.as_ref().map(|c| c.id.as_str()) != Some(detail.id.as_str());
         self.current_conversation = Some(detail);
+        // Drop a stale context-fill reading when the visible conversation
+        // changes; the next turn re-establishes it (#341).
+        if switching {
+            self.context_usage = None;
+        }
     }
 
     pub fn update_conversation_title(&mut self, conversation_id: &str, title: &str) {
@@ -889,6 +992,110 @@ impl Default for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Context-usage indicator (#341) ---
+
+    fn usage(used: u64, budget: u64, compaction: bool) -> ContextUsageView {
+        ContextUsageView {
+            used_tokens: used,
+            budget_tokens: budget,
+            compaction_active: compaction,
+        }
+    }
+
+    #[test]
+    fn context_usage_readout_formats_used_over_budget_with_percent() {
+        assert_eq!(usage(12_000, 32_000, false).readout(), "12k / 32k (38%)");
+        // Small exact counts are not abbreviated.
+        assert_eq!(usage(500, 8_000, false).readout(), "500 / 8k (6%)");
+    }
+
+    #[test]
+    fn context_usage_readout_marks_active_compaction() {
+        assert!(usage(30_000, 32_000, true).readout().ends_with(" ⟳"));
+        assert!(!usage(30_000, 32_000, false).readout().contains('⟳'));
+    }
+
+    #[test]
+    fn context_usage_zero_used_at_turn_start_is_green_zero_percent() {
+        let u = usage(0, 32_000, false);
+        assert_eq!(u.level(), ContextFillLevel::Green);
+        assert_eq!(u.readout(), "0 / 32k (0%)");
+    }
+
+    #[test]
+    fn context_usage_below_threshold_is_green() {
+        // 0.84 of budget — just under the 0.85 line.
+        assert_eq!(
+            usage(26_880, 32_000, false).level(),
+            ContextFillLevel::Green
+        );
+    }
+
+    #[test]
+    fn context_usage_exactly_at_0_85_is_amber_inclusive() {
+        // 0.85 * 32_000 == 27_200. The amber threshold is inclusive at 0.85.
+        assert_eq!(
+            usage(27_200, 32_000, false).level(),
+            ContextFillLevel::Amber
+        );
+    }
+
+    #[test]
+    fn context_usage_between_threshold_and_budget_is_amber() {
+        assert_eq!(
+            usage(30_000, 32_000, false).level(),
+            ContextFillLevel::Amber
+        );
+    }
+
+    #[test]
+    fn context_usage_at_budget_is_red() {
+        assert_eq!(usage(32_000, 32_000, false).level(), ContextFillLevel::Red);
+    }
+
+    #[test]
+    fn context_usage_over_budget_overflow_is_red() {
+        let u = usage(40_000, 32_000, false);
+        assert_eq!(u.level(), ContextFillLevel::Red);
+        // Percent reads over 100 — honest overflow, not clamped.
+        assert_eq!(u.readout(), "40k / 32k (125%)");
+    }
+
+    #[test]
+    fn context_usage_zero_budget_renders_neutrally_without_panic() {
+        // 200K-fallback / unknown budget degenerate guard: no divide-by-zero,
+        // green, 0%.
+        let u = usage(5_000, 0, false);
+        assert_eq!(u.fraction(), 0.0);
+        assert_eq!(u.level(), ContextFillLevel::Green);
+        assert_eq!(u.readout(), "5k / 0 (0%)");
+    }
+
+    #[test]
+    fn set_context_usage_only_applies_to_open_conversation() {
+        let mut app = App::new();
+        app.load_conversation(detail("c1"));
+        // A reading for a different conversation (e.g. background turn) is dropped.
+        app.set_context_usage("c2", usage(10_000, 32_000, false));
+        assert_eq!(app.context_usage, None);
+        // A reading for the open conversation lands.
+        app.set_context_usage("c1", usage(10_000, 32_000, false));
+        assert_eq!(app.context_usage, Some(usage(10_000, 32_000, false)));
+    }
+
+    #[test]
+    fn switching_conversation_clears_stale_context_usage() {
+        let mut app = App::new();
+        app.load_conversation(detail("c1"));
+        app.set_context_usage("c1", usage(10_000, 32_000, false));
+        assert!(app.context_usage.is_some());
+        app.load_conversation(detail("c2"));
+        assert_eq!(
+            app.context_usage, None,
+            "stale reading must not bleed across"
+        );
+    }
 
     fn sample_conversations() -> Vec<ConversationSummary> {
         vec![

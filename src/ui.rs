@@ -20,6 +20,11 @@ const COLOR_USER_PREFIX: Color = Color::Rgb(255, 189, 89);
 const COLOR_ASSISTANT_PREFIX: Color = Color::Rgb(92, 206, 154);
 const COLOR_ASSISTANT_STREAMING: Color = Color::Rgb(132, 218, 193);
 const COLOR_STATUS_DIM: Color = Color::Rgb(143, 153, 174);
+// Context-fill indicator colours (#341): green well under the 0.85
+// compaction line, amber approaching it, red at/over budget.
+const COLOR_CTX_GREEN: Color = Color::Rgb(122, 200, 132);
+const COLOR_CTX_AMBER: Color = Color::Rgb(232, 184, 96);
+const COLOR_CTX_RED: Color = Color::Rgb(232, 106, 106);
 const COLOR_COUNT_DIM: Color = Color::Rgb(124, 132, 148);
 const COLOR_DEBUG_TOOL: Color = Color::Rgb(178, 138, 220);
 const COLOR_DEBUG_SYSTEM: Color = Color::Rgb(140, 156, 196);
@@ -454,6 +459,28 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     } else {
         crate::tasks::running_badge(&app.tasks)
     };
+
+    // Right-aligned context-fill indicator (#341). Read-only; reflects the
+    // open conversation's last reported fill. Rendered before the left
+    // status text so a long status can't shove it off the bar.
+    if let Some(usage) = app.context_usage {
+        let (text, color) = context_usage_span(usage);
+        let w = text.chars().count() as u16;
+        if w + 2 <= area.width {
+            let right = ratatui::layout::Rect {
+                x: area.x + area.width - w - 1,
+                y: area.y,
+                width: w + 1,
+                height: area.height,
+            };
+            let para = Paragraph::new(Line::from(Span::styled(
+                text,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )));
+            f.render_widget(para, right);
+        }
+    }
+
     if app.status_message.is_empty() && badge.is_empty() {
         return;
     }
@@ -476,11 +503,70 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     f.render_widget(status, area);
 }
 
+/// Build the context-fill readout text + colour for the status bar (#341).
+/// Pure so the colour-threshold contract is unit-testable without a frame.
+fn context_usage_span(usage: crate::app::ContextUsageView) -> (String, Color) {
+    use crate::app::ContextFillLevel;
+    let color = match usage.level() {
+        ContextFillLevel::Green => COLOR_CTX_GREEN,
+        ContextFillLevel::Amber => COLOR_CTX_AMBER,
+        ContextFillLevel::Red => COLOR_CTX_RED,
+    };
+    (usage.readout(), color)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::{ChatMessage, ConversationDetail, ConversationSummary};
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn context_usage_span_colours_track_thresholds() {
+        use crate::app::ContextUsageView;
+        let mk = |used, budget| ContextUsageView {
+            used_tokens: used,
+            budget_tokens: budget,
+            compaction_active: false,
+        };
+        // Green below 0.85.
+        assert_eq!(context_usage_span(mk(12_000, 32_000)).1, COLOR_CTX_GREEN);
+        // Amber at exactly 0.85 (27_200) and between line and budget.
+        assert_eq!(context_usage_span(mk(27_200, 32_000)).1, COLOR_CTX_AMBER);
+        assert_eq!(context_usage_span(mk(30_000, 32_000)).1, COLOR_CTX_AMBER);
+        // Red at/over budget.
+        assert_eq!(context_usage_span(mk(32_000, 32_000)).1, COLOR_CTX_RED);
+        assert_eq!(context_usage_span(mk(40_000, 32_000)).1, COLOR_CTX_RED);
+        // Text carries the readout.
+        assert_eq!(context_usage_span(mk(12_000, 32_000)).0, "12k / 32k (38%)");
+    }
+
+    #[test]
+    fn draw_with_context_usage_does_not_panic() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.context_usage = Some(crate::app::ContextUsageView {
+            used_tokens: 30_000,
+            budget_tokens: 32_000,
+            compaction_active: true,
+        });
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn draw_with_context_usage_on_tiny_terminal_does_not_panic() {
+        // Narrow terminal: the readout must be skipped rather than overflow.
+        let backend = TestBackend::new(8, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.context_usage = Some(crate::app::ContextUsageView {
+            used_tokens: 30_000,
+            budget_tokens: 32_000,
+            compaction_active: false,
+        });
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+    }
 
     #[test]
     fn draw_empty_app_does_not_panic() {
