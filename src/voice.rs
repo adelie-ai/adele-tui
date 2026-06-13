@@ -148,8 +148,13 @@ impl VoiceSession {
     /// session just supplies the `Speaker`; the caller decides per conversation
     /// whether to use it.
     pub async fn build(cfg: &VoiceConfig) -> anyhow::Result<Self> {
-        let dictation = build_dictation(&cfg.audio, &cfg.vad, &cfg.stt)?;
+        // Build the speaker first so the dictation can share its output sink as
+        // an echo guard (half-duplex): the mic then won't capture and transcribe
+        // Adele's own TTS playback. The stored `speaker` is the one playback runs
+        // through, so the guard watches the right sink.
         let speaker = build_speaker(&cfg.tts, &cfg.audio).await;
+        let dictation =
+            build_dictation(&cfg.audio, &cfg.vad, &cfg.stt)?.with_echo_guard(speaker.sink());
         Ok(Self {
             dictation: Arc::new(Mutex::new(dictation)),
             speaker,
