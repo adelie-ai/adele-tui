@@ -431,6 +431,14 @@ async fn run(
             return Ok(RunOutcome::Switch);
         }
 
+        // Drain a deferred conversation-list refresh (#1): a
+        // `ConversationListChanged` that arrived while a modal sub-screen was
+        // open set this flag (the sink couldn't own `in_flight`). Now that the
+        // modal has closed and the sidebar is drawn again, refetch it.
+        if std::mem::take(&mut app.pending_conversation_refresh) {
+            push_conversation_refresh(&mut app, &connector, &mut in_flight);
+        }
+
         // The reconnect timer is built fresh each loop iteration so that it
         // gets re-armed when state transitions in/out of Pending.
         let next_retry = match &reconnect {
@@ -701,10 +709,11 @@ async fn run(
             Some(signal) = signal_rx.recv() => {
                 // All signal handling lives in `handle_signal` (shared with the
                 // sub-screen driver, TUI-12) — it touches only `App` + the voice
-                // plumbing. The one thing it can't own is the loop-local
-                // connection teardown a `Disconnected` triggers, so it reports
-                // that back for the main loop to action here.
-                if let SignalAction::Disconnected { reason } = handle_signal(
+                // plumbing. The things it can't own are loop-local: the
+                // connection teardown a `Disconnected` triggers, and the
+                // `InFlight` RPC driver a `ConversationListChanged` refetch runs
+                // on. It reports those back for the main loop to action here.
+                match handle_signal(
                     &mut app,
                     &connector,
                     &voice_daemon,
@@ -714,19 +723,28 @@ async fn run(
                 )
                 .await
                 {
-                    // Drop the connector (closing its transport + fanout task)
-                    // and reset to the not-connected sentinel receiver so the
-                    // backoff loop owns reconnection. Any in-flight stream died
-                    // with the connection (TUI-8): clear it so no frozen ▌ buffer
-                    // lingers and the ack sentinel can't mis-claim the first
-                    // post-reconnect stream.
-                    app.clear_streaming_state();
-                    connector = None;
-                    signal_rx = unbounded_channel().1;
-                    reconnect = schedule_reconnect(None);
-                    app.status_message = format!(
-                        "Disconnected: {reason}. Reconnecting in {RECONNECT_INITIAL_SECS}s..."
-                    );
+                    SignalAction::None => {}
+                    SignalAction::Disconnected { reason } => {
+                        // Drop the connector (closing its transport + fanout
+                        // task) and reset to the not-connected sentinel receiver
+                        // so the backoff loop owns reconnection. Any in-flight
+                        // stream died with the connection (TUI-8): clear it so no
+                        // frozen ▌ buffer lingers and the ack sentinel can't
+                        // mis-claim the first post-reconnect stream.
+                        app.clear_streaming_state();
+                        connector = None;
+                        signal_rx = unbounded_channel().1;
+                        reconnect = schedule_reconnect(None);
+                        app.status_message = format!(
+                            "Disconnected: {reason}. Reconnecting in {RECONNECT_INITIAL_SECS}s..."
+                        );
+                    }
+                    // The list changed elsewhere — refetch the sidebar via the
+                    // same off-loop path the (un)archive/show-archived toggles
+                    // use, leaving the open conversation + transcript untouched.
+                    SignalAction::RefreshConversations => {
+                        push_conversation_refresh(&mut app, &connector, &mut in_flight);
+                    }
                 }
             }
             _ = async {
@@ -994,13 +1012,24 @@ fn apply_rpc_outcome(app: &mut App, outcome: RpcOutcome) -> bool {
 
 /// What [`handle_signal`] asks its caller to do after handling a signal. Almost
 /// every signal is fully handled inside `handle_signal` (it mutates `App` and the
-/// voice plumbing it was given) and yields [`SignalAction::None`]. The sole
-/// exception is `Disconnected`, whose connection teardown touches loop-local
-/// state (`connector`, `signal_rx`, `reconnect`) that `handle_signal` doesn't
-/// own — so it reports the reason back and the loop performs the teardown.
+/// voice plumbing it was given) and yields [`SignalAction::None`]. The exceptions
+/// touch loop-local state `handle_signal` doesn't own, so they are reported back
+/// for the caller to action: `Disconnected` (connection teardown — `connector`,
+/// `signal_rx`, `reconnect`) and `RefreshConversations` (a list refetch on the
+/// loop-local `InFlight` RPC driver).
 enum SignalAction {
     None,
-    Disconnected { reason: String },
+    Disconnected {
+        reason: String,
+    },
+    /// A `ConversationListChanged` arrived (#1): the user's list changed on
+    /// another client or the voice daemon. The caller must refetch the
+    /// conversation list and repaint the sidebar. Reported back rather than
+    /// handled inline because the refetch runs on the loop-local `InFlight` RPC
+    /// driver that `handle_signal` doesn't own — same reason `Disconnected` is
+    /// returned. The open conversation + its transcript are untouched: only the
+    /// sidebar list is replaced.
+    RefreshConversations,
 }
 
 /// Apply one daemon [`SignalEvent`] to `App` (+ voice). Extracted from the main
@@ -1102,6 +1131,15 @@ async fn handle_signal(
         } => {
             app.update_conversation_title(&conversation_id, &title);
         }
+        // The user's conversation list changed elsewhere (#1) — a conversation
+        // was created / renamed / deleted / (un)archived by another client or
+        // the voice daemon. The event carries only the affected id; the correct
+        // handling for every change kind is a full list refetch, so we ignore
+        // the id and ask the caller to refetch (it owns the RPC driver). The
+        // open conversation + its transcript are deliberately left alone.
+        SignalEvent::ConversationListChanged { .. } => {
+            return SignalAction::RefreshConversations;
+        }
         SignalEvent::Disconnected { reason } => {
             return SignalAction::Disconnected { reason };
         }
@@ -1187,7 +1225,7 @@ struct SubScreenSink<'a> {
 
 impl screen::SignalSink for SubScreenSink<'_> {
     async fn handle(&mut self, signal: SignalEvent) {
-        if let SignalAction::Disconnected { reason } = handle_signal(
+        match handle_signal(
             self.app,
             self.connector,
             self.voice_daemon,
@@ -1197,9 +1235,20 @@ impl screen::SignalSink for SubScreenSink<'_> {
         )
         .await
         {
-            // Keep the FIRST disconnect reason; further signals on a dead
-            // connection are moot (the stream is about to be torn down anyway).
-            self.disconnect.get_or_insert(reason);
+            SignalAction::None => {}
+            SignalAction::Disconnected { reason } => {
+                // Keep the FIRST disconnect reason; further signals on a dead
+                // connection are moot (the stream is about to be torn down
+                // anyway).
+                self.disconnect.get_or_insert(reason);
+            }
+            // The list changed elsewhere while a modal is open. The sink can't
+            // own the loop-local `InFlight` driver, and the sidebar isn't even
+            // drawn behind the modal, so defer: record the request and let the
+            // chat loop refetch once the screen returns.
+            SignalAction::RefreshConversations => {
+                self.app.pending_conversation_refresh = true;
+            }
         }
     }
 }
@@ -1994,6 +2043,35 @@ async fn subscribe_to_open_conversation(app: &mut App, conn: &Connector) {
     if let Err(e) = commands.send_command(cmd).await {
         app.status_message = format!("Live-sync subscribe failed: {e}");
     }
+}
+
+/// Push an off-loop conversation-list refetch onto `in_flight` (#1), honouring
+/// the current `show_archived` filter. Reuses the exact refresh path the
+/// (un)archive / show-archived toggles use — the future yields
+/// [`RpcOutcome::ConversationsRefreshed`], whose handler calls
+/// `App::set_conversations`, which replaces ONLY the sidebar list (the open
+/// conversation + its transcript are separate state and are left untouched).
+/// No status message on success, so a list change elsewhere refreshes silently.
+/// A no-op when disconnected — the next (re)connect's `subscribe_and_load`
+/// reloads the list anyway.
+fn push_conversation_refresh(
+    app: &mut App,
+    connector: &Option<Rc<Connector>>,
+    in_flight: &mut InFlight<'static, RpcOutcome>,
+) {
+    let Some(conn) = connector.as_ref() else {
+        return;
+    };
+    let conn = Rc::clone(conn);
+    let show_archived = app.show_archived;
+    in_flight.push(async move {
+        RpcOutcome::ConversationsRefreshed {
+            list: fetch_conversations(conn.client(), show_archived)
+                .await
+                .map_err(|e| e.to_string()),
+            on_success: None,
+        }
+    });
 }
 
 async fn fetch_conversations(
