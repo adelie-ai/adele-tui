@@ -200,6 +200,13 @@ pub struct App {
     /// `pending_request_id` is `Some`. Completion appends to — and narration
     /// gates on — THIS conversation, not whichever one is open at the time.
     pub streaming_conversation_id: Option<String>,
+    /// `true` when the in-flight turn was NOT initiated by this client — adopted
+    /// from a `UserMessageAdded` for a turn started elsewhere (a voice turn, or
+    /// another client on the same account) so its reply streams live (#1).
+    /// Suppresses tui's own reply narration for it: the originator (e.g. the
+    /// voice daemon) already speaks the reply, so narrating again would
+    /// double-speak. Reset whenever the in-flight slot is (re)set or cleared.
+    pub streaming_is_external: bool,
     pub mode: InputMode,
     pub status_message: String,
     pub should_quit: bool,
@@ -288,6 +295,7 @@ impl App {
             streaming_buffer: String::new(),
             pending_request_id: None,
             streaming_conversation_id: None,
+            streaming_is_external: false,
             mode: InputMode::Normal,
             status_message: "Connected".to_string(),
             should_quit: false,
@@ -744,6 +752,9 @@ impl App {
         self.pending_request_id = Some(request_id);
         self.streaming_conversation_id = Some(conversation_id);
         self.streaming_buffer.clear();
+        // A turn entering the slot via the normal send path is this client's
+        // own; only `user_message_added` flips this true for an adopted turn.
+        self.streaming_is_external = false;
     }
 
     pub fn start_streaming_without_request_id(&mut self, conversation_id: String) {
@@ -780,6 +791,7 @@ impl App {
         self.streaming_conversation_id = None;
         self.streaming_buffer.clear();
         self.assistant_status = None;
+        self.streaming_is_external = false;
     }
 
     /// Move the sidebar selection to the conversation with `id`, returning
@@ -842,6 +854,7 @@ impl App {
         self.streaming_buffer.clear();
         self.pending_request_id = None;
         self.assistant_status = None;
+        self.streaming_is_external = false;
         origin
     }
 
@@ -854,6 +867,48 @@ impl App {
         self.pending_request_id = None;
         self.streaming_conversation_id = None;
         self.assistant_status = None;
+        self.streaming_is_external = false;
+    }
+
+    /// Handle a `UserMessageAdded` (#1): the daemon announces a user message and
+    /// the turn it begins. For a turn this client did NOT initiate (a voice turn,
+    /// or another client on the same account) showing in the open conversation,
+    /// render the user bubble and adopt the turn so its reply streams live;
+    /// dedupe this client's own send (already shown optimistically).
+    pub fn user_message_added(&mut self, conversation_id: &str, request_id: &str, content: &str) {
+        // Case 1 — our own send, echoed back. `prepare_submission` already
+        // appended the user message and `apply_prompt_ack` pinned the sentinel
+        // (both run inline before any signal is processed). Claim the real
+        // request_id off the sentinel — it precedes the first chunk — and render
+        // nothing more. This also resolves the stream's request_id earlier and
+        // more reliably than the claim-on-first-chunk fallback.
+        if self.pending_request_id.as_deref() == Some(Self::PENDING_STREAM_REQUEST_ID)
+            && self.streaming_conversation_id.as_deref() == Some(conversation_id)
+        {
+            self.pending_request_id = Some(request_id.to_string());
+            return;
+        }
+        // Case 2 — a turn this client did NOT initiate, for the conversation on
+        // screen, with no turn already occupying the single in-flight slot. Adopt
+        // it so the existing chunk/completion path streams the reply live, append
+        // the user message now, and mark it external so its reply is NOT narrated
+        // here (the originator already speaks it). A turn for a background
+        // conversation, or one arriving while our own turn is in flight, is left
+        // to the reload-on-switch path (the daemon persists it).
+        let is_displayed =
+            self.current_conversation.as_ref().map(|c| c.id.as_str()) == Some(conversation_id);
+        if self.pending_request_id.is_none() && is_displayed {
+            self.pending_request_id = Some(request_id.to_string());
+            self.streaming_conversation_id = Some(conversation_id.to_string());
+            self.streaming_buffer.clear();
+            self.streaming_is_external = true;
+            if let Some(conv) = self.current_conversation.as_mut() {
+                conv.messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: content.to_string(),
+                });
+            }
+        }
     }
 
     // --- Conversation management ---
@@ -1839,6 +1894,139 @@ mod tests {
         assert_eq!(app.status_message, "Error: LLM timeout");
         assert_eq!(app.pending_request_id, None);
         assert_eq!(app.streaming_buffer, "");
+    }
+
+    // --- Live external-turn rendering (#1) --------------------------------
+
+    /// A `UserMessageAdded` for the open conversation, with no turn in flight,
+    /// is a turn this client did not initiate (voice / another client). It
+    /// renders the user message and adopts the turn so the reply streams live.
+    #[test]
+    fn external_user_message_in_open_conversation_renders_and_adopts() {
+        let mut app = app_with_open_conversation("c1");
+        app.user_message_added("c1", "voice-req", "what's the weather?");
+
+        let msgs = &app.current_conversation.as_ref().unwrap().messages;
+        assert_eq!(msgs.len(), 1, "the external user message must be rendered");
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].content, "what's the weather?");
+        assert_eq!(
+            app.pending_request_id.as_deref(),
+            Some("voice-req"),
+            "the turn must be adopted so its reply streams live"
+        );
+        assert_eq!(app.streaming_conversation_id.as_deref(), Some("c1"));
+        assert!(
+            app.streaming_is_external,
+            "an adopted turn is external so tui does not also narrate it"
+        );
+    }
+
+    /// This client's own send is echoed back as `UserMessageAdded`. The user
+    /// message was already appended optimistically and the sentinel pinned, so
+    /// the echo renders nothing — it only claims the real request_id.
+    #[test]
+    fn own_send_echo_dedupes_and_claims_request_id() {
+        let mut app = app_with_open_conversation("c1");
+        // Mirror the local send: optimistic append + sentinel via the ack.
+        app.current_conversation
+            .as_mut()
+            .unwrap()
+            .messages
+            .push(ChatMessage {
+                role: "user".to_string(),
+                content: "typed this".to_string(),
+            });
+        app.apply_prompt_ack(String::new(), "c1".to_string());
+
+        app.user_message_added("c1", "real-req", "typed this");
+
+        assert_eq!(
+            app.current_conversation.as_ref().unwrap().messages.len(),
+            1,
+            "our own send's echo must not double-append the user message"
+        );
+        assert_eq!(
+            app.pending_request_id.as_deref(),
+            Some("real-req"),
+            "the echo must claim the real request_id off the sentinel"
+        );
+        assert!(
+            !app.streaming_is_external,
+            "our own turn must NOT be flagged external (tui owns its narration)"
+        );
+    }
+
+    /// An adopted external turn is narrated by its originator — tui must not
+    /// also speak it even when the conversation's gate is open. Verifies the
+    /// flag main.rs captures (`was_external`) to suppress `enqueue_narration`.
+    #[test]
+    fn adopted_external_turn_suppresses_tui_narration() {
+        let mut app = app_with_open_conversation("c1");
+        app.set_adele_output("c1", AdeleOutput::Always);
+        assert!(
+            app.narrate_for("c1"),
+            "precondition: the gate alone would narrate (Adele=Always)"
+        );
+
+        app.user_message_added("c1", "voice-req", "a question");
+        // main.rs captures this BEFORE complete_streaming resets it, then gates
+        // narration on `!was_external && narrate_for(origin)`.
+        let was_external = app.streaming_is_external;
+        let origin = app.complete_streaming("voice-req", "the spoken answer");
+
+        assert!(was_external, "external turn must suppress tui narration");
+        assert_eq!(origin.as_deref(), Some("c1"));
+        assert!(
+            !app.streaming_is_external,
+            "the external flag must reset at turn completion"
+        );
+    }
+
+    /// A `UserMessageAdded` for a conversation NOT on screen is left to the
+    /// reload-on-switch path — it must not touch the open transcript or the
+    /// in-flight slot.
+    #[test]
+    fn external_turn_for_background_conversation_is_ignored() {
+        let mut app = app_with_open_conversation("c1");
+        app.user_message_added("c2", "bg-req", "background");
+
+        assert!(
+            app.current_conversation
+                .as_ref()
+                .unwrap()
+                .messages
+                .is_empty(),
+            "a background turn must not render into the open transcript"
+        );
+        assert!(
+            app.pending_request_id.is_none(),
+            "a background turn must not be adopted into the in-flight slot"
+        );
+    }
+
+    /// While this client's own turn is in flight, a concurrent external turn is
+    /// NOT adopted — the single in-flight slot stays bound to our turn.
+    #[test]
+    fn external_turn_ignored_while_own_turn_in_flight() {
+        let mut app = app_with_open_conversation("c1");
+        app.start_streaming("mine".to_string(), "c1".to_string());
+
+        app.user_message_added("c1", "other", "concurrent");
+
+        assert_eq!(
+            app.pending_request_id.as_deref(),
+            Some("mine"),
+            "the in-flight turn's slot must be preserved"
+        );
+        assert!(
+            app.current_conversation
+                .as_ref()
+                .unwrap()
+                .messages
+                .is_empty(),
+            "must not append a second user message while a turn is in flight"
+        );
     }
 
     #[test]

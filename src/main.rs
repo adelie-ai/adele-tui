@@ -1004,12 +1004,28 @@ async fn handle_signal(
     signal: SignalEvent,
 ) -> SignalAction {
     match signal {
-        SignalEvent::Chunk { request_id, chunk } => {
+        // A user message was committed and a turn started (#1). For our own send
+        // this dedupes (the bubble was drawn optimistically); for a turn started
+        // elsewhere (a voice turn) in the open conversation it renders the user
+        // bubble and adopts the turn so its reply streams live. All streaming
+        // events now carry `conversation_id` too, but the in-flight slot routes
+        // them by `request_id`, so it is dropped on those arms.
+        SignalEvent::UserMessageAdded {
+            conversation_id,
+            request_id,
+            content,
+        } => {
+            app.user_message_added(&conversation_id, &request_id, &content);
+        }
+        SignalEvent::Chunk {
+            request_id, chunk, ..
+        } => {
             app.receive_chunk(&request_id, &chunk);
         }
         SignalEvent::Complete {
             request_id,
             full_response,
+            ..
         } => {
             // `complete_streaming` reports the ORIGINATING conversation (TUI-4) —
             // the one the prompt was sent to, not whichever is open now — and the
@@ -1020,21 +1036,29 @@ async fn handle_signal(
             // `say_this` aside; the queue task speaks it so synth never blocks the
             // UI. Gated entirely here so the cut-off holds: when the gate is false
             // nothing is spoken on any path.
+            // An adopted external turn (a voice turn, or another client) is
+            // narrated by its originator — tui must not also speak it. Capture
+            // the flag before `complete_streaming` resets it.
+            let was_external = app.streaming_is_external;
             let origin = app.complete_streaming(&request_id, &full_response);
             if let Some(origin) = origin
+                && !was_external
                 && app.narrate_for(&origin)
                 && !full_response.trim().is_empty()
             {
                 enqueue_narration(narration_tx, voice_daemon, voice_session, full_response);
             }
         }
-        SignalEvent::Error { request_id, error } => {
+        SignalEvent::Error {
+            request_id, error, ..
+        } => {
             app.streaming_error(&request_id, &error);
             app.status_message = format!("Error: {error}");
         }
         SignalEvent::Status {
             request_id: _,
             message,
+            ..
         } => {
             app.set_assistant_status(message);
         }
