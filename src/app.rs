@@ -420,6 +420,10 @@ impl App {
             return false;
         }
         conv.messages.push(ChatMessage {
+            // Local-only inline note (never persisted daemon-side), so it has no
+            // daemon-assigned message id (#1): the dedupe/ordering cursor is only
+            // meaningful for daemon-sourced messages.
+            id: String::new(),
             role: "assistant".to_string(),
             content: format!("(speech mode disabled) {text}"),
         });
@@ -634,6 +638,11 @@ impl App {
         }
         let conv = self.current_conversation.as_mut()?;
         conv.messages.push(ChatMessage {
+            // Optimistic local echo of our own send; the daemon assigns the real
+            // message id (#1) when it persists the turn. Dedupe of the echoed-back
+            // `UserMessageAdded` is by request_id, not message id (see
+            // `user_message_added`), so an empty id here is correct.
+            id: String::new(),
             role: "user".to_string(),
             content: content.clone(),
         });
@@ -847,6 +856,11 @@ impl App {
             .filter(|c| origin.as_deref() == Some(c.id.as_str()))
         {
             conv.messages.push(ChatMessage {
+                // Local copy of the just-streamed reply; the daemon already
+                // persisted the authoritative message (with its #1 id), which is
+                // re-fetched on the next open. Streaming dedupe is by request_id,
+                // so an empty id here is correct.
+                id: String::new(),
                 role: "assistant".to_string(),
                 content: full_response.to_string(),
             });
@@ -904,6 +918,11 @@ impl App {
             self.streaming_is_external = true;
             if let Some(conv) = self.current_conversation.as_mut() {
                 conv.messages.push(ChatMessage {
+                    // Adopted external user bubble (#1 live sync). The turn is
+                    // tracked by request_id, not message id, so an empty id is
+                    // correct; the persisted message (with its real id) is
+                    // re-fetched on the next open.
+                    id: String::new(),
                     role: "user".to_string(),
                     content: content.to_string(),
                 });
@@ -1654,6 +1673,7 @@ mod tests {
             id: "c2".into(),
             title: "Other".into(),
             messages: vec![ChatMessage {
+                id: String::new(),
                 role: "user".into(),
                 content: "prompt for c1".into(), // same text, different conv
             }],
@@ -1682,6 +1702,7 @@ mod tests {
             .unwrap()
             .messages
             .push(ChatMessage {
+                id: String::new(),
                 role: "assistant".into(),
                 content: "(speech mode disabled) aside".into(),
             });
@@ -1934,6 +1955,7 @@ mod tests {
             .unwrap()
             .messages
             .push(ChatMessage {
+                id: String::new(),
                 role: "user".to_string(),
                 content: "typed this".to_string(),
             });

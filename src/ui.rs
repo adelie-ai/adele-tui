@@ -609,10 +609,12 @@ mod tests {
             title: "Test".into(),
             messages: vec![
                 ChatMessage {
+                    id: String::new(),
                     role: "user".into(),
                     content: "Hello".into(),
                 },
                 ChatMessage {
+                    id: String::new(),
                     role: "assistant".into(),
                     content: "Hi there!".into(),
                 },
@@ -795,22 +797,27 @@ mod tests {
             title: "Test".into(),
             messages: vec![
                 ChatMessage {
+                    id: String::new(),
                     role: "user".into(),
                     content: "Hello".into(),
                 },
                 ChatMessage {
+                    id: String::new(),
                     role: "tool".into(),
                     content: "ran search(foo)".into(),
                 },
                 ChatMessage {
+                    id: String::new(),
                     role: "system".into(),
                     content: "context updated".into(),
                 },
                 ChatMessage {
+                    id: String::new(),
                     role: "assistant".into(),
                     content: "".into(), // empty — only shown in debug
                 },
                 ChatMessage {
+                    id: String::new(),
                     role: "assistant".into(),
                     content: "Hi there!".into(),
                 },
@@ -921,6 +928,7 @@ mod tests {
             id: "1".into(),
             title: "Test".into(),
             messages: vec![ChatMessage {
+                id: String::new(),
                 role: "assistant".into(),
                 content: "answer with **strong** word".into(),
             }],
