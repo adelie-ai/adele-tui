@@ -824,7 +824,15 @@ async fn run(
             // and redraw never wait on a slow/wedged daemon round-trip. When no
             // RPC is in flight this arm is pending-forever (an inert branch).
             Some(outcome) = in_flight.next() => {
-                apply_rpc_outcome(&mut app, outcome);
+                // When the open conversation changed (open/create), (re)point the
+                // daemon's live turn-event fan-out at the now-open conversation
+                // (#1 multi-client sync) so turns started elsewhere — another
+                // client, or the voice daemon — render live here.
+                if apply_rpc_outcome(&mut app, outcome)
+                    && let Some(conn) = connector.as_ref()
+                {
+                    subscribe_to_open_conversation(&mut app, conn).await;
+                }
             }
         }
     }
@@ -891,7 +899,13 @@ enum RpcOutcome {
 /// Apply a completed [`RpcOutcome`] to `App` (TUI-5 / #83). This is the only
 /// place RPC results touch `App`; it runs on the event loop after the RPC has
 /// resolved off it.
-fn apply_rpc_outcome(app: &mut App, outcome: RpcOutcome) {
+///
+/// Returns `true` when the open conversation changed (an open/create succeeded),
+/// so the caller can (re)send `SubscribeConversations` for the now-open
+/// conversation (#1 live multi-client sync) — this function stays transport-free,
+/// so the actual command send happens on the event loop where the connector
+/// lives.
+fn apply_rpc_outcome(app: &mut App, outcome: RpcOutcome) -> bool {
     match outcome {
         RpcOutcome::ConversationOpened {
             result,
@@ -902,6 +916,7 @@ fn apply_rpc_outcome(app: &mut App, outcome: RpcOutcome) {
                 if enter_editing {
                     app.enter_editing_mode();
                 }
+                return true;
             }
             Err(e) => app.status_message = format!("Error: {e}"),
         },
@@ -914,7 +929,7 @@ fn apply_rpc_outcome(app: &mut App, outcome: RpcOutcome) {
                 Ok(id) => id,
                 Err(e) => {
                     app.status_message = format!("Create error: {e}");
-                    return;
+                    return false;
                 }
             };
             match list {
@@ -932,6 +947,7 @@ fn apply_rpc_outcome(app: &mut App, outcome: RpcOutcome) {
                 Some(Ok(detail)) => {
                     app.load_conversation(detail);
                     app.enter_editing_mode();
+                    return true;
                 }
                 Some(Err(e)) => app.status_message = format!("Error opening: {e}"),
                 None => {}
@@ -972,6 +988,8 @@ fn apply_rpc_outcome(app: &mut App, outcome: RpcOutcome) {
             }
         }
     }
+    // No open-conversation change on any path that reached here.
+    false
 }
 
 /// What [`handle_signal`] asks its caller to do after handling a signal. Almost
@@ -1750,6 +1768,12 @@ async fn subscribe_and_load(app: &mut App, conn: &Connector) -> UnboundedReceive
 /// reconnect paths so the two can't drift.
 async fn finish_connection_init(app: &mut App, conn: &Connector) {
     init_background_tasks(app, conn.client()).await;
+    // (Re)establish the live turn-event subscription for the currently-open
+    // conversation (#1 multi-client sync) on every (re)connect — on the initial
+    // connect nothing is open yet, so this sends an empty set; on a reconnect the
+    // open conversation was already re-fetched by the reconnect resync before this
+    // call, so this re-points the daemon's fan-out at it.
+    subscribe_to_open_conversation(app, conn).await;
     register_client_tools(conn).await;
     app.status_message = conn.label().to_string();
 }
@@ -1936,6 +1960,42 @@ async fn init_background_tasks(
     }
 }
 
+/// The set of conversation ids the TUI is currently viewing, for
+/// `SubscribeConversations` (#1 live multi-client sync). The TUI shows exactly
+/// one conversation at a time, so this is `[open id]` when a conversation is
+/// open and empty otherwise. The command is set-replace, so an empty list tells
+/// the daemon to stop fanning any conversation's turn events to this connection.
+fn open_conversation_ids(app: &App) -> Vec<String> {
+    app.current_conversation
+        .as_ref()
+        .map(|c| vec![c.id.clone()])
+        .unwrap_or_default()
+}
+
+/// Tell the daemon which conversation this connection is viewing (#1 live
+/// multi-client sync) so it fans that conversation's turn events
+/// (`UserMessageAdded`/`AssistantDelta`/`AssistantCompleted`/`AssistantError`/
+/// `AssistantStatus`) here — including turns started by another client or the
+/// voice daemon. Sent on (re)connect and whenever the open conversation changes;
+/// it is set-replace, so each send carries the WHOLE viewed set.
+///
+/// Rides the shared command channel (`as_commands`), like
+/// [`init_background_tasks`]. Best-effort: a send failure (or a transport that
+/// doesn't accept the command) only surfaces a status hint — live sync is an
+/// enhancement, and turns this connection initiates still arrive via its own
+/// request stream regardless.
+async fn subscribe_to_open_conversation(app: &mut App, conn: &Connector) {
+    let Some(commands) = conn.client().as_commands() else {
+        return;
+    };
+    let cmd = desktop_assistant_api_model::Command::SubscribeConversations {
+        conversation_ids: open_conversation_ids(app),
+    };
+    if let Err(e) = commands.send_command(cmd).await {
+        app.status_message = format!("Live-sync subscribe failed: {e}");
+    }
+}
+
 async fn fetch_conversations(
     client: &desktop_assistant_client_common::TransportClient,
     include_archived: bool,
@@ -2116,5 +2176,49 @@ mod tests {
             ReconnectState::Pending { delay_secs, .. } => assert_eq!(delay_secs, 8),
             _ => panic!("expected Pending"),
         }
+    }
+
+    // --- Live conversation subscription (#1 multi-client sync) ---
+    //
+    // `open_conversation_ids` computes the `SubscribeConversations` set the TUI
+    // sends on (re)connect and on every conversation switch. The TUI views one
+    // conversation at a time, so the set is `[open id]` or empty.
+
+    fn detail(id: &str) -> ConversationDetail {
+        ConversationDetail {
+            id: id.into(),
+            title: format!("Conv {id}"),
+            messages: vec![],
+            model_selection: None,
+            conversation_personality: None,
+        }
+    }
+
+    #[test]
+    fn open_conversation_ids_is_empty_with_nothing_open() {
+        let app = App::new();
+        assert!(app.current_conversation.is_none());
+        // Set-replace semantics: an empty set tells the daemon to stop fanning
+        // any conversation's turn events here (e.g. the initial connect, before
+        // anything is opened).
+        assert!(open_conversation_ids(&app).is_empty());
+    }
+
+    #[test]
+    fn open_conversation_ids_is_the_single_open_conversation() {
+        let mut app = App::new();
+        app.load_conversation(detail("conv-42"));
+        assert_eq!(open_conversation_ids(&app), vec!["conv-42".to_string()]);
+    }
+
+    #[test]
+    fn open_conversation_ids_follows_a_switch() {
+        let mut app = App::new();
+        app.load_conversation(detail("conv-1"));
+        assert_eq!(open_conversation_ids(&app), vec!["conv-1".to_string()]);
+        // Switching conversations re-points the subscription at the new one (the
+        // whole set, since it's set-replace, not a delta).
+        app.load_conversation(detail("conv-2"));
+        assert_eq!(open_conversation_ids(&app), vec!["conv-2".to_string()]);
     }
 }
