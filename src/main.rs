@@ -1038,6 +1038,22 @@ async fn handle_signal(
         } => {
             app.set_assistant_status(message);
         }
+        SignalEvent::ContextUsage {
+            conversation_id,
+            request_id: _,
+            used_tokens,
+            budget_tokens,
+            compaction_active,
+        } => {
+            app.set_context_usage(
+                &conversation_id,
+                adele::app::ContextUsageView {
+                    used_tokens,
+                    budget_tokens,
+                    compaction_active,
+                },
+            );
+        }
         SignalEvent::TitleChanged {
             conversation_id,
             title,
