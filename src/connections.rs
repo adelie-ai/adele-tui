@@ -205,22 +205,41 @@ impl EditForm {
             if s.is_empty() { None } else { Some(s) }
         };
 
+        // The create form doesn't expose the advanced knobs (connect/stream
+        // timeouts, the context ceiling, or Ollama's keep-warm flag), so they
+        // default to `None` and the daemon applies its own defaults. The TUI's
+        // edit path doesn't echo config back either (it pre-fills from id/type
+        // only), so there's nothing to round-trip here — `None` is correct for
+        // both create and edit.
         let config = match self.kind {
             ConnectorKind::Anthropic => ConnectionConfigView::Anthropic {
                 base_url: opt(&self.base_url),
                 api_key_env: opt(&self.api_key_env),
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
             },
             ConnectorKind::OpenAi => ConnectionConfigView::OpenAi {
                 base_url: opt(&self.base_url),
                 api_key_env: opt(&self.api_key_env),
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
             },
             ConnectorKind::Bedrock => ConnectionConfigView::Bedrock {
                 aws_profile: opt(&self.aws_profile),
                 region: opt(&self.region),
                 base_url: opt(&self.base_url),
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
             },
             ConnectorKind::Ollama => ConnectionConfigView::Ollama {
                 base_url: opt(&self.base_url),
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                keep_warm: None,
+                max_context_tokens: None,
             },
         };
 
@@ -962,6 +981,7 @@ mod tests {
             ConnectionConfigView::Anthropic {
                 api_key_env,
                 base_url,
+                ..
             } => {
                 assert_eq!(api_key_env.as_deref(), Some("WORK_KEY"));
                 assert!(base_url.is_none());
@@ -984,6 +1004,7 @@ mod tests {
                 aws_profile,
                 region,
                 base_url,
+                ..
             } => {
                 assert_eq!(aws_profile.as_deref(), Some("dev"));
                 assert_eq!(region.as_deref(), Some("us-east-1"));
@@ -1002,7 +1023,7 @@ mod tests {
         let (id, config) = form.submit().unwrap();
         assert_eq!(id, "local");
         match config {
-            ConnectionConfigView::Ollama { base_url } => {
+            ConnectionConfigView::Ollama { base_url, .. } => {
                 assert_eq!(base_url.as_deref(), Some("http://127.0.0.1:11434"));
             }
             other => panic!("expected Ollama, got {other:?}"),
