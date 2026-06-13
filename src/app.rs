@@ -238,6 +238,12 @@ pub struct App {
     /// Set when the user asks to switch to a different connection. Causes
     /// the chat loop to exit cleanly so the picker can run again.
     pub switch_requested: bool,
+    /// Set when a `SignalEvent::ConversationListChanged` arrives while a modal
+    /// sub-screen is open (#1). The sub-screen sink can't own the loop-local
+    /// `InFlight` RPC driver, so it records the request here; the chat loop
+    /// drains it on the next iteration (once the modal has closed and the
+    /// sidebar is visible again) by pushing a conversation-list refetch.
+    pub pending_conversation_refresh: bool,
     /// Set when the user asks to open the knowledge base. The chat loop
     /// hands the screen to `kb::run` and resets this flag when KB exits.
     pub kb_requested: bool,
@@ -308,6 +314,7 @@ impl App {
             context_usage: None,
             show_sidebar: true,
             switch_requested: false,
+            pending_conversation_refresh: false,
             kb_requested: false,
             connections_requested: false,
             purposes_requested: false,
@@ -2200,6 +2207,60 @@ mod tests {
         app.selected_conversation = Some(1);
         app.set_conversations(vec![]);
         assert_eq!(app.selected_conversation, None);
+    }
+
+    #[test]
+    fn list_refetch_replaces_sidebar_without_disturbing_open_conversation() {
+        // A `SignalEvent::ConversationListChanged` (#1) refetches the whole
+        // conversation list via `set_conversations`. That must repaint the
+        // sidebar but leave the OPEN conversation and its transcript intact —
+        // even when the change elsewhere renamed and removed rows.
+        let mut app = app_with_conversations();
+        app.selected_conversation = Some(1);
+        app.load_conversation(ConversationDetail {
+            id: "2".into(),
+            title: "Second".into(),
+            messages: vec![
+                ChatMessage {
+                    id: "m1".into(),
+                    role: "user".into(),
+                    content: "hello".into(),
+                },
+                ChatMessage {
+                    id: "m2".into(),
+                    role: "assistant".into(),
+                    content: "hi there".into(),
+                },
+            ],
+            model_selection: None,
+            conversation_personality: None,
+        });
+
+        // Simulate the refetched list: "1" was renamed and "3" was deleted
+        // elsewhere; "2" (the open one) survives.
+        app.set_conversations(vec![
+            ConversationSummary {
+                id: "1".into(),
+                title: "First (renamed elsewhere)".into(),
+                message_count: 3,
+                archived: false,
+            },
+            ConversationSummary {
+                id: "2".into(),
+                title: "Second".into(),
+                message_count: 2,
+                archived: false,
+            },
+        ]);
+
+        // Sidebar reflects the new list...
+        assert_eq!(app.conversations.len(), 2);
+        assert_eq!(app.conversations[0].title, "First (renamed elsewhere)");
+        // ...but the open conversation + its transcript are byte-for-byte intact.
+        let open = app.current_conversation.as_ref().expect("still open");
+        assert_eq!(open.id, "2");
+        assert_eq!(open.messages.len(), 2);
+        assert_eq!(open.messages[1].content, "hi there");
     }
 
     #[test]
