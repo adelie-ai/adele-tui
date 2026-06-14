@@ -135,6 +135,8 @@ pub struct App {
     pub mode: InputMode,
     pub status_message: String,
     pub should_quit: bool,
+    /// Whether the `?`/F1 keymap help overlay is shown. Any key closes it.
+    pub show_help: bool,
     /// Lines scrolled up from the bottom. 0 = auto-scroll to bottom.
     pub scroll_offset: u16,
     /// Whether to include archived conversations in the list.
@@ -230,6 +232,7 @@ impl App {
             mode: InputMode::Normal,
             status_message: "Connected".to_string(),
             should_quit: false,
+            show_help: false,
             scroll_offset: 0,
             show_archived: false,
             rename_textarea: new_textarea(),
@@ -251,6 +254,12 @@ impl App {
             voice_in: HashMap::new(),
             adele_output: HashMap::new(),
         }
+    }
+
+    /// Toggle the keymap help overlay (`?`/F1). Any key closes it (handled in the
+    /// event loop), so the action only ever opens it.
+    pub fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
     }
 
     // --- Per-conversation You/Adele voice controls (adele-tui#77) ---

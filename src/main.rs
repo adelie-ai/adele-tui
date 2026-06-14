@@ -651,6 +651,12 @@ async fn run(
                     if key.kind == KeyEventKind::Release {
                         continue;
                     }
+                    // The help overlay is informational: while it's open, ANY key
+                    // dismisses it (and does nothing else).
+                    if app.show_help {
+                        app.show_help = false;
+                        continue;
+                    }
                     if let Some(action) = handle_key_event(key, &app.mode, app.tasks.visible) {
                         if action == Action::Dictate {
                             // Push-to-talk (adele-tui#77). Prefer the voice
@@ -1544,6 +1550,7 @@ async fn handle_action(
                 "Conversation list hidden (Ctrl+B to show)".into()
             };
         }
+        Action::ToggleHelp => app.toggle_help(),
         Action::SwitchConnection => {
             app.switch_requested = true;
             app.status_message = "Switching connection...".into();

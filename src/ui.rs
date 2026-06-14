@@ -77,6 +77,59 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.tasks.visible {
         crate::tasks::draw_overlay(f, &app.tasks, f.area());
     }
+
+    // Keymap help (?/F1) sits on top of everything.
+    if app.show_help {
+        draw_help_overlay(f, f.area());
+    }
+}
+
+/// The `?`/F1 keymap help overlay. Content comes from `keys::help_sections` so
+/// the bindings stay single-sourced.
+fn draw_help_overlay(f: &mut Frame, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+    for (section, binds) in crate::keys::help_sections() {
+        lines.push(Line::from(Span::styled(
+            *section,
+            Style::default()
+                .fg(Color::Rgb(166, 182, 255))
+                .add_modifier(Modifier::BOLD),
+        )));
+        for (key, desc) in *binds {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {key:<22}"),
+                    Style::default().fg(Color::Rgb(216, 223, 236)),
+                ),
+                Span::styled(*desc, Style::default().fg(Color::Rgb(143, 153, 174))),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        "Inside modal screens (KB / connections / purposes), Ctrl+S = save.",
+        Style::default()
+            .fg(Color::Rgb(143, 153, 174))
+            .add_modifier(Modifier::ITALIC),
+    )));
+
+    let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let width = 60u16.min(area.width.saturating_sub(4));
+    let popup = centered_rect(width, height, area);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Rgb(82, 104, 173)))
+        .title(Line::from(Span::styled(
+            " Keys — press any key to close ",
+            Style::default()
+                .fg(Color::Rgb(166, 182, 255))
+                .add_modifier(Modifier::BOLD),
+        )));
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, popup);
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
