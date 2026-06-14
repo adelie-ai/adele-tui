@@ -67,6 +67,24 @@ pub trait Screen {
     fn on_timer(&mut self) -> impl Future<Output = ()> {
         async {}
     }
+
+    /// Whether this screen has an off-loop RPC in flight (modal-freeze fix). While
+    /// `true`, the driver keeps redrawing — so the `busy` indicator actually
+    /// renders — and arms [`poll_pending`](Screen::poll_pending). Default `false`
+    /// for screens that still `await` their RPCs inline.
+    fn has_pending(&self) -> bool {
+        false
+    }
+
+    /// Drive this screen's off-loop RPCs and apply the next one that resolves,
+    /// mirroring the chat loop's [`InFlight`](crate::in_flight::InFlight) driver so
+    /// a slow daemon round-trip no longer blocks redraw/input (no freeze, the
+    /// `busy` line shows, Esc stays live). Armed only while
+    /// [`has_pending`](Screen::has_pending) is `true`; the default is
+    /// pending-forever (inert) for screens with no in-flight set.
+    fn poll_pending(&mut self) -> impl Future<Output = ()> {
+        std::future::pending()
+    }
 }
 
 /// Sink for daemon signals drained while a modal screen is open (TUI-12).
@@ -146,6 +164,11 @@ where
             }, if next_timer.is_some() => {
                 screen.on_timer().await;
             }
+            // Modal-freeze fix: drive the screen's own off-loop RPCs so a slow
+            // daemon round-trip no longer blocks redraw/input. Armed only when the
+            // screen has work in flight; otherwise the branch is disabled and the
+            // screen keeps its old inline-`await` behaviour.
+            _ = screen.poll_pending(), if screen.has_pending() => {}
         }
     }
 }

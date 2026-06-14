@@ -29,22 +29,19 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
+use crate::in_flight::InFlight;
 use crate::screen::Screen;
 
-const COLOR_BORDER: Color = Color::Rgb(82, 104, 173);
-const COLOR_TITLE: Color = Color::Rgb(166, 182, 255);
-const COLOR_HINT_KEY: Color = Color::Rgb(216, 223, 236);
-const COLOR_HINT_DESC: Color = Color::Rgb(143, 153, 174);
-const COLOR_HINT_SEP: Color = Color::Rgb(82, 90, 110);
-const COLOR_LIST_HIGHLIGHT: Color = Color::Rgb(72, 102, 180);
-const COLOR_LIST_HIGHLIGHT_FG: Color = Color::Rgb(245, 248, 255);
-const COLOR_ERROR: Color = Color::Rgb(232, 130, 130);
-const COLOR_CURRENT_PICK: Color = Color::Rgb(255, 207, 119);
+/// Result of the off-loop `list_available_models` RPC (modal-freeze fix): the
+/// model list, or a user-facing error string.
+type ModelsResult = Result<Vec<ModelListing>, String>;
+
+use crate::theme::theme;
 
 /// Outcome of running the picker.
 #[derive(Default)]
@@ -75,6 +72,9 @@ struct State {
 struct ModelSelectorScreen<'a> {
     state: State,
     client: &'a TransportClient,
+    /// In-flight `list_available_models` RPC, polled off the draw loop by
+    /// `poll_pending` so the picker never freezes during a (re)load.
+    pending: InFlight<'a, ModelsResult>,
 }
 
 impl Screen for ModelSelectorScreen<'_> {
@@ -84,12 +84,25 @@ impl Screen for ModelSelectorScreen<'_> {
         draw(frame, &self.state);
     }
 
-    async fn handle_key(&mut self, key: KeyEvent) {
-        handle_key(&mut self.state, key, self.client).await;
+    fn handle_key(&mut self, key: KeyEvent) -> impl std::future::Future<Output = ()> {
+        // Synchronous: a refresh enqueues an off-loop RPC into `pending` instead
+        // of awaiting it here, so the key handler never blocks the draw/input loop.
+        handle_key(&mut self.state, key, self.client, &mut self.pending);
+        std::future::ready(())
     }
 
     fn take_outcome(&mut self) -> Option<Outcome> {
         self.state.outcome.take()
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    async fn poll_pending(&mut self) {
+        if let Some(result) = self.pending.next().await {
+            apply_models_result(&mut self.state, result);
+        }
     }
 }
 
@@ -111,22 +124,29 @@ pub async fn run(
             outcome: None,
         },
         client,
+        pending: InFlight::new(),
     };
 
-    refresh(&mut screen.state, client, false).await;
-    seed_selection(&mut screen.state);
+    // Kick the initial load off-loop too, so the "Loading models…" line shows and
+    // the picker stays responsive while it lands (seeding happens on arrival).
+    refresh(&mut screen.state, &mut screen.pending, client, false);
 
     crate::screen::run_screen(terminal, &mut screen, signal_rx, sink).await
 }
 
-async fn handle_key(state: &mut State, key: KeyEvent, client: &TransportClient) {
+fn handle_key<'a>(
+    state: &mut State,
+    key: KeyEvent,
+    client: &'a TransportClient,
+    pending: &mut InFlight<'a, ModelsResult>,
+) {
     match (key.code, key.modifiers) {
         (KeyCode::Esc | KeyCode::Char('q'), m) if m.is_empty() => {
             state.outcome = Some(Outcome::Cancelled);
         }
         (KeyCode::Char('j') | KeyCode::Down, m) if m.is_empty() => advance(state, 1),
         (KeyCode::Char('k') | KeyCode::Up, m) if m.is_empty() => advance(state, -1),
-        (KeyCode::Char('r'), KeyModifiers::NONE) => refresh(state, client, true).await,
+        (KeyCode::Char('r'), KeyModifiers::NONE) => refresh(state, pending, client, true),
         (KeyCode::Enter, m) if m.is_empty() => {
             if let Some(model) = state.models.get(state.selected) {
                 state.outcome = Some(Outcome::Selected(SendPromptOverride {
@@ -158,30 +178,44 @@ fn advance(state: &mut State, delta: i32) {
     state.selected = idx as usize;
 }
 
-async fn refresh(state: &mut State, client: &TransportClient, refresh_cache: bool) {
-    let Some(commands) = client.as_commands() else {
-        state.error = Some(
-            "Model selection isn't available over D-Bus — switch transport with --transport ws or the local socket"
-                .into(),
-        );
-        state.busy = None;
-        return;
-    };
+/// Enqueue a model-list refresh as an off-loop RPC (modal-freeze fix). Sets the
+/// `busy` line and returns immediately; the result is applied by
+/// `apply_models_result` once `poll_pending` resolves it.
+fn refresh<'a>(
+    state: &mut State,
+    pending: &mut InFlight<'a, ModelsResult>,
+    client: &'a TransportClient,
+    refresh_cache: bool,
+) {
     state.busy = Some(if refresh_cache {
         "Refreshing models from daemon...".into()
     } else {
         "Loading models...".into()
     });
-    match commands.list_available_models(None, refresh_cache).await {
+    pending.push(async move {
+        match client.as_commands() {
+            Some(commands) => commands
+                .list_available_models(None, refresh_cache)
+                .await
+                .map_err(|e| format!("Failed to load models: {e}")),
+            None => Err(
+                "Model selection isn't available over D-Bus — switch transport with --transport ws or the local socket"
+                    .into(),
+            ),
+        }
+    });
+}
+
+/// Apply a resolved model-list RPC to the picker state.
+fn apply_models_result(state: &mut State, result: ModelsResult) {
+    state.busy = None;
+    match result {
         Ok(models) => {
             state.models = models;
-            state.busy = None;
+            state.error = None;
             seed_selection(state);
         }
-        Err(e) => {
-            state.error = Some(format!("Failed to load models: {e}"));
-            state.busy = None;
-        }
+        Err(e) => state.error = Some(e),
     }
 }
 
@@ -241,20 +275,20 @@ fn draw_header(f: &mut Frame, state: &State, area: Rect) {
     let mut lines = vec![Line::from(Span::styled(
         "Pick a model for this conversation",
         Style::default()
-            .fg(COLOR_TITLE)
+            .fg(theme().title)
             .add_modifier(Modifier::BOLD),
     ))];
     if let Some(current) = &state.current {
         lines.push(Line::from(Span::styled(
             format!("Current: {} · {}", current.connection_id, current.model_id),
             Style::default()
-                .fg(COLOR_CURRENT_PICK)
+                .fg(theme().pinned)
                 .add_modifier(Modifier::ITALIC),
         )));
     } else {
         lines.push(Line::from(Span::styled(
             "Current: (none — daemon will use the interactive purpose default)",
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         )));
     }
     f.render_widget(Paragraph::new(lines), area);
@@ -264,7 +298,7 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
     let items: Vec<ListItem> = if state.models.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "(no models — configure connections via F3 first)",
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         )))]
     } else {
         state
@@ -276,7 +310,7 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
                     c.connection_id == listing.connection_id && c.model_id == listing.model.id
                 });
                 if is_current {
-                    spans.push(Span::styled("★ ", Style::default().fg(COLOR_CURRENT_PICK)));
+                    spans.push(Span::styled("★ ", Style::default().fg(theme().pinned)));
                 } else {
                     spans.push(Span::raw("  "));
                 }
@@ -284,12 +318,12 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
                     listing.connection_label.clone(),
                     Style::default().add_modifier(Modifier::BOLD),
                 ));
-                spans.push(Span::styled("  ·  ", Style::default().fg(COLOR_HINT_SEP)));
+                spans.push(Span::styled("  ·  ", Style::default().fg(theme().hint_sep)));
                 spans.push(Span::styled(listing.model.id.clone(), Style::default()));
                 if listing.model.display_name != listing.model.id {
                     spans.push(Span::styled(
                         format!("  ({})", listing.model.display_name),
-                        Style::default().fg(COLOR_HINT_DESC),
+                        Style::default().fg(theme().text_dim),
                     ));
                 }
                 ListItem::new(Line::from(spans))
@@ -307,18 +341,18 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BORDER))
+                .border_style(Style::default().fg(theme().border))
                 .title(Line::from(Span::styled(
                     title,
                     Style::default()
-                        .fg(COLOR_TITLE)
+                        .fg(theme().title)
                         .add_modifier(Modifier::BOLD),
                 ))),
         )
         .highlight_style(
             Style::default()
-                .bg(COLOR_LIST_HIGHLIGHT)
-                .fg(COLOR_LIST_HIGHLIGHT_FG)
+                .bg(theme().list_highlight)
+                .fg(theme().list_highlight_fg)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ");
@@ -333,14 +367,14 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
 fn draw_status(f: &mut Frame, state: &State, area: Rect) {
     if let Some(busy) = &state.busy {
         let style = Style::default()
-            .fg(Color::Rgb(178, 220, 245))
+            .fg(theme().assistant_indicator)
             .add_modifier(Modifier::ITALIC);
         f.render_widget(
             Paragraph::new(Span::styled(format!(" ● {busy}"), style)),
             area,
         );
     } else if let Some(err) = &state.error {
-        let style = Style::default().fg(COLOR_ERROR);
+        let style = Style::default().fg(theme().error);
         f.render_widget(
             Paragraph::new(Span::styled(format!(" • {err}"), style)),
             area,
@@ -353,18 +387,18 @@ fn draw_hints(f: &mut Frame, area: Rect) {
     let mut spans: Vec<Span> = Vec::new();
     for (idx, (key, desc)) in hints.iter().enumerate() {
         if idx > 0 {
-            spans.push(Span::styled("  ·  ", Style::default().fg(COLOR_HINT_SEP)));
+            spans.push(Span::styled("  ·  ", Style::default().fg(theme().hint_sep)));
         }
         spans.push(Span::styled(
             (*key).to_string(),
             Style::default()
-                .fg(COLOR_HINT_KEY)
+                .fg(theme().hint_key)
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             (*desc).to_string(),
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);

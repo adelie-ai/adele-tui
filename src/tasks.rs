@@ -246,24 +246,15 @@ impl TaskPane {
 
 // --- Rendering --------------------------------------------------------
 
-const COLOR_BORDER: Color = Color::Rgb(82, 104, 173);
-const COLOR_TITLE: Color = Color::Rgb(166, 182, 255);
-const COLOR_HINT_DESC: Color = Color::Rgb(143, 153, 174);
-const COLOR_LIST_HIGHLIGHT: Color = Color::Rgb(72, 102, 180);
-const COLOR_LIST_HIGHLIGHT_FG: Color = Color::Rgb(245, 248, 255);
-const COLOR_OK: Color = Color::Rgb(132, 218, 193);
-const COLOR_ERROR: Color = Color::Rgb(232, 130, 130);
-const COLOR_WARN: Color = Color::Rgb(232, 200, 130);
-const COLOR_RUN: Color = Color::Rgb(122, 163, 255);
-const COLOR_PEND: Color = Color::Rgb(178, 138, 220);
+use crate::theme::theme;
 
 fn status_chip(status: TaskStatus) -> Span<'static> {
     let (label, color) = match status {
-        TaskStatus::Pending => ("PEND", COLOR_PEND),
-        TaskStatus::Running => ("RUN ", COLOR_RUN),
-        TaskStatus::Completed => ("OK  ", COLOR_OK),
-        TaskStatus::Failed => ("FAIL", COLOR_ERROR),
-        TaskStatus::Cancelled => ("CXL ", COLOR_WARN),
+        TaskStatus::Pending => ("PEND", theme().debug_tool),
+        TaskStatus::Running => ("RUN ", theme().run),
+        TaskStatus::Completed => ("OK  ", theme().ok),
+        TaskStatus::Failed => ("FAIL", theme().error),
+        TaskStatus::Cancelled => ("CXL ", theme().warn),
     };
     Span::styled(
         format!(" {label} "),
@@ -276,9 +267,9 @@ fn status_chip(status: TaskStatus) -> Span<'static> {
 
 fn level_color(level: LogLevel) -> Color {
     match level {
-        LogLevel::Info => COLOR_OK,
-        LogLevel::Warn => COLOR_WARN,
-        LogLevel::Error => COLOR_ERROR,
+        LogLevel::Info => theme().ok,
+        LogLevel::Warn => theme().warn,
+        LogLevel::Error => theme().error,
     }
 }
 
@@ -339,18 +330,18 @@ pub fn draw_overlay(f: &mut Frame, pane: &TaskPane, area: Rect) {
         Span::styled(
             format!("Tasks ({} running)", pane.running_count()),
             Style::default()
-                .fg(COLOR_TITLE)
+                .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             "  —  j/k navigate · c cancel · Enter open conv · Ctrl+P close",
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         ),
     ]);
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_BORDER))
+        .border_style(Style::default().fg(theme().border))
         .title(title_line);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -358,7 +349,7 @@ pub fn draw_overlay(f: &mut Frame, pane: &TaskPane, area: Rect) {
     if pane.tasks.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "(no background tasks — they will appear here as the daemon spawns them)",
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         )))
         .wrap(Wrap { trim: true });
         f.render_widget(empty, inner);
@@ -387,7 +378,7 @@ fn draw_task_list(f: &mut Frame, pane: &TaskPane, area: Rect) {
         .values()
         .map(|row| {
             let parent_indicator = if row.parent.is_some() {
-                Span::styled(" ↳", Style::default().fg(COLOR_HINT_DESC))
+                Span::styled(" ↳", Style::default().fg(theme().text_dim))
             } else {
                 Span::raw("  ")
             };
@@ -406,25 +397,28 @@ fn draw_task_list(f: &mut Frame, pane: &TaskPane, area: Rect) {
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!("  {age:>4}"), Style::default().fg(COLOR_HINT_DESC)),
+                Span::styled(format!("  {age:>4}"), Style::default().fg(theme().text_dim)),
                 parent_indicator,
                 Span::raw(" "),
                 Span::styled(
                     format!("[{}] ", row.kind_label),
                     Style::default()
-                        .fg(COLOR_HINT_DESC)
+                        .fg(theme().text_dim)
                         .add_modifier(Modifier::DIM),
                 ),
                 Span::styled(row.title.clone(), Style::default().fg(Color::White)),
             ];
             if !progress.is_empty() {
-                spans.push(Span::styled(progress, Style::default().fg(COLOR_HINT_DESC)));
+                spans.push(Span::styled(
+                    progress,
+                    Style::default().fg(theme().text_dim),
+                ));
             }
             if let Some(err) = &row.last_error {
                 spans.push(Span::styled(
                     format!("  ·  {err}"),
                     Style::default()
-                        .fg(COLOR_ERROR)
+                        .fg(theme().error)
                         .add_modifier(Modifier::ITALIC),
                 ));
             }
@@ -436,18 +430,18 @@ fn draw_task_list(f: &mut Frame, pane: &TaskPane, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BORDER))
+                .border_style(Style::default().fg(theme().border))
                 .title(Line::from(Span::styled(
                     "Background tasks",
                     Style::default()
-                        .fg(COLOR_TITLE)
+                        .fg(theme().title)
                         .add_modifier(Modifier::BOLD),
                 ))),
         )
         .highlight_style(
             Style::default()
-                .bg(COLOR_LIST_HIGHLIGHT)
-                .fg(COLOR_LIST_HIGHLIGHT_FG)
+                .bg(theme().list_highlight)
+                .fg(theme().list_highlight_fg)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ");
@@ -460,11 +454,11 @@ fn draw_task_list(f: &mut Frame, pane: &TaskPane, area: Rect) {
 fn draw_task_logs(f: &mut Frame, pane: &TaskPane, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_BORDER))
+        .border_style(Style::default().fg(theme().border))
         .title(Line::from(Span::styled(
             "Logs",
             Style::default()
-                .fg(COLOR_TITLE)
+                .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(area);
@@ -474,7 +468,7 @@ fn draw_task_logs(f: &mut Frame, pane: &TaskPane, area: Rect) {
     if logs.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "(no log entries yet)",
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         )));
         f.render_widget(empty, inner);
         return;
@@ -487,7 +481,7 @@ fn draw_task_logs(f: &mut Frame, pane: &TaskPane, area: Rect) {
             // long tool outputs are readable without word-wrap weirdness.
             let head = Span::styled(
                 format!("[{:>4}] ", entry.seq),
-                Style::default().fg(COLOR_HINT_DESC),
+                Style::default().fg(theme().text_dim),
             );
             let level_label = format!("{:?}", entry.level).to_uppercase();
             let level_span = Span::styled(
@@ -498,7 +492,7 @@ fn draw_task_logs(f: &mut Frame, pane: &TaskPane, area: Rect) {
             );
             let category_span = Span::styled(
                 format!(" {:?} ", entry.category).to_lowercase(),
-                Style::default().fg(COLOR_HINT_DESC),
+                Style::default().fg(theme().text_dim),
             );
             let mut out: Vec<Line<'static>> = Vec::new();
             let mut first = true;

@@ -28,23 +28,19 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
+use crate::in_flight::InFlight;
 use crate::screen::Screen;
 
-const COLOR_BORDER: Color = Color::Rgb(82, 104, 173);
-const COLOR_TITLE: Color = Color::Rgb(166, 182, 255);
-const COLOR_HINT_KEY: Color = Color::Rgb(216, 223, 236);
-const COLOR_HINT_DESC: Color = Color::Rgb(143, 153, 174);
-const COLOR_HINT_SEP: Color = Color::Rgb(82, 90, 110);
-const COLOR_LIST_HIGHLIGHT: Color = Color::Rgb(72, 102, 180);
-const COLOR_LIST_HIGHLIGHT_FG: Color = Color::Rgb(245, 248, 255);
-const COLOR_ERROR: Color = Color::Rgb(232, 130, 130);
-const COLOR_GLOBAL: Color = Color::Rgb(143, 153, 174);
-const COLOR_PINNED: Color = Color::Rgb(255, 207, 119);
+/// Result of the off-loop `set_conversation_personality` RPC (modal-freeze fix):
+/// the stored override, or a user-facing error string.
+type SaveResult = Result<ConversationPersonalityView, String>;
+
+use crate::theme::theme;
 
 /// The seven traits in their canonical wire order. Each entry pairs a display
 /// label with getters/setters into a [`ConversationPersonalityView`], so the
@@ -158,6 +154,9 @@ struct State {
 struct PersonalityScreen<'a> {
     state: State,
     client: &'a TransportClient,
+    /// In-flight `set_conversation_personality` RPC, polled off the draw loop by
+    /// `poll_pending` so the picker never freezes while saving.
+    pending: InFlight<'a, SaveResult>,
 }
 
 impl Screen for PersonalityScreen<'_> {
@@ -167,12 +166,25 @@ impl Screen for PersonalityScreen<'_> {
         draw(frame, &self.state);
     }
 
-    async fn handle_key(&mut self, key: KeyEvent) {
-        handle_key(&mut self.state, key, self.client).await;
+    fn handle_key(&mut self, key: KeyEvent) -> impl std::future::Future<Output = ()> {
+        // Synchronous: a save enqueues an off-loop RPC into `pending` instead of
+        // awaiting it here, so the key handler never blocks the draw/input loop.
+        handle_key(&mut self.state, key, self.client, &mut self.pending);
+        std::future::ready(())
     }
 
     fn take_outcome(&mut self) -> Option<Outcome> {
         self.state.outcome.take()
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    async fn poll_pending(&mut self) {
+        if let Some(result) = self.pending.next().await {
+            apply_save_result(&mut self.state, result);
+        }
     }
 }
 
@@ -194,12 +206,18 @@ pub async fn run(
             outcome: None,
         },
         client,
+        pending: InFlight::new(),
     };
 
     crate::screen::run_screen(terminal, &mut screen, signal_rx, sink).await
 }
 
-async fn handle_key(state: &mut State, key: KeyEvent, client: &TransportClient) {
+fn handle_key<'a>(
+    state: &mut State,
+    key: KeyEvent,
+    client: &'a TransportClient,
+    pending: &mut InFlight<'a, SaveResult>,
+) {
     match (key.code, key.modifiers) {
         (KeyCode::Esc | KeyCode::Char('q'), m) if m.is_empty() => {
             state.outcome = Some(Outcome::Cancelled);
@@ -208,7 +226,7 @@ async fn handle_key(state: &mut State, key: KeyEvent, client: &TransportClient) 
         (KeyCode::Char('k') | KeyCode::Up, m) if m.is_empty() => advance(state, -1),
         (KeyCode::Char('l') | KeyCode::Right, m) if m.is_empty() => cycle_selected(state, true),
         (KeyCode::Char('h') | KeyCode::Left, m) if m.is_empty() => cycle_selected(state, false),
-        (KeyCode::Enter, m) if m.is_empty() => save(state, client).await,
+        (KeyCode::Enter, m) if m.is_empty() => save(state, pending, client),
         _ => {}
     }
 }
@@ -239,28 +257,39 @@ fn cycle_selected(state: &mut State, forward: bool) {
     (t.set)(&mut state.draft, next);
 }
 
-async fn save(state: &mut State, client: &TransportClient) {
-    let Some(commands) = client.as_commands() else {
-        state.error = Some(
-            "Personality selection isn't available over D-Bus — switch transport with --transport ws or the local socket"
-                .into(),
-        );
-        return;
-    };
+/// Enqueue a personality save as an off-loop RPC (modal-freeze fix). Sets the
+/// `busy` line and returns immediately; the result is applied by
+/// `apply_save_result` once `poll_pending` resolves it.
+fn save<'a>(
+    state: &mut State,
+    pending: &mut InFlight<'a, SaveResult>,
+    client: &'a TransportClient,
+) {
     state.busy = Some("Saving personality...".into());
     state.error = None;
-    match commands
-        .set_conversation_personality(&state.conversation_id, state.draft)
-        .await
-    {
-        Ok(stored) => {
-            state.busy = None;
-            state.outcome = Some(Outcome::Saved(stored));
+    let conversation_id = state.conversation_id.clone();
+    let draft = state.draft;
+    pending.push(async move {
+        match client.as_commands() {
+            Some(commands) => commands
+                .set_conversation_personality(&conversation_id, draft)
+                .await
+                .map_err(|e| format!("Failed to save personality: {e}")),
+            None => Err(
+                "Personality selection isn't available over D-Bus — switch transport with --transport ws or the local socket"
+                    .into(),
+            ),
         }
-        Err(e) => {
-            state.busy = None;
-            state.error = Some(format!("Failed to save personality: {e}"));
-        }
+    });
+}
+
+/// Apply a resolved personality-save RPC to the picker state. On success this
+/// sets the `Saved` outcome, which closes the screen on the next loop turn.
+fn apply_save_result(state: &mut State, result: SaveResult) {
+    state.busy = None;
+    match result {
+        Ok(stored) => state.outcome = Some(Outcome::Saved(stored)),
+        Err(e) => state.error = Some(e),
     }
 }
 
@@ -305,12 +334,12 @@ fn draw_header(f: &mut Frame, area: Rect) {
         Line::from(Span::styled(
             "Personality for this conversation",
             Style::default()
-                .fg(COLOR_TITLE)
+                .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             "Global inherits your default; any level pins it here.",
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         )),
     ];
     f.render_widget(Paragraph::new(lines), area);
@@ -323,10 +352,10 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
         .map(|t| {
             let level = (t.get)(&state.draft);
             let value_style = if level.is_none() {
-                Style::default().fg(COLOR_GLOBAL)
+                Style::default().fg(theme().text_dim)
             } else {
                 Style::default()
-                    .fg(COLOR_PINNED)
+                    .fg(theme().pinned)
                     .add_modifier(Modifier::BOLD)
             };
             let spans = vec![
@@ -335,9 +364,9 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("   ", Style::default()),
-                Span::styled("◂ ", Style::default().fg(COLOR_HINT_SEP)),
+                Span::styled("◂ ", Style::default().fg(theme().hint_sep)),
                 Span::styled(format!("{:^9}", level_label(level)), value_style),
-                Span::styled(" ▸", Style::default().fg(COLOR_HINT_SEP)),
+                Span::styled(" ▸", Style::default().fg(theme().hint_sep)),
             ];
             ListItem::new(Line::from(spans))
         })
@@ -347,18 +376,18 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BORDER))
+                .border_style(Style::default().fg(theme().border))
                 .title(Line::from(Span::styled(
                     "Traits",
                     Style::default()
-                        .fg(COLOR_TITLE)
+                        .fg(theme().title)
                         .add_modifier(Modifier::BOLD),
                 ))),
         )
         .highlight_style(
             Style::default()
-                .bg(COLOR_LIST_HIGHLIGHT)
-                .fg(COLOR_LIST_HIGHLIGHT_FG)
+                .bg(theme().list_highlight)
+                .fg(theme().list_highlight_fg)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ");
@@ -371,14 +400,14 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
 fn draw_status(f: &mut Frame, state: &State, area: Rect) {
     if let Some(busy) = &state.busy {
         let style = Style::default()
-            .fg(Color::Rgb(178, 220, 245))
+            .fg(theme().assistant_indicator)
             .add_modifier(Modifier::ITALIC);
         f.render_widget(
             Paragraph::new(Span::styled(format!(" ● {busy}"), style)),
             area,
         );
     } else if let Some(err) = &state.error {
-        let style = Style::default().fg(COLOR_ERROR);
+        let style = Style::default().fg(theme().error);
         f.render_widget(
             Paragraph::new(Span::styled(format!(" • {err}"), style)),
             area,
@@ -396,18 +425,18 @@ fn draw_hints(f: &mut Frame, area: Rect) {
     let mut spans: Vec<Span> = Vec::new();
     for (idx, (key, desc)) in hints.iter().enumerate() {
         if idx > 0 {
-            spans.push(Span::styled("  ·  ", Style::default().fg(COLOR_HINT_SEP)));
+            spans.push(Span::styled("  ·  ", Style::default().fg(theme().hint_sep)));
         }
         spans.push(Span::styled(
             (*key).to_string(),
             Style::default()
-                .fg(COLOR_HINT_KEY)
+                .fg(theme().hint_key)
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             (*desc).to_string(),
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);

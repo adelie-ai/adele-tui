@@ -36,7 +36,7 @@ use tokio::{
 // `personality_selector` + `voice_client` from `lib.rs`). Only the orchestration
 // wiring them together (the `run` event loop, its RPC/signal helpers, the voice
 // plumbing types) lives in this file.
-use adele::app::{AdeleOutput, App, InputMode};
+use adele::app::{AdeleOutput, App, InputMode, ScreenRequest};
 use adele::in_flight::InFlight;
 use adele::keys::{Action, handle_key_event};
 use adele::picker::PickerOutcome;
@@ -48,6 +48,7 @@ use adele::{
     client_tools, connections, credentials, kb, model_selector, personality_selector, picker,
     purposes, screen, ui, voice,
 };
+use client_ui_common::{Effect, UiMessage};
 
 const DEFAULT_WS_URL: &str = desktop_assistant_client_common::config::DEFAULT_WS_URL;
 const DEFAULT_WS_SUBJECT: &str = desktop_assistant_client_common::config::DEFAULT_WS_SUBJECT;
@@ -143,6 +144,13 @@ impl From<CliArgs> for ConnectionConfig {
             ws_login_password: None,
             ws_subject,
             socket_path,
+            // Mint the UDS handshake JWT locally (#101/#316), not over the
+            // deprecated D-Bus path. UDS-only — see `Profile::to_connection_config`.
+            minter_socket: if matches!(transport_mode, TransportMode::Uds) {
+                desktop_assistant_client_common::minter::default_minter_socket_path()
+            } else {
+                None
+            },
             ..Default::default()
         }
     }
@@ -237,23 +245,6 @@ enum ReconnectState {
 
 const RECONNECT_INITIAL_SECS: u64 = 2;
 const RECONNECT_MAX_SECS: u64 = 30;
-
-/// The system refinement to attach on the next send for `conversation_id`,
-/// chosen by its `Adele:` level: `OnDemand` → brief/conversational/speakable;
-/// `Always` → speakable-but-full (don't shorten); `Disabled` → none. Pure
-/// decision the send path consults to choose the refinement string (empty =
-/// none).
-///
-/// The refinement prose + the level→refinement mapping now live in the shared
-/// `adele-voice-client-common` crate (desktop-assistant#274) so the GTK and TUI
-/// clients send byte-identical refinements. The shared helper returns
-/// `Option<&str>`; we keep this client's empty-string-means-none convention so
-/// the send call sites are untouched.
-fn refinement_for_send(app: &App, conversation_id: &str) -> &'static str {
-    app.adele_output_for(conversation_id)
-        .send_refinement()
-        .unwrap_or("")
-}
 
 fn next_backoff(prev_secs: u64) -> u64 {
     prev_secs.saturating_mul(2).min(RECONNECT_MAX_SECS)
@@ -422,6 +413,12 @@ async fn run(
     }
 
     loop {
+        // Project the run loop's connection state into the model so the view
+        // can render disconnect chrome — the loop owns the socket; the draw
+        // path only sees `app`. Mirror the exact predicate that gates sending
+        // (`connector.is_some()`) so the `offline` cue shows precisely when a
+        // send would be refused.
+        app.connected = connector.is_some();
         terminal.draw(|f| ui::draw(f, &mut app))?;
 
         if app.should_quit {
@@ -446,27 +443,149 @@ async fn run(
             ReconnectState::Connected => None,
         };
 
-        // Sub-screens (TUI-12): each modal screen now runs over the shared
-        // `screen::run_screen` driver, which drains the daemon signal stream via
-        // `handle_signal` while the screen is open so a turn parked on the TUI's
-        // `say_this` client tool is answered immediately instead of stalling
-        // until the screen closes. A `Disconnected` that arrives mid-screen is
-        // recorded by the drain callback and actioned right after the screen
-        // returns (the teardown touches loop-local state the callback can't own).
-        if app.kb_requested {
-            app.kb_requested = false;
+        // Sub-screens: each modal runs over the shared `screen::run_screen`
+        // driver, which drains the daemon signal stream while the screen is open
+        // (TUI-12) so a turn parked on the TUI's `say_this` client tool is
+        // answered immediately instead of stalling until the screen closes.
+        //
+        // A single dispatch point (CC-3): the user's request is mutually exclusive
+        // (`ScreenRequest`), so the loop opens at most one modal per turn. Every
+        // screen shares the same disconnect handling — a `Disconnected` drained
+        // mid-screen is recorded into `disconnect` and actioned once the screen
+        // returns, since the teardown touches loop-local state the sink can't own
+        // — so that skeleton is hoisted around the per-screen `match`.
+        if let Some(screen) = app.take_pending_screen() {
             let mut disconnect: Option<String> = None;
-            if let Some(conn) = connector.clone() {
-                let mut sink = SubScreenSink {
-                    app: &mut app,
-                    connector: &connector,
-                    voice_daemon: &voice_daemon,
-                    voice_session: &voice_session,
-                    narration_tx: &narration_tx,
-                    disconnect: &mut disconnect,
-                };
-                if let Err(e) = kb::run(terminal, conn.client(), &mut signal_rx, &mut sink).await {
-                    sink.app.status_message = format!("KB error: {e}");
+            match screen {
+                ScreenRequest::KnowledgeBase => {
+                    if let Some(conn) = connector.clone() {
+                        let mut sink = SubScreenSink {
+                            app: &mut app,
+                            connector: &connector,
+                            voice_daemon: &voice_daemon,
+                            voice_session: &voice_session,
+                            narration_tx: &narration_tx,
+                            disconnect: &mut disconnect,
+                        };
+                        if let Err(e) =
+                            kb::run(terminal, conn.client(), &mut signal_rx, &mut sink).await
+                        {
+                            sink.app.status_message = format!("KB error: {e}");
+                        }
+                    }
+                }
+                ScreenRequest::Connections => {
+                    if let Some(conn) = connector.clone() {
+                        let mut sink = SubScreenSink {
+                            app: &mut app,
+                            connector: &connector,
+                            voice_daemon: &voice_daemon,
+                            voice_session: &voice_session,
+                            narration_tx: &narration_tx,
+                            disconnect: &mut disconnect,
+                        };
+                        if let Err(e) =
+                            connections::run(terminal, conn.client(), &mut signal_rx, &mut sink)
+                                .await
+                        {
+                            sink.app.status_message = format!("Connections error: {e}");
+                        }
+                    }
+                }
+                ScreenRequest::Purposes => {
+                    if let Some(conn) = connector.clone() {
+                        let mut sink = SubScreenSink {
+                            app: &mut app,
+                            connector: &connector,
+                            voice_daemon: &voice_daemon,
+                            voice_session: &voice_session,
+                            narration_tx: &narration_tx,
+                            disconnect: &mut disconnect,
+                        };
+                        if let Err(e) =
+                            purposes::run(terminal, conn.client(), &mut signal_rx, &mut sink).await
+                        {
+                            sink.app.status_message = format!("Purposes error: {e}");
+                        }
+                    }
+                }
+                ScreenRequest::ModelPicker => {
+                    let mut picked_outcome = None;
+                    if let Some(conn) = connector.clone() {
+                        let current = app
+                            .current_conversation()
+                            .and_then(|c| c.model_selection.clone());
+                        let mut sink = SubScreenSink {
+                            app: &mut app,
+                            connector: &connector,
+                            voice_daemon: &voice_daemon,
+                            voice_session: &voice_session,
+                            narration_tx: &narration_tx,
+                            disconnect: &mut disconnect,
+                        };
+                        match model_selector::run(
+                            terminal,
+                            conn.client(),
+                            current,
+                            &mut signal_rx,
+                            &mut sink,
+                        )
+                        .await
+                        {
+                            Ok(outcome) => picked_outcome = Some(outcome),
+                            Err(e) => sink.app.status_message = format!("Model picker error: {e}"),
+                        }
+                    }
+                    // Apply the selection AFTER the sink's borrow of `app` ends.
+                    if let Some(model_selector::Outcome::Selected(picked)) = picked_outcome {
+                        let label = format!("{} · {}", picked.connection_id, picked.model_id);
+                        app.apply_model_override(picked);
+                        app.status_message = format!("Model: {label} (applies to next message)");
+                    }
+                }
+                ScreenRequest::PersonalityPicker => {
+                    let mut saved_outcome = None;
+                    // Only reachable with a loaded conversation (handle_action gates
+                    // on `current_conversation`), but re-check so the borrow stays
+                    // clean.
+                    let conv_info = app
+                        .current_conversation()
+                        .map(|conv| (conv.id.clone(), conv.conversation_personality));
+                    if let (Some(conn), Some((conv_id, current))) = (connector.clone(), conv_info) {
+                        let mut sink = SubScreenSink {
+                            app: &mut app,
+                            connector: &connector,
+                            voice_daemon: &voice_daemon,
+                            voice_session: &voice_session,
+                            narration_tx: &narration_tx,
+                            disconnect: &mut disconnect,
+                        };
+                        match personality_selector::run(
+                            terminal,
+                            conn.client(),
+                            conv_id,
+                            current,
+                            &mut signal_rx,
+                            &mut sink,
+                        )
+                        .await
+                        {
+                            Ok(outcome) => saved_outcome = Some(outcome),
+                            Err(e) => {
+                                sink.app.status_message = format!("Personality picker error: {e}")
+                            }
+                        }
+                    }
+                    // Apply the result AFTER the sink's borrow of `app` ends.
+                    if let Some(personality_selector::Outcome::Saved(stored)) = saved_outcome {
+                        let cleared = stored == Default::default();
+                        app.set_open_conversation_personality(stored);
+                        app.status_message = if cleared {
+                            "Personality cleared (using global)".into()
+                        } else {
+                            "Personality saved for this conversation".into()
+                        };
+                    }
                 }
             }
             apply_sub_screen_disconnect(
@@ -478,162 +597,6 @@ async fn run(
             );
             // Force a redraw on the next iteration so the chat reappears
             // immediately instead of waiting for the next event.
-            continue;
-        }
-
-        if app.connections_requested {
-            app.connections_requested = false;
-            let mut disconnect: Option<String> = None;
-            if let Some(conn) = connector.clone() {
-                let mut sink = SubScreenSink {
-                    app: &mut app,
-                    connector: &connector,
-                    voice_daemon: &voice_daemon,
-                    voice_session: &voice_session,
-                    narration_tx: &narration_tx,
-                    disconnect: &mut disconnect,
-                };
-                if let Err(e) =
-                    connections::run(terminal, conn.client(), &mut signal_rx, &mut sink).await
-                {
-                    sink.app.status_message = format!("Connections error: {e}");
-                }
-            }
-            apply_sub_screen_disconnect(
-                &mut app,
-                &mut connector,
-                &mut signal_rx,
-                &mut reconnect,
-                disconnect,
-            );
-            continue;
-        }
-
-        if app.purposes_requested {
-            app.purposes_requested = false;
-            let mut disconnect: Option<String> = None;
-            if let Some(conn) = connector.clone() {
-                let mut sink = SubScreenSink {
-                    app: &mut app,
-                    connector: &connector,
-                    voice_daemon: &voice_daemon,
-                    voice_session: &voice_session,
-                    narration_tx: &narration_tx,
-                    disconnect: &mut disconnect,
-                };
-                if let Err(e) =
-                    purposes::run(terminal, conn.client(), &mut signal_rx, &mut sink).await
-                {
-                    sink.app.status_message = format!("Purposes error: {e}");
-                }
-            }
-            apply_sub_screen_disconnect(
-                &mut app,
-                &mut connector,
-                &mut signal_rx,
-                &mut reconnect,
-                disconnect,
-            );
-            continue;
-        }
-
-        if app.model_picker_requested {
-            app.model_picker_requested = false;
-            let mut disconnect: Option<String> = None;
-            let mut picked_outcome = None;
-            if let Some(conn) = connector.clone() {
-                let current = app
-                    .current_conversation
-                    .as_ref()
-                    .and_then(|c| c.model_selection.clone());
-                let mut sink = SubScreenSink {
-                    app: &mut app,
-                    connector: &connector,
-                    voice_daemon: &voice_daemon,
-                    voice_session: &voice_session,
-                    narration_tx: &narration_tx,
-                    disconnect: &mut disconnect,
-                };
-                match model_selector::run(
-                    terminal,
-                    conn.client(),
-                    current,
-                    &mut signal_rx,
-                    &mut sink,
-                )
-                .await
-                {
-                    Ok(outcome) => picked_outcome = Some(outcome),
-                    Err(e) => sink.app.status_message = format!("Model picker error: {e}"),
-                }
-            }
-            // Apply the selection AFTER the sink's borrow of `app` ends.
-            if let Some(model_selector::Outcome::Selected(picked)) = picked_outcome {
-                let label = format!("{} · {}", picked.connection_id, picked.model_id);
-                app.apply_model_override(picked);
-                app.status_message = format!("Model: {label} (applies to next message)");
-            }
-            apply_sub_screen_disconnect(
-                &mut app,
-                &mut connector,
-                &mut signal_rx,
-                &mut reconnect,
-                disconnect,
-            );
-            continue;
-        }
-
-        if app.personality_picker_requested {
-            app.personality_picker_requested = false;
-            let mut disconnect: Option<String> = None;
-            let mut saved_outcome = None;
-            // Only reachable with a loaded conversation (handle_action gates on
-            // `current_conversation`), but re-check so the borrow stays clean.
-            let conv_info = app
-                .current_conversation
-                .as_ref()
-                .map(|conv| (conv.id.clone(), conv.conversation_personality));
-            if let (Some(conn), Some((conv_id, current))) = (connector.clone(), conv_info) {
-                let mut sink = SubScreenSink {
-                    app: &mut app,
-                    connector: &connector,
-                    voice_daemon: &voice_daemon,
-                    voice_session: &voice_session,
-                    narration_tx: &narration_tx,
-                    disconnect: &mut disconnect,
-                };
-                match personality_selector::run(
-                    terminal,
-                    conn.client(),
-                    conv_id,
-                    current,
-                    &mut signal_rx,
-                    &mut sink,
-                )
-                .await
-                {
-                    Ok(outcome) => saved_outcome = Some(outcome),
-                    Err(e) => sink.app.status_message = format!("Personality picker error: {e}"),
-                }
-            }
-            // Apply the result AFTER the sink's borrow of `app` ends.
-            if let Some(personality_selector::Outcome::Saved(stored)) = saved_outcome {
-                if let Some(c) = app.current_conversation.as_mut() {
-                    c.conversation_personality = Some(stored);
-                }
-                app.status_message = if stored == Default::default() {
-                    "Personality cleared (using global)".into()
-                } else {
-                    "Personality saved for this conversation".into()
-                };
-            }
-            apply_sub_screen_disconnect(
-                &mut app,
-                &mut connector,
-                &mut signal_rx,
-                &mut reconnect,
-                disconnect,
-            );
             continue;
         }
 
@@ -651,6 +614,12 @@ async fn run(
                     if key.kind == KeyEventKind::Release {
                         continue;
                     }
+                    // The help overlay is informational: while it's open, ANY key
+                    // dismisses it (and does nothing else).
+                    if app.show_help {
+                        app.show_help = false;
+                        continue;
+                    }
                     if let Some(action) = handle_key_event(key, &app.mode, app.tasks.visible) {
                         if action == Action::Dictate {
                             // Push-to-talk (adele-tui#77). Prefer the voice
@@ -662,8 +631,7 @@ async fn run(
                             // when the daemon is absent.
                             if voice_daemon.is_available().await {
                                 let conv = app
-                                    .current_conversation
-                                    .as_ref()
+                                    .current_conversation()
                                     .map(|c| c.id.clone());
                                 // Barge-in: stop any in-progress narration before
                                 // we start listening, so the mic doesn't capture
@@ -769,9 +737,7 @@ async fn run(
                         // exists daemon-side) and reselect it by ID — the
                         // sidebar selection is positional and the refreshed
                         // list may have reordered.
-                        if let Some(open_id) =
-                            app.current_conversation.as_ref().map(|c| c.id.clone())
-                        {
+                        if let Some(open_id) = app.current_conversation().map(|c| c.id.clone()) {
                             app.select_conversation_by_id(&open_id);
                             match conn.client().get_conversation(&open_id).await {
                                 Ok(detail) => app.load_conversation(detail),
@@ -990,7 +956,19 @@ fn apply_rpc_outcome(app: &mut App, outcome: RpcOutcome) -> bool {
         },
         RpcOutcome::ConversationsRefreshed { list, on_success } => match list {
             Ok(convs) => {
-                app.set_conversations(convs);
+                // The list-only refresh (a show-archived/(un)archive toggle, or a
+                // `ConversationListChanged` refetch) flows through the reducer's
+                // `ConversationListRefetched`, which repaints the sidebar
+                // (`SetConversations`) and re-syncs the selection
+                // (`EnsureActiveConversation` — a no-op in the TUI). The open
+                // conversation + its chat are deliberately left untouched. These
+                // are all view-effects, so `apply_core` fully handles them and
+                // returns nothing for the loop to run.
+                let effects = app.apply_core(UiMessage::ConversationListRefetched(convs));
+                debug_assert!(
+                    effects.is_empty(),
+                    "ConversationListRefetched must emit only view-effects: {effects:?}"
+                );
                 if let Some(msg) = on_success {
                     app.status_message = msg;
                 }
@@ -1032,6 +1010,31 @@ enum SignalAction {
     RefreshConversations,
 }
 
+/// Run the controller-level effects [`App::apply_core`] bubbled up from a
+/// streaming signal — the ones the view can't perform itself. Today the streaming
+/// arms bubble up only [`Effect::Speak`] (reply narration, already gated by
+/// core's `StreamComplete`); the view-level effects (including the side-pane
+/// no-ops) were already absorbed inside `apply_core`. Later CC-3 slices route the
+/// open-conversation RPC effects and handle them here.
+fn run_stream_controller_effects(
+    effects: Vec<Effect>,
+    voice_daemon: &VoiceController,
+    voice_session: &Option<VoiceSession>,
+    narration_tx: &UnboundedSender<NarrationRequest>,
+) {
+    // Today the streaming arms bubble up only `Speak`; any other effect is
+    // ignored here (later CC-3 slices route the open-conversation RPC effects).
+    // Reaching the body means core's narration gate passed; skip an empty reply
+    // so we don't enqueue silence.
+    for effect in effects {
+        if let Effect::Speak(text) = effect
+            && !text.trim().is_empty()
+        {
+            enqueue_narration(narration_tx, voice_daemon, voice_session, text);
+        }
+    }
+}
+
 /// Apply one daemon [`SignalEvent`] to `App` (+ voice). Extracted from the main
 /// `select!` so it can be reused by the sub-screen driver (TUI-12): while a modal
 /// screen is open, [`screen::run_screen`] drains the signal stream through this
@@ -1051,63 +1054,75 @@ async fn handle_signal(
     signal: SignalEvent,
 ) -> SignalAction {
     match signal {
-        // A user message was committed and a turn started (#1). For our own send
-        // this dedupes (the bubble was drawn optimistically); for a turn started
-        // elsewhere (a voice turn) in the open conversation it renders the user
-        // bubble and adopts the turn so its reply streams live. All streaming
-        // events now carry `conversation_id` too, but the in-flight slot routes
-        // them by `request_id`, so it is dropped on those arms.
+        // The streaming events (#1) route through the shared core
+        // (`App::apply_core`): the reducer owns the in-flight state machine —
+        // request-id claiming, originating-conversation targeting (TUI-4), and
+        // the reply-narration gate — and emits effects. `apply_core` applies the
+        // view-level effects (transcript, chat status, context fill) onto `App`
+        // in place and returns the controller-level ones (narration) for
+        // `run_stream_controller_effects` to run. The events carry
+        // `conversation_id` too, but the in-flight slot routes the stream arms by
+        // `request_id`, so the reducer drops it there.
         SignalEvent::UserMessageAdded {
             conversation_id,
             request_id,
             content,
         } => {
-            app.user_message_added(&conversation_id, &request_id, &content);
+            let effects = app.apply_core(UiMessage::UserMessageAdded {
+                conversation_id,
+                request_id,
+                content,
+            });
+            run_stream_controller_effects(effects, voice_daemon, voice_session, narration_tx);
         }
         SignalEvent::Chunk {
             request_id, chunk, ..
         } => {
-            app.receive_chunk(&request_id, &chunk);
+            let effects = app.apply_core(UiMessage::StreamChunk { request_id, chunk });
+            run_stream_controller_effects(effects, voice_daemon, voice_session, narration_tx);
         }
         SignalEvent::Complete {
             request_id,
             full_response,
             ..
         } => {
-            // `complete_streaming` reports the ORIGINATING conversation (TUI-4) —
-            // the one the prompt was sent to, not whichever is open now — and the
-            // narration gate (adele-tui#77: `Adele == Always` OR `Adele ==
-            // OnDemand` AND `You == Enabled`) is evaluated against THAT
-            // conversation's settings. Routed daemon-first + chunked through the
-            // single narration queue (TUI-11) so it can't interleave with a
-            // `say_this` aside; the queue task speaks it so synth never blocks the
-            // UI. Gated entirely here so the cut-off holds: when the gate is false
-            // nothing is spoken on any path.
-            // An adopted external turn (a voice turn, or another client) is
-            // narrated by its originator — tui must not also speak it. Capture
-            // the flag before `complete_streaming` resets it.
-            let was_external = app.streaming_is_external;
-            let origin = app.complete_streaming(&request_id, &full_response);
-            if let Some(origin) = origin
-                && !was_external
-                && app.narrate_for(&origin)
-                && !full_response.trim().is_empty()
-            {
-                enqueue_narration(narration_tx, voice_daemon, voice_session, full_response);
-            }
+            // The whole narration gate — TUI-4 originating-conversation
+            // targeting, the adele-tui#77 `Adele`-level gate (`Always` OR
+            // `OnDemand` AND `You == Enabled`), external-turn suppression, and the
+            // `say_this` dedupe — now lives in core's `StreamComplete`, which
+            // emits a `Speak` effect when (and only when) the reply should be
+            // spoken. `run_stream_controller_effects` routes that through the
+            // single narration queue (TUI-11) so synth never blocks the UI and a
+            // `say_this` aside can't interleave.
+            let effects = app.apply_core(UiMessage::StreamComplete {
+                request_id,
+                full_response,
+            });
+            run_stream_controller_effects(effects, voice_daemon, voice_session, narration_tx);
         }
         SignalEvent::Error {
             request_id, error, ..
         } => {
-            app.streaming_error(&request_id, &error);
+            let effects = app.apply_core(UiMessage::StreamError {
+                request_id,
+                error: error.clone(),
+            });
+            run_stream_controller_effects(effects, voice_daemon, voice_session, narration_tx);
+            // The reducer surfaces "Error: …" in the status line only for the
+            // matching in-flight stream; set it unconditionally too so an error
+            // for an already-resolved request still reaches the user.
             app.status_message = format!("Error: {error}");
         }
         SignalEvent::Status {
-            request_id: _,
+            request_id,
             message,
             ..
         } => {
-            app.set_assistant_status(message);
+            let effects = app.apply_core(UiMessage::AssistantStatus {
+                request_id,
+                message,
+            });
+            run_stream_controller_effects(effects, voice_daemon, voice_session, narration_tx);
         }
         SignalEvent::ContextUsage {
             conversation_id,
@@ -1116,14 +1131,13 @@ async fn handle_signal(
             budget_tokens,
             compaction_active,
         } => {
-            app.set_context_usage(
-                &conversation_id,
-                adele::app::ContextUsageView {
-                    used_tokens,
-                    budget_tokens,
-                    compaction_active,
-                },
-            );
+            let effects = app.apply_core(UiMessage::ContextUsage {
+                conversation_id,
+                used_tokens,
+                budget_tokens,
+                compaction_active,
+            });
+            run_stream_controller_effects(effects, voice_daemon, voice_session, narration_tx);
         }
         SignalEvent::TitleChanged {
             conversation_id,
@@ -1379,7 +1393,7 @@ async fn handle_action(
             }
         }
         Action::EnterEditMode => {
-            if app.current_conversation.is_some() {
+            if app.current_conversation().is_some() {
                 app.enter_editing_mode();
             } else {
                 app.status_message = "Open a conversation first (Enter) or create one (n)".into();
@@ -1462,7 +1476,7 @@ async fn handle_action(
                 let id = id.to_string();
                 // Determine if conversation is currently archived
                 let is_archived = app
-                    .conversations
+                    .conversations()
                     .get(app.selected_conversation.unwrap_or(0))
                     .is_some_and(|c| c.archived);
                 let show_archived = app.show_archived;
@@ -1544,34 +1558,35 @@ async fn handle_action(
                 "Conversation list hidden (Ctrl+B to show)".into()
             };
         }
+        Action::ToggleHelp => app.toggle_help(),
         Action::SwitchConnection => {
             app.switch_requested = true;
             app.status_message = "Switching connection...".into();
         }
         Action::OpenKnowledgeBase => {
             if client.is_some() {
-                app.kb_requested = true;
+                app.request_screen(ScreenRequest::KnowledgeBase);
             } else {
                 app.status_message = "Not connected — knowledge base unavailable".into();
             }
         }
         Action::OpenConnections => {
             if client.is_some() {
-                app.connections_requested = true;
+                app.request_screen(ScreenRequest::Connections);
             } else {
                 app.status_message = "Not connected — connections manager unavailable".into();
             }
         }
         Action::OpenPurposes => {
             if client.is_some() {
-                app.purposes_requested = true;
+                app.request_screen(ScreenRequest::Purposes);
             } else {
                 app.status_message = "Not connected — purposes manager unavailable".into();
             }
         }
         Action::OpenModelPicker => {
             if client.is_some() {
-                app.model_picker_requested = true;
+                app.request_screen(ScreenRequest::ModelPicker);
             } else {
                 app.status_message = "Not connected — model picker unavailable".into();
             }
@@ -1579,11 +1594,11 @@ async fn handle_action(
         Action::OpenPersonalityPicker => {
             if client.is_none() {
                 app.status_message = "Not connected — personality picker unavailable".into();
-            } else if app.current_conversation.is_none() {
+            } else if app.current_conversation().is_none() {
                 app.status_message =
                     "Open a conversation first (Enter) — personality is per-conversation".into();
             } else {
-                app.personality_picker_requested = true;
+                app.request_screen(ScreenRequest::PersonalityPicker);
             }
         }
         Action::ToggleTasksPane => {
@@ -1921,53 +1936,69 @@ fn insert_dictated_text(app: &mut App, text: &str) {
 /// (which appends a transcript to the input, then submits via the same route),
 /// so both honor the staged model override and the same ack handling.
 ///
-/// The connected/streaming gates run BEFORE any state mutation
-/// (`App::prepare_submission`, TUI-2/TUI-7), and a failed send RPC rolls the
-/// optimistic transcript append back and refills the composer
-/// (`App::restore_failed_submission`).
+/// The send *decision* lives in the shared core (`UiMessage::SubmitPrompt`,
+/// Phase-2): it runs the streaming/empty gate (TUI-7), draws the user bubble
+/// optimistically, and — when accepted — hands back an [`Effect::SendPrompt`]
+/// for this executor to run as the actual RPC. Only the connection gate and the
+/// transport-specific RPC + override stay here. A failed send rolls the
+/// optimistic bubble back via `UiMessage::SendFailed` and refills the composer.
 async fn send_prompt_from_input(app: &mut App, connector: &Option<Rc<Connector>>) {
-    if let Some((conv_id, prompt)) = app.prepare_submission(connector.is_some())
-        && let Some(connector) = connector.as_ref()
-    {
-        let client = connector.client();
-        let override_selection = app.take_pending_override();
-        // Per the conversation's `Adele:` level (adele-tui#77) carry a system
-        // refinement so the reply is shaped for speech: OnDemand → brief and
-        // conversational; Always → speakable but full (not shortened); Disabled →
-        // none. It only refines the system prompt for THIS turn — never stored,
-        // never in the transcript.
-        let refinement = refinement_for_send(app, &conv_id);
-        // Use the command-channel `send_prompt_full` when a model override is
-        // staged (model picker) and/or a refinement applies; the high-level
-        // `send_prompt` carries neither. `as_commands()` is `Some` on both
-        // socket transports (UDS + WS) but `None` on D-Bus. The Connector's
-        // refinement helper already folds the refinement into the prompt over
-        // D-Bus, so the no-override voice-mode path works everywhere.
-        let result = match (override_selection, client.as_commands()) {
-            (Some(ovr), Some(commands)) => {
-                commands
-                    .send_prompt_full(&conv_id, &prompt, Some(ovr), refinement.to_string())
-                    .await
-            }
-            (Some(_), None) => {
-                app.status_message =
-                    "Model override isn't supported over D-Bus — sent without override".into();
-                connector
-                    .send_prompt_with_system_refinement(&conv_id, &prompt, refinement)
-                    .await
-            }
-            (None, _) => {
-                connector
-                    .send_prompt_with_system_refinement(&conv_id, &prompt, refinement)
-                    .await
-            }
-        };
-        match result {
-            Ok(task_id) => app.apply_prompt_ack(task_id, conv_id.clone()),
-            Err(e) => {
-                app.restore_failed_submission(&conv_id, &prompt);
-                app.status_message = format!("Send error: {e} (your text is preserved)");
-            }
+    // Connection gate: transport state the core doesn't own.
+    let Some(connector) = connector.as_ref() else {
+        app.status_message = "Not connected — message not sent (your text is preserved)".into();
+        return;
+    };
+    let prompt = app.textarea_content();
+    let effects = app.apply_core(UiMessage::SubmitPrompt { prompt });
+    let Some(Effect::SendPrompt {
+        conversation_id,
+        prompt,
+        system_refinement,
+    }) = effects
+        .into_iter()
+        .find(|e| matches!(e, Effect::SendPrompt { .. }))
+    else {
+        // Rejected (still streaming / empty / no open conversation): the core
+        // already surfaced any status message and left the composer untouched.
+        return;
+    };
+    // Accepted: the user bubble is drawn, so clear the composer and snap to the
+    // bottom, then run the RPC. `send_prompt_full` carries the staged model
+    // override (socket transports only); over D-Bus the refinement folds into the
+    // prompt, so the no-override voice path works everywhere. `system_refinement`
+    // is `None` when the conversation's `Adele:` level is Disabled.
+    app.clear_composer();
+    app.scroll_to_bottom();
+    let client = connector.client();
+    let refinement = system_refinement.as_deref().unwrap_or("");
+    let result = match (app.take_pending_override(), client.as_commands()) {
+        (Some(ovr), Some(commands)) => {
+            commands
+                .send_prompt_full(&conversation_id, &prompt, Some(ovr), refinement.to_string())
+                .await
+        }
+        (Some(_), None) => {
+            app.status_message =
+                "Model override isn't supported over D-Bus — sent without override".into();
+            connector
+                .send_prompt_with_system_refinement(&conversation_id, &prompt, refinement)
+                .await
+        }
+        (None, _) => {
+            connector
+                .send_prompt_with_system_refinement(&conversation_id, &prompt, refinement)
+                .await
+        }
+    };
+    match result {
+        Ok(task_id) => app.apply_prompt_ack(task_id, conversation_id),
+        Err(e) => {
+            let _ = app.apply_core(UiMessage::SendFailed {
+                conversation_id,
+                prompt: prompt.clone(),
+            });
+            app.set_composer(&prompt);
+            app.status_message = format!("Send error: {e} (your text is preserved)");
         }
     }
 }
@@ -2015,8 +2046,7 @@ async fn init_background_tasks(
 /// open and empty otherwise. The command is set-replace, so an empty list tells
 /// the daemon to stop fanning any conversation's turn events to this connection.
 fn open_conversation_ids(app: &App) -> Vec<String> {
-    app.current_conversation
-        .as_ref()
+    app.current_conversation()
         .map(|c| vec![c.id.clone()])
         .unwrap_or_default()
 }
@@ -2275,7 +2305,7 @@ mod tests {
     #[test]
     fn open_conversation_ids_is_empty_with_nothing_open() {
         let app = App::new();
-        assert!(app.current_conversation.is_none());
+        assert!(app.current_conversation().is_none());
         // Set-replace semantics: an empty set tells the daemon to stop fanning
         // any conversation's turn events here (e.g. the initial connect, before
         // anything is opened).

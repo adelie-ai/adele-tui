@@ -70,6 +70,8 @@ pub enum Action {
     /// `Adele == On Demand` — reply narration is on. Defaults `Disabled` (type
     /// only); text input is always available.
     ToggleVoiceIn,
+    /// Toggle the keymap help overlay (`?` in Normal mode, or `F1` from anywhere).
+    ToggleHelp,
 }
 
 /// Handle key events that we intercept before passing to textarea.
@@ -99,6 +101,12 @@ pub fn handle_key_event(
     // F4 opens the purposes manager.
     if key.code == KeyCode::F(4) && key.modifiers.is_empty() {
         return Some(Action::OpenPurposes);
+    }
+    // F1 toggles the keymap help overlay from any mode (`?` also opens it in
+    // Normal mode; F1 is offered too since `?` is a literal character in the
+    // composer).
+    if key.code == KeyCode::F(1) && key.modifiers.is_empty() {
+        return Some(Action::ToggleHelp);
     }
 
     // Ctrl combos. Most apply across modes, but in Renaming we forward
@@ -185,6 +193,7 @@ pub fn handle_key_event(
                 KeyCode::Char('A') => Some(Action::ArchiveConversation),
                 KeyCode::Char('r') => Some(Action::BeginRename),
                 KeyCode::Char('i') => Some(Action::EnterEditMode),
+                KeyCode::Char('?') => Some(Action::ToggleHelp),
                 KeyCode::PageUp => Some(Action::ScrollUp),
                 KeyCode::PageDown => Some(Action::ScrollDown),
                 KeyCode::End => Some(Action::ScrollToBottom),
@@ -224,6 +233,79 @@ pub fn handle_key_event(
             }
         }
     }
+}
+
+/// The keymap shown in the `?`/F1 help overlay (rendered by `ui::draw_help_overlay`).
+/// Lives next to `handle_key_event` so the help stays the single source of truth
+/// for the bindings.
+pub fn help_sections() -> &'static [(&'static str, &'static [(&'static str, &'static str)])] {
+    &[
+        (
+            "Conversations (Normal mode)",
+            &[
+                ("j / k   ↑ / ↓", "move selection"),
+                ("Enter", "open conversation"),
+                ("i", "compose / edit"),
+                ("n", "new conversation"),
+                ("r", "rename"),
+                ("d", "delete"),
+                ("A", "archive"),
+                ("a", "show / hide archived"),
+                ("q", "quit"),
+            ],
+        ),
+        (
+            "Composing (edit mode)",
+            &[
+                ("Enter", "send"),
+                ("Shift+Enter / Ctrl+J", "insert newline"),
+                ("Esc", "leave edit mode"),
+            ],
+        ),
+        (
+            "Scroll",
+            &[
+                ("Ctrl+U / Ctrl+D", "page up / down"),
+                ("Ctrl+E", "jump to bottom"),
+            ],
+        ),
+        (
+            "View",
+            &[
+                ("Ctrl+B", "toggle sidebar"),
+                ("Ctrl+T", "toggle debug messages"),
+                ("Ctrl+P", "tasks pane"),
+            ],
+        ),
+        (
+            "Open",
+            &[
+                ("F2", "switch connection"),
+                ("F3", "connections manager"),
+                ("F4", "purposes"),
+                ("Ctrl+K", "knowledge base"),
+                ("Ctrl+M", "model picker"),
+                ("Ctrl+R", "personality"),
+            ],
+        ),
+        (
+            "Voice",
+            &[
+                ("Ctrl+G", "push-to-talk dictation"),
+                ("Ctrl+S", "cycle Adele voice output"),
+                ("Ctrl+V", "toggle You (voice input)"),
+            ],
+        ),
+        (
+            "Tasks pane (when open)",
+            &[
+                ("j / k", "move selection"),
+                ("c", "cancel task"),
+                ("Enter", "open task's conversation"),
+                ("Esc", "close pane"),
+            ],
+        ),
+    ]
 }
 
 #[cfg(test)]

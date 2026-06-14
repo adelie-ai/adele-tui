@@ -26,7 +26,7 @@
 //! - `y` / `Enter`: confirm
 //! - `f`: force-delete (purposes referencing this connection fall back to
 //!   the `interactive` purpose, per the daemon's contract)
-//! - any other key: cancel
+//! - `n`/`Esc`: cancel (any other key is ignored)
 
 use std::io;
 
@@ -47,17 +47,7 @@ use ratatui_textarea::{CursorMove, TextArea};
 
 use crate::screen::Screen;
 
-const COLOR_BORDER: Color = Color::Rgb(82, 104, 173);
-const COLOR_BORDER_ACTIVE: Color = Color::Rgb(120, 183, 109);
-const COLOR_TITLE: Color = Color::Rgb(166, 182, 255);
-const COLOR_HINT_KEY: Color = Color::Rgb(216, 223, 236);
-const COLOR_HINT_DESC: Color = Color::Rgb(143, 153, 174);
-const COLOR_HINT_SEP: Color = Color::Rgb(82, 90, 110);
-const COLOR_LIST_HIGHLIGHT: Color = Color::Rgb(72, 102, 180);
-const COLOR_LIST_HIGHLIGHT_FG: Color = Color::Rgb(245, 248, 255);
-const COLOR_ERROR: Color = Color::Rgb(232, 130, 130);
-const COLOR_OK: Color = Color::Rgb(132, 218, 193);
-const COLOR_DELETE_BORDER: Color = Color::Rgb(232, 130, 130);
+use crate::theme::theme;
 
 /// Connector kinds the TUI can build forms for. Mirrors
 /// `ConnectionConfigView` variants.
@@ -253,6 +243,20 @@ fn single_line_textarea() -> TextArea<'static> {
     ta
 }
 
+use crate::in_flight::InFlight;
+
+/// Resolved outcome of an off-loop connections RPC (modal-freeze fix). Each
+/// variant carries the daemon result (stringified error); `apply_outcome` may
+/// chain a follow-up `refresh_list` after a successful save/delete.
+enum RpcOutcome {
+    Listed(Result<CommandResult, String>),
+    Saved(Result<CommandResult, String>),
+    Deleted {
+        force: bool,
+        result: Result<CommandResult, String>,
+    },
+}
+
 struct State {
     connections: Vec<ConnectionView>,
     selected: usize,
@@ -270,6 +274,9 @@ struct State {
 struct ConnectionsScreen<'a> {
     state: State,
     client: &'a TransportClient,
+    /// In-flight list/save/delete RPCs, polled off the draw loop by
+    /// `poll_pending` so the screen never freezes during a round-trip.
+    pending: InFlight<'a, RpcOutcome>,
 }
 
 impl Screen for ConnectionsScreen<'_> {
@@ -279,16 +286,32 @@ impl Screen for ConnectionsScreen<'_> {
         draw(frame, &self.state);
     }
 
-    async fn handle_key(&mut self, key: KeyEvent) {
+    fn handle_key(&mut self, key: KeyEvent) -> impl std::future::Future<Output = ()> {
+        // Synchronous: RPC-bearing keys enqueue into `pending` rather than
+        // awaiting here, so the handler never blocks the draw/input loop.
         match self.state.mode {
-            Mode::List => handle_list_key(&mut self.state, key, self.client).await,
-            Mode::Edit => handle_edit_key(&mut self.state, key, self.client).await,
-            Mode::DeleteConfirm => handle_delete_key(&mut self.state, key, self.client).await,
+            Mode::List => handle_list_key(&mut self.state, key, self.client, &mut self.pending),
+            Mode::Edit => handle_edit_key(&mut self.state, key, self.client, &mut self.pending),
+            Mode::DeleteConfirm => {
+                handle_delete_key(&mut self.state, key, self.client, &mut self.pending)
+            }
         }
+        std::future::ready(())
     }
 
     fn take_outcome(&mut self) -> Option<()> {
         self.state.closing.then_some(())
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    async fn poll_pending(&mut self) {
+        let resolved = self.pending.next().await;
+        if let Some(outcome) = resolved {
+            apply_outcome(&mut self.state, &mut self.pending, self.client, outcome);
+        }
     }
 }
 
@@ -309,14 +332,22 @@ pub async fn run(
             closing: false,
         },
         client,
+        pending: InFlight::new(),
     };
 
-    refresh_list(&mut screen.state, client).await;
+    // Kick the initial load off-loop so "Loading connections…" shows and the
+    // screen is responsive while it lands.
+    refresh_list(&mut screen.state, &mut screen.pending, client);
 
     crate::screen::run_screen(terminal, &mut screen, signal_rx, sink).await
 }
 
-async fn handle_list_key(state: &mut State, key: KeyEvent, client: &TransportClient) {
+fn handle_list_key<'a>(
+    state: &mut State,
+    key: KeyEvent,
+    client: &'a TransportClient,
+    pending: &mut InFlight<'a, RpcOutcome>,
+) {
     match (key.code, key.modifiers) {
         (KeyCode::Esc | KeyCode::Char('q'), m) if m.is_empty() => state.closing = true,
         (KeyCode::Char('j') | KeyCode::Down, m) if m.is_empty() => advance_selection(state, 1),
@@ -338,16 +369,21 @@ async fn handle_list_key(state: &mut State, key: KeyEvent, client: &TransportCli
         {
             state.mode = Mode::DeleteConfirm;
         }
-        (KeyCode::Char('r'), m) if m.is_empty() => refresh_list(state, client).await,
+        (KeyCode::Char('r'), m) if m.is_empty() => refresh_list(state, pending, client),
         _ => {}
     }
 }
 
-async fn handle_edit_key(state: &mut State, key: KeyEvent, client: &TransportClient) {
+fn handle_edit_key<'a>(
+    state: &mut State,
+    key: KeyEvent,
+    client: &'a TransportClient,
+    pending: &mut InFlight<'a, RpcOutcome>,
+) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
     if ctrl && key.code == KeyCode::Char('s') {
-        save_edit(state, client).await;
+        save_edit(state, pending, client);
         return;
     }
 
@@ -411,19 +447,34 @@ async fn handle_edit_key(state: &mut State, key: KeyEvent, client: &TransportCli
     }
 }
 
-async fn handle_delete_key(state: &mut State, key: KeyEvent, client: &TransportClient) {
+fn handle_delete_key<'a>(
+    state: &mut State,
+    key: KeyEvent,
+    client: &'a TransportClient,
+    pending: &mut InFlight<'a, RpcOutcome>,
+) {
     match (key.code, key.modifiers) {
         (KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter, _) => {
-            do_delete(state, client, false).await;
+            do_delete(state, pending, client, false);
         }
         (KeyCode::Char('f') | KeyCode::Char('F'), _) => {
-            do_delete(state, client, true).await;
+            do_delete(state, pending, client, true);
         }
-        _ => state.mode = Mode::List,
+        // A destructive confirm is dismissed only by an explicit cancel
+        // (n/Esc); any other key is ignored rather than silently closing it.
+        (KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc, _) => {
+            state.mode = Mode::List;
+        }
+        _ => {}
     }
 }
 
-async fn do_delete(state: &mut State, client: &TransportClient, force: bool) {
+fn do_delete<'a>(
+    state: &mut State,
+    pending: &mut InFlight<'a, RpcOutcome>,
+    client: &'a TransportClient,
+    force: bool,
+) {
     let Some(view) = state.connections.get(state.selected).cloned() else {
         state.mode = Mode::List;
         return;
@@ -433,34 +484,15 @@ async fn do_delete(state: &mut State, client: &TransportClient, force: bool) {
     } else {
         "Deleting...".into()
     });
-    match send(
-        client,
-        Command::DeleteConnection {
-            id: view.id.clone(),
+    let id = view.id.clone();
+    pending.push(async move {
+        RpcOutcome::Deleted {
             force,
-        },
-    )
-    .await
-    {
-        Ok(_) => {
-            state.busy = None;
-            state.mode = Mode::List;
-            refresh_list(state, client).await;
+            result: send(client, Command::DeleteConnection { id, force })
+                .await
+                .map_err(|e| e.to_string()),
         }
-        Err(e) => {
-            state.busy = None;
-            // The daemon refuses non-force deletes when purposes still
-            // reference the connection. Surface that and stay in the
-            // confirm overlay so the user can press `f` to force.
-            let msg = e.to_string();
-            if !force && msg.to_lowercase().contains("purpose") {
-                state.error = Some(format!("{msg} — press 'f' to force"));
-            } else {
-                state.error = Some(format!("Delete failed: {msg}"));
-                state.mode = Mode::List;
-            }
-        }
-    }
+    });
 }
 
 fn advance_selection(state: &mut State, delta: i32) {
@@ -478,27 +510,26 @@ fn advance_selection(state: &mut State, delta: i32) {
     state.selected = idx as usize;
 }
 
-async fn refresh_list(state: &mut State, client: &TransportClient) {
+fn refresh_list<'a>(
+    state: &mut State,
+    pending: &mut InFlight<'a, RpcOutcome>,
+    client: &'a TransportClient,
+) {
     state.busy = Some("Loading connections...".into());
-    let result = send(client, Command::ListConnections).await;
-    state.busy = None;
-    match result {
-        Ok(CommandResult::Connections(conns)) => {
-            state.connections = conns;
-            if state.selected >= state.connections.len() {
-                state.selected = state.connections.len().saturating_sub(1);
-            }
-        }
-        Ok(other) => {
-            state.error = Some(format!("Unexpected response: {other:?}"));
-        }
-        Err(e) => {
-            state.error = Some(format!("Failed to load connections: {e}"));
-        }
-    }
+    pending.push(async move {
+        RpcOutcome::Listed(
+            send(client, Command::ListConnections)
+                .await
+                .map_err(|e| e.to_string()),
+        )
+    });
 }
 
-async fn save_edit(state: &mut State, client: &TransportClient) {
+fn save_edit<'a>(
+    state: &mut State,
+    pending: &mut InFlight<'a, RpcOutcome>,
+    client: &'a TransportClient,
+) {
     let (id, config) = match state.form.submit() {
         Ok(parts) => parts,
         Err(e) => {
@@ -517,18 +548,56 @@ async fn save_edit(state: &mut State, client: &TransportClient) {
         Command::CreateConnection { id, config }
     };
 
-    match send(client, cmd).await {
-        Ok(_) => {
-            state.busy = None;
-            state.error = None;
-            state.form = EditForm::empty();
-            state.mode = Mode::List;
-            refresh_list(state, client).await;
-        }
-        Err(e) => {
-            state.busy = None;
-            state.error = Some(format!("Save failed: {e}"));
-        }
+    pending
+        .push(async move { RpcOutcome::Saved(send(client, cmd).await.map_err(|e| e.to_string())) });
+}
+
+/// Apply a resolved connections RPC; chains a `refresh_list` after a successful
+/// save or delete (mirroring the old inline `refresh_list().await`).
+fn apply_outcome<'a>(
+    state: &mut State,
+    pending: &mut InFlight<'a, RpcOutcome>,
+    client: &'a TransportClient,
+    outcome: RpcOutcome,
+) {
+    state.busy = None;
+    match outcome {
+        RpcOutcome::Listed(result) => match result {
+            Ok(CommandResult::Connections(conns)) => {
+                state.connections = conns;
+                if state.selected >= state.connections.len() {
+                    state.selected = state.connections.len().saturating_sub(1);
+                }
+            }
+            Ok(other) => state.error = Some(format!("Unexpected response: {other:?}")),
+            Err(e) => state.error = Some(format!("Failed to load connections: {e}")),
+        },
+        RpcOutcome::Saved(result) => match result {
+            Ok(_) => {
+                state.error = None;
+                state.form = EditForm::empty();
+                state.mode = Mode::List;
+                refresh_list(state, pending, client);
+            }
+            Err(e) => state.error = Some(format!("Save failed: {e}")),
+        },
+        RpcOutcome::Deleted { force, result } => match result {
+            Ok(_) => {
+                state.mode = Mode::List;
+                refresh_list(state, pending, client);
+            }
+            Err(msg) => {
+                // The daemon refuses non-force deletes when purposes still
+                // reference the connection. Surface that and stay in the confirm
+                // overlay so the user can press `f` to force.
+                if !force && msg.to_lowercase().contains("purpose") {
+                    state.error = Some(format!("{msg} — press 'f' to force"));
+                } else {
+                    state.error = Some(format!("Delete failed: {msg}"));
+                    state.mode = Mode::List;
+                }
+            }
+        },
     }
 }
 
@@ -581,12 +650,12 @@ fn draw_header(f: &mut Frame, area: Rect) {
         Span::styled(
             "LLM provider connections",
             Style::default()
-                .fg(COLOR_TITLE)
+                .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             "  —  Esc to return to chat",
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         ),
     ]);
     f.render_widget(Paragraph::new(line), area);
@@ -596,7 +665,7 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
     let items: Vec<ListItem> = if state.connections.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "(no connections — press 'a' to add one)",
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         )))]
     } else {
         state
@@ -604,9 +673,11 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
             .iter()
             .map(|c| {
                 let availability_text = match &c.availability {
-                    ConnectionAvailability::Ok => Span::styled("●", Style::default().fg(COLOR_OK)),
+                    ConnectionAvailability::Ok => {
+                        Span::styled("●", Style::default().fg(theme().ok))
+                    }
                     ConnectionAvailability::Unavailable { .. } => {
-                        Span::styled("●", Style::default().fg(COLOR_ERROR))
+                        Span::styled("●", Style::default().fg(theme().error))
                     }
                 };
                 let unavail_reason = match &c.availability {
@@ -619,20 +690,20 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
                     Span::styled(c.id.clone(), Style::default().add_modifier(Modifier::BOLD)),
                     Span::styled(
                         format!(" [{}]", c.connector_type),
-                        Style::default().fg(COLOR_HINT_DESC),
+                        Style::default().fg(theme().text_dim),
                     ),
                 ];
                 if c.display_label != format!("{} ({})", c.id, c.connector_type) {
                     spans.push(Span::styled(
                         format!("  ·  {}", c.display_label),
-                        Style::default().fg(COLOR_HINT_DESC),
+                        Style::default().fg(theme().text_dim),
                     ));
                 }
                 if let Some(reason) = unavail_reason {
                     spans.push(Span::styled(
                         format!("  ·  {reason}"),
                         Style::default()
-                            .fg(COLOR_ERROR)
+                            .fg(theme().error)
                             .add_modifier(Modifier::ITALIC),
                     ));
                 }
@@ -651,18 +722,18 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BORDER))
+                .border_style(Style::default().fg(theme().border))
                 .title(Line::from(Span::styled(
                     title,
                     Style::default()
-                        .fg(COLOR_TITLE)
+                        .fg(theme().title)
                         .add_modifier(Modifier::BOLD),
                 ))),
         )
         .highlight_style(
             Style::default()
-                .bg(COLOR_LIST_HIGHLIGHT)
-                .fg(COLOR_LIST_HIGHLIGHT_FG)
+                .bg(theme().list_highlight)
+                .fg(theme().list_highlight_fg)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ");
@@ -677,7 +748,7 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
 fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_BORDER))
+        .border_style(Style::default().fg(theme().border))
         .title(Line::from(Span::styled(
             if state.form.editing_id.is_some() {
                 "Edit connection"
@@ -685,7 +756,7 @@ fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
                 "New connection"
             },
             Style::default()
-                .fg(COLOR_TITLE)
+                .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(area);
@@ -755,9 +826,9 @@ fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
 
 fn draw_type_toggle(f: &mut Frame, area: Rect, state: &State, focused: bool) {
     let border_color = if focused {
-        COLOR_BORDER_ACTIVE
+        theme().border_active
     } else {
-        COLOR_BORDER
+        theme().border
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -770,10 +841,10 @@ fn draw_type_toggle(f: &mut Frame, area: Rect, state: &State, focused: bool) {
         let style = if active {
             Style::default()
                 .fg(Color::Black)
-                .bg(COLOR_BORDER_ACTIVE)
+                .bg(theme().border_active)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(COLOR_HINT_DESC)
+            Style::default().fg(theme().text_dim)
         };
         Span::styled(format!(" {} ", kind.label()), style)
     };
@@ -791,10 +862,10 @@ fn draw_type_toggle(f: &mut Frame, area: Rect, state: &State, focused: bool) {
 fn draw_field_label(f: &mut Frame, area: Rect, label: &str, focused: bool) {
     let style = if focused {
         Style::default()
-            .fg(COLOR_BORDER_ACTIVE)
+            .fg(theme().border_active)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(COLOR_HINT_DESC)
+        Style::default().fg(theme().text_dim)
     };
     f.render_widget(Paragraph::new(Span::styled(label.to_string(), style)), area);
 }
@@ -802,9 +873,9 @@ fn draw_field_label(f: &mut Frame, area: Rect, label: &str, focused: bool) {
 fn draw_text_field(f: &mut Frame, area: Rect, textarea: &TextArea<'static>, focused: bool) {
     let mut ta = textarea.clone();
     let border_color = if focused {
-        COLOR_BORDER_ACTIVE
+        theme().border_active
     } else {
-        COLOR_BORDER
+        theme().border
     };
     ta.set_block(
         Block::default()
@@ -831,11 +902,11 @@ fn draw_delete_overlay(f: &mut Frame, state: &State, area: Rect) {
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_DELETE_BORDER))
+        .border_style(Style::default().fg(theme().error))
         .title(Line::from(Span::styled(
             "Delete connection",
             Style::default()
-                .fg(Color::Rgb(255, 200, 200))
+                .fg(theme().error_text)
                 .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(popup);
@@ -846,8 +917,8 @@ fn draw_delete_overlay(f: &mut Frame, state: &State, area: Rect) {
             Style::default().fg(Color::White),
         )),
         Line::from(Span::styled(
-            "y/Enter = confirm · f = force (referencing purposes fall back) · any = cancel",
-            Style::default().fg(COLOR_HINT_DESC),
+            "y/Enter = confirm · f = force (referencing purposes fall back) · n/Esc = cancel",
+            Style::default().fg(theme().text_dim),
         )),
     ])
     .wrap(Wrap { trim: true });
@@ -857,14 +928,14 @@ fn draw_delete_overlay(f: &mut Frame, state: &State, area: Rect) {
 fn draw_status(f: &mut Frame, state: &State, area: Rect) {
     if let Some(busy) = &state.busy {
         let style = Style::default()
-            .fg(Color::Rgb(178, 220, 245))
+            .fg(theme().assistant_indicator)
             .add_modifier(Modifier::ITALIC);
         f.render_widget(
             Paragraph::new(Span::styled(format!(" ● {busy}"), style)),
             area,
         );
     } else if let Some(err) = &state.error {
-        let style = Style::default().fg(COLOR_ERROR);
+        let style = Style::default().fg(theme().error);
         f.render_widget(
             Paragraph::new(Span::styled(format!(" • {err}"), style)),
             area,
@@ -882,23 +953,23 @@ fn draw_hints(f: &mut Frame, state: &State, area: Rect) {
             ("Esc", "back to chat"),
         ],
         Mode::Edit => &[("Tab", "next field"), ("Ctrl+S", "save"), ("Esc", "cancel")],
-        Mode::DeleteConfirm => &[("y/Enter", "confirm"), ("f", "force"), ("any", "cancel")],
+        Mode::DeleteConfirm => &[("y/Enter", "confirm"), ("f", "force"), ("n/Esc", "cancel")],
     };
     let mut spans: Vec<Span> = Vec::new();
     for (idx, (key, desc)) in hints.iter().enumerate() {
         if idx > 0 {
-            spans.push(Span::styled("  ·  ", Style::default().fg(COLOR_HINT_SEP)));
+            spans.push(Span::styled("  ·  ", Style::default().fg(theme().hint_sep)));
         }
         spans.push(Span::styled(
             (*key).to_string(),
             Style::default()
-                .fg(COLOR_HINT_KEY)
+                .fg(theme().hint_key)
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             (*desc).to_string(),
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);

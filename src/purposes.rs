@@ -44,16 +44,7 @@ use ratatui::{
 
 use crate::screen::Screen;
 
-const COLOR_BORDER: Color = Color::Rgb(82, 104, 173);
-const COLOR_BORDER_ACTIVE: Color = Color::Rgb(120, 183, 109);
-const COLOR_TITLE: Color = Color::Rgb(166, 182, 255);
-const COLOR_HINT_KEY: Color = Color::Rgb(216, 223, 236);
-const COLOR_HINT_DESC: Color = Color::Rgb(143, 153, 174);
-const COLOR_HINT_SEP: Color = Color::Rgb(82, 90, 110);
-const COLOR_LIST_HIGHLIGHT: Color = Color::Rgb(72, 102, 180);
-const COLOR_LIST_HIGHLIGHT_FG: Color = Color::Rgb(245, 248, 255);
-const COLOR_ERROR: Color = Color::Rgb(232, 130, 130);
-const COLOR_INHERIT: Color = Color::Rgb(140, 156, 196);
+use crate::theme::theme;
 
 /// The four purposes in display order.
 const PURPOSES: &[PurposeKindApi] = &[
@@ -174,6 +165,24 @@ impl EditState {
     }
 }
 
+use crate::in_flight::InFlight;
+
+/// Refreshed purposes-screen data — result of the sequential off-loop
+/// `ListConnections` → `GetPurposes` → `list_available_models` chain.
+struct RefreshData {
+    connections: Vec<ConnectionView>,
+    purposes: PurposesView,
+    models: Vec<ModelListing>,
+}
+
+/// Resolved outcome of an off-loop purposes RPC (modal-freeze fix).
+enum RpcOutcome {
+    // Boxed: `RefreshData` (three vecs) dwarfs the `Saved` variant, so box it to
+    // keep the enum small (clippy::large_enum_variant).
+    Refreshed(Result<Box<RefreshData>, String>),
+    Saved(Result<(), String>),
+}
+
 struct State {
     connections: Vec<ConnectionView>,
     models: Vec<ModelListing>,
@@ -193,6 +202,9 @@ struct State {
 struct PurposesScreen<'a> {
     state: State,
     client: &'a TransportClient,
+    /// In-flight list/save RPCs, polled off the draw loop by `poll_pending` so
+    /// the screen never freezes during the (sequential) refresh or a save.
+    pending: InFlight<'a, RpcOutcome>,
 }
 
 impl Screen for PurposesScreen<'_> {
@@ -202,15 +214,27 @@ impl Screen for PurposesScreen<'_> {
         draw(frame, &self.state);
     }
 
-    async fn handle_key(&mut self, key: KeyEvent) {
+    fn handle_key(&mut self, key: KeyEvent) -> impl std::future::Future<Output = ()> {
         match self.state.mode {
-            Mode::List => handle_list_key(&mut self.state, key, self.client).await,
-            Mode::Edit => handle_edit_key(&mut self.state, key, self.client).await,
+            Mode::List => handle_list_key(&mut self.state, key, self.client, &mut self.pending),
+            Mode::Edit => handle_edit_key(&mut self.state, key, self.client, &mut self.pending),
         }
+        std::future::ready(())
     }
 
     fn take_outcome(&mut self) -> Option<()> {
         self.state.closing.then_some(())
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    async fn poll_pending(&mut self) {
+        let resolved = self.pending.next().await;
+        if let Some(outcome) = resolved {
+            apply_outcome(&mut self.state, &mut self.pending, self.client, outcome);
+        }
     }
 }
 
@@ -233,65 +257,95 @@ pub async fn run(
             closing: false,
         },
         client,
+        pending: InFlight::new(),
     };
 
-    refresh_all(&mut screen.state, client).await;
+    refresh_all(&mut screen.state, &mut screen.pending, client);
 
     crate::screen::run_screen(terminal, &mut screen, signal_rx, sink).await
 }
 
-async fn refresh_all(state: &mut State, client: &TransportClient) {
+/// Enqueue the full refresh off-loop (modal-freeze fix). Sets `busy` and returns;
+/// `apply_outcome` installs the data once `poll_pending` resolves it.
+fn refresh_all<'a>(
+    state: &mut State,
+    pending: &mut InFlight<'a, RpcOutcome>,
+    client: &'a TransportClient,
+) {
     state.busy = Some("Loading purposes...".into());
-    let conns = send(client, Command::ListConnections).await;
-    let purposes = send(client, Command::GetPurposes).await;
-    state.busy = None;
-
-    match conns {
-        Ok(CommandResult::Connections(c)) => state.connections = c,
-        Ok(other) => {
-            state.error = Some(format!(
-                "Unexpected response listing connections: {other:?}"
-            ));
-            return;
-        }
-        Err(e) => {
-            state.error = Some(format!("Failed to list connections: {e}"));
-            return;
-        }
-    }
-
-    match purposes {
-        Ok(CommandResult::Purposes(p)) => state.purposes = p,
-        Ok(other) => {
-            state.error = Some(format!("Unexpected response loading purposes: {other:?}"));
-            return;
-        }
-        Err(e) => {
-            state.error = Some(format!("Failed to load purposes: {e}"));
-            return;
-        }
-    }
-
-    // Pre-fetch the full model list once; we filter client-side per
-    // connection in the editor cyclers. Refresh only on user request.
-    refresh_models(state, client, false).await;
+    pending.push(async move { RpcOutcome::Refreshed(load_all(client).await.map(Box::new)) });
 }
 
-async fn refresh_models(state: &mut State, client: &TransportClient, refresh_cache: bool) {
+/// Run the three refresh RPCs sequentially in one off-loop future, short-circuiting
+/// on the first failure. Pre-fetches the full model list once (filtered
+/// client-side per connection in the editor cyclers).
+async fn load_all(client: &TransportClient) -> Result<RefreshData, String> {
+    let connections = match send(client, Command::ListConnections).await {
+        Ok(CommandResult::Connections(c)) => c,
+        Ok(other) => {
+            return Err(format!(
+                "Unexpected response listing connections: {other:?}"
+            ));
+        }
+        Err(e) => return Err(format!("Failed to list connections: {e}")),
+    };
+    let purposes = match send(client, Command::GetPurposes).await {
+        Ok(CommandResult::Purposes(p)) => p,
+        Ok(other) => return Err(format!("Unexpected response loading purposes: {other:?}")),
+        Err(e) => return Err(format!("Failed to load purposes: {e}")),
+    };
     let Some(commands) = client.as_commands() else {
-        state.error = Some(
+        return Err(
             "Purposes management isn't available over D-Bus — switch transport with --transport ws or the local socket"
                 .into(),
         );
-        return;
     };
-    match commands.list_available_models(None, refresh_cache).await {
-        Ok(models) => state.models = models,
-        Err(e) => state.error = Some(format!("Failed to list models: {e}")),
+    let models = commands
+        .list_available_models(None, false)
+        .await
+        .map_err(|e| format!("Failed to list models: {e}"))?;
+    Ok(RefreshData {
+        connections,
+        purposes,
+        models,
+    })
+}
+
+/// Apply a resolved purposes RPC; chains a `refresh_all` after a successful save.
+fn apply_outcome<'a>(
+    state: &mut State,
+    pending: &mut InFlight<'a, RpcOutcome>,
+    client: &'a TransportClient,
+    outcome: RpcOutcome,
+) {
+    state.busy = None;
+    match outcome {
+        RpcOutcome::Refreshed(Ok(data)) => {
+            let RefreshData {
+                connections,
+                purposes,
+                models,
+            } = *data;
+            state.connections = connections;
+            state.purposes = purposes;
+            state.models = models;
+        }
+        RpcOutcome::Refreshed(Err(e)) => state.error = Some(e),
+        RpcOutcome::Saved(Ok(())) => {
+            state.error = None;
+            state.mode = Mode::List;
+            refresh_all(state, pending, client);
+        }
+        RpcOutcome::Saved(Err(e)) => state.error = Some(format!("Save failed: {e}")),
     }
 }
 
-async fn handle_list_key(state: &mut State, key: KeyEvent, client: &TransportClient) {
+fn handle_list_key<'a>(
+    state: &mut State,
+    key: KeyEvent,
+    client: &'a TransportClient,
+    pending: &mut InFlight<'a, RpcOutcome>,
+) {
     match (key.code, key.modifiers) {
         (KeyCode::Esc | KeyCode::Char('q'), m) if m.is_empty() => state.closing = true,
         (KeyCode::Char('j') | KeyCode::Down, m) if m.is_empty() => advance_selection(state, 1),
@@ -303,16 +357,21 @@ async fn handle_list_key(state: &mut State, key: KeyEvent, client: &TransportCli
             state.error = None;
             state.mode = Mode::Edit;
         }
-        (KeyCode::Char('r'), m) if m.is_empty() => refresh_all(state, client).await,
+        (KeyCode::Char('r'), m) if m.is_empty() => refresh_all(state, pending, client),
         _ => {}
     }
 }
 
-async fn handle_edit_key(state: &mut State, key: KeyEvent, client: &TransportClient) {
+fn handle_edit_key<'a>(
+    state: &mut State,
+    key: KeyEvent,
+    client: &'a TransportClient,
+    pending: &mut InFlight<'a, RpcOutcome>,
+) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
     if ctrl && key.code == KeyCode::Char('s') {
-        save_edit(state, client).await;
+        save_edit(state, pending, client);
         return;
     }
 
@@ -433,7 +492,11 @@ fn advance_selection(state: &mut State, delta: i32) {
     state.selected_row = idx as usize;
 }
 
-async fn save_edit(state: &mut State, client: &TransportClient) {
+fn save_edit<'a>(
+    state: &mut State,
+    pending: &mut InFlight<'a, RpcOutcome>,
+    client: &'a TransportClient,
+) {
     let config = match state.edit.submit() {
         Ok(c) => c,
         Err(e) => {
@@ -443,26 +506,15 @@ async fn save_edit(state: &mut State, client: &TransportClient) {
     };
 
     state.busy = Some("Saving...".into());
-    let result = send(
-        client,
-        Command::SetPurpose {
-            purpose: state.edit.purpose,
-            config,
-        },
-    )
-    .await;
-    state.busy = None;
-
-    match result {
-        Ok(_) => {
-            state.error = None;
-            state.mode = Mode::List;
-            refresh_all(state, client).await;
-        }
-        Err(e) => {
-            state.error = Some(format!("Save failed: {e}"));
-        }
-    }
+    let purpose = state.edit.purpose;
+    pending.push(async move {
+        RpcOutcome::Saved(
+            send(client, Command::SetPurpose { purpose, config })
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+        )
+    });
 }
 
 fn purpose_slot(view: &PurposesView, kind: PurposeKindApi) -> Option<&PurposeConfigView> {
@@ -532,12 +584,12 @@ fn draw_header(f: &mut Frame, area: Rect) {
         Span::styled(
             "Purposes",
             Style::default()
-                .fg(COLOR_TITLE)
+                .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             "  —  Esc to return to chat",
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         ),
     ]);
     f.render_widget(Paragraph::new(line), area);
@@ -565,7 +617,7 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
                             "(inherit primary)"
                         },
                         Style::default()
-                            .fg(COLOR_INHERIT)
+                            .fg(theme().debug_system)
                             .add_modifier(Modifier::ITALIC),
                     ));
                 }
@@ -581,12 +633,12 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
                         cfg.model.clone()
                     };
                     spans.push(Span::styled(connection_text, Style::default()));
-                    spans.push(Span::styled(" · ", Style::default().fg(COLOR_HINT_SEP)));
+                    spans.push(Span::styled(" · ", Style::default().fg(theme().hint_sep)));
                     spans.push(Span::styled(model_text, Style::default()));
                     if let Some(eff) = cfg.effort {
                         spans.push(Span::styled(
                             format!("  ({})", effort_label(Some(eff))),
-                            Style::default().fg(COLOR_HINT_DESC),
+                            Style::default().fg(theme().text_dim),
                         ));
                     }
                 }
@@ -599,18 +651,18 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BORDER))
+                .border_style(Style::default().fg(theme().border))
                 .title(Line::from(Span::styled(
                     "Purpose · Connection · Model · Effort",
                     Style::default()
-                        .fg(COLOR_TITLE)
+                        .fg(theme().title)
                         .add_modifier(Modifier::BOLD),
                 ))),
         )
         .highlight_style(
             Style::default()
-                .bg(COLOR_LIST_HIGHLIGHT)
-                .fg(COLOR_LIST_HIGHLIGHT_FG)
+                .bg(theme().list_highlight)
+                .fg(theme().list_highlight_fg)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ");
@@ -624,11 +676,11 @@ fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
     let title = format!("Edit purpose: {}", purpose_label(state.edit.purpose));
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_BORDER))
+        .border_style(Style::default().fg(theme().border))
         .title(Line::from(Span::styled(
             title,
             Style::default()
-                .fg(COLOR_TITLE)
+                .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(area);
@@ -650,10 +702,10 @@ fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
     let label_for = |s: &str, focused: bool| {
         let style = if focused {
             Style::default()
-                .fg(COLOR_BORDER_ACTIVE)
+                .fg(theme().border_active)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(COLOR_HINT_DESC)
+            Style::default().fg(theme().text_dim)
         };
         Paragraph::new(Span::styled(s.to_string(), style))
     };
@@ -697,14 +749,14 @@ fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
 fn draw_status(f: &mut Frame, state: &State, area: Rect) {
     if let Some(busy) = &state.busy {
         let style = Style::default()
-            .fg(Color::Rgb(178, 220, 245))
+            .fg(theme().assistant_indicator)
             .add_modifier(Modifier::ITALIC);
         f.render_widget(
             Paragraph::new(Span::styled(format!(" ● {busy}"), style)),
             area,
         );
     } else if let Some(err) = &state.error {
-        let style = Style::default().fg(COLOR_ERROR);
+        let style = Style::default().fg(theme().error);
         f.render_widget(
             Paragraph::new(Span::styled(format!(" • {err}"), style)),
             area,
@@ -725,18 +777,18 @@ fn draw_hints(f: &mut Frame, state: &State, area: Rect) {
     let mut spans: Vec<Span> = Vec::new();
     for (idx, (key, desc)) in hints.iter().enumerate() {
         if idx > 0 {
-            spans.push(Span::styled("  ·  ", Style::default().fg(COLOR_HINT_SEP)));
+            spans.push(Span::styled("  ·  ", Style::default().fg(theme().hint_sep)));
         }
         spans.push(Span::styled(
             (*key).to_string(),
             Style::default()
-                .fg(COLOR_HINT_KEY)
+                .fg(theme().hint_key)
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             (*desc).to_string(),
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);

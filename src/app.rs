@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use desktop_assistant_api_model::TaskId;
 pub use desktop_assistant_client_common::{ChatMessage, ConversationDetail, ConversationSummary};
 use ratatui::style::Style;
@@ -7,84 +5,16 @@ use ratatui_textarea::{CursorMove, DataCursor, TextArea};
 
 use crate::tasks::TaskPane;
 
-/// Context-window fill for the current conversation (desktop-assistant#341).
-/// Mirrors the daemon's `SignalEvent::ContextUsage` — token COUNTS only, no
-/// content. Drives the read-only status-bar indicator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ContextUsageView {
-    pub used_tokens: u64,
-    pub budget_tokens: u64,
-    pub compaction_active: bool,
-}
+// The shared, view-agnostic model+controller (client-ui-common). `App` embeds a
+// `WindowState` as `core` and is migrating its chat-core state onto it slice by
+// slice (CC-3). First slice: per-conversation voice state lives in `core`;
+// `App`'s voice methods are thin wrappers that read core's accessors and route
+// writes through `core.apply(...)`.
+use client_ui_common::{Effect, UiMessage, WindowState};
 
-/// Colour bucket for the context-fill indicator, decided by the daemon's
-/// proactive-compaction line (0.85 of budget). Green below 0.85, amber from
-/// 0.85 up to budget, red at/over budget (overflow).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContextFillLevel {
-    Green,
-    Amber,
-    Red,
-}
-
-/// The proactive-compaction ratio the daemon uses (`COMPACTION_TOKEN_RATIO`).
-/// Kept in sync deliberately — this is the colour-threshold contract, not a
-/// recomputation of the budget (the daemon owns the numbers).
-const COMPACTION_RATIO: f64 = 0.85;
-
-impl ContextUsageView {
-    /// Fraction of budget consumed (0.0..). May exceed 1.0 on overflow.
-    /// Returns 0.0 for a zero/unknown budget to avoid a divide-by-zero and
-    /// to render neutrally rather than imply false precision.
-    pub fn fraction(&self) -> f64 {
-        if self.budget_tokens == 0 {
-            0.0
-        } else {
-            self.used_tokens as f64 / self.budget_tokens as f64
-        }
-    }
-
-    pub fn level(&self) -> ContextFillLevel {
-        let f = self.fraction();
-        if f >= 1.0 {
-            ContextFillLevel::Red
-        } else if f >= COMPACTION_RATIO {
-            // Inclusive at exactly 0.85: the daemon's strict-`>` compaction
-            // gate means we are AT the line, the moment to warn (amber).
-            ContextFillLevel::Amber
-        } else {
-            ContextFillLevel::Green
-        }
-    }
-
-    /// Compact human readout, e.g. `12k / 32k (38%)`. A trailing `⟳` marks an
-    /// active compaction/windowing pass. Budgets below 10k show exact counts;
-    /// larger ones are abbreviated to `k` for width.
-    pub fn readout(&self) -> String {
-        let pct = (self.fraction() * 100.0).round() as u64;
-        let mut s = format!(
-            "{} / {} ({pct}%)",
-            abbrev_tokens(self.used_tokens),
-            abbrev_tokens(self.budget_tokens),
-        );
-        if self.compaction_active {
-            s.push_str(" ⟳");
-        }
-        s
-    }
-}
-
-/// Abbreviate a token count for the narrow status bar: `12000 -> "12k"`,
-/// `512 -> "512"`. One decimal under 10k-with-fraction is avoided to keep it
-/// terse; this is a glanceable instrument, not an accounting figure.
-fn abbrev_tokens(n: u64) -> String {
-    if n >= 1_000 {
-        format!("{}k", n / 1_000)
-    } else {
-        n.to_string()
-    }
-}
-
+/// Context-window fill view + colour bucket (#341), shared via client-ui-common;
+/// re-exported so existing crate::app::ContextUsageView paths in ui.rs/main.rs resolve.
+pub use client_ui_common::{ContextFillLevel, ContextUsageView};
 fn new_textarea() -> TextArea<'static> {
     let mut ta = TextArea::default();
     ta.set_cursor_line_style(Style::default());
@@ -178,6 +108,19 @@ pub enum InputMode {
     Renaming,
 }
 
+/// A modal sub-screen the user has asked the run loop to open. Each maps to one
+/// `*::run` driver invocation in the loop's single dispatch point. Replaces the
+/// old independent `*_requested` bools so the request is mutually exclusive by
+/// construction (CC-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenRequest {
+    KnowledgeBase,
+    Connections,
+    Purposes,
+    ModelPicker,
+    PersonalityPicker,
+}
+
 /// The `Adele:` voice-output level for a conversation. Decides reply narration
 /// (with `You`), the `say_this` aside gate, and the send-time
 /// `system_refinement`. Defaults to `Disabled`.
@@ -190,26 +133,27 @@ pub enum InputMode {
 pub use adele_voice_client_common::AdeleOutput;
 
 pub struct App {
-    pub conversations: Vec<ConversationSummary>,
     pub selected_conversation: Option<usize>,
-    pub current_conversation: Option<ConversationDetail>,
     pub textarea: TextArea<'static>,
-    pub streaming_buffer: String,
-    pub pending_request_id: Option<String>,
-    /// The conversation the in-flight stream was sent to (TUI-4). `Some` iff
-    /// `pending_request_id` is `Some`. Completion appends to — and narration
-    /// gates on — THIS conversation, not whichever one is open at the time.
-    pub streaming_conversation_id: Option<String>,
-    /// `true` when the in-flight turn was NOT initiated by this client — adopted
-    /// from a `UserMessageAdded` for a turn started elsewhere (a voice turn, or
-    /// another client on the same account) so its reply streams live (#1).
-    /// Suppresses tui's own reply narration for it: the originator (e.g. the
-    /// voice daemon) already speaks the reply, so narrating again would
-    /// double-speak. Reset whenever the in-flight slot is (re)set or cleared.
-    pub streaming_is_external: bool,
+    // The conversation list, the open conversation's transcript, and the
+    // in-flight streaming state (buffer, pending request/conversation id,
+    // external-turn flag, ack sentinel, narration gate) all now live in the
+    // shared `core` (CC-3): the reducer owns those state machines and the view
+    // reads them back through `conversations()` / `current_conversation()` /
+    // `streaming_buffer()` / `streaming_is_active_for_view()` / `is_streaming()`.
+    // `App` keeps only TUI view state (selection, scroll, mode, status lines).
     pub mode: InputMode,
     pub status_message: String,
+    /// Whether the daemon connection is currently live. The run loop projects
+    /// its `ReconnectState` into this each frame (it owns the socket); the view
+    /// reads it to render disconnect chrome — a warn-colored input border plus
+    /// an `offline` tag. Defaults `true`; the loop overwrites it before the
+    /// first draw. (CC-3 moves this into the shared `core` once signals route
+    /// through the reducer.)
+    pub connected: bool,
     pub should_quit: bool,
+    /// Whether the `?`/F1 keymap help overlay is shown. Any key closes it.
+    pub show_help: bool,
     /// Lines scrolled up from the bottom. 0 = auto-scroll to bottom.
     pub scroll_offset: u16,
     /// Whether to include archived conversations in the list.
@@ -244,19 +188,12 @@ pub struct App {
     /// drains it on the next iteration (once the modal has closed and the
     /// sidebar is visible again) by pushing a conversation-list refetch.
     pub pending_conversation_refresh: bool,
-    /// Set when the user asks to open the knowledge base. The chat loop
-    /// hands the screen to `kb::run` and resets this flag when KB exits.
-    pub kb_requested: bool,
-    /// Set when the user asks to open the LLM-provider connections manager.
-    /// Mirrors `kb_requested`'s screen-handoff pattern.
-    pub connections_requested: bool,
-    /// Set when the user asks to open the purposes manager.
-    pub purposes_requested: bool,
-    /// Set when the user asks to open the per-conversation model picker.
-    pub model_picker_requested: bool,
-    /// Set when the user asks to open the per-conversation personality picker.
-    /// Mirrors `model_picker_requested`'s screen-handoff pattern.
-    pub personality_picker_requested: bool,
+    /// The modal sub-screen the user has asked to open, serviced (and cleared)
+    /// by the run loop on its next iteration. Replaces the old set of independent
+    /// `*_requested` bools (CC-3): only ONE screen can be pending at a time, so a
+    /// fresh request can't silently race a not-yet-serviced one, and the run loop
+    /// dispatches them from a single point instead of five near-identical guards.
+    pub pending_screen: Option<ScreenRequest>,
     /// One-shot override staged by the model picker. Applied to the next
     /// `SendPrompt` and then cleared — the daemon persists it as the
     /// conversation's `last_model_selection`, so subsequent prompts pick
@@ -272,39 +209,32 @@ pub struct App {
     /// actually closes the loop; this is purely so the status bar can
     /// say "cancelling t-1..." while we wait.
     pub pending_task_cancel: Option<TaskId>,
-    /// Per-conversation `You:` (voice input) state (adele-tui#77, mirroring
-    /// adele-gtk#80). Keyed by conversation id; a conversation absent from the
-    /// map is **Disabled** (type only). When `true` (Enabled), a push-to-talk
-    /// control is available and — combined with `Adele == OnDemand` — gates
-    /// reply narration. Toggled in-app with `Ctrl+V`. Per-conversation, so
-    /// enabling it in one conversation never affects another.
-    voice_in: HashMap<String, bool>,
-    /// Per-conversation `Adele:` (voice output) level (adele-tui#77, mirroring
-    /// adele-gtk#80). Keyed by conversation id; a conversation absent from the
-    /// map is `Disabled` (never speaks). Set by the user (`Ctrl+S` cycles it) or
-    /// the model (`request_voice` → OnDemand, `stop_voice` → Disabled). Decides
-    /// reply narration (with `You`), the `say_this` aside gate, and the send-time
-    /// `system_refinement`. Replaces phase-1/2's `speech_enabled` (read-aloud ==
-    /// Always) and `voice_mode` (== OnDemand) toggles.
-    adele_output: HashMap<String, AdeleOutput>,
+    /// The shared, view-agnostic model+controller (client-ui-common). `App` is
+    /// migrating its chat-core state onto it slice by slice (CC-3). It owns the
+    /// per-conversation voice state (`You:` input enablement and `Adele:` output
+    /// level, adele-tui#77 / adele-gtk#80) and the **in-flight streaming state**
+    /// — the buffer, the pending request/conversation ids, the external-turn
+    /// flag, the ack sentinel, and the reply-narration gate. Daemon stream events
+    /// route through `core.apply(...)` (see [`App::apply_core`]); `App` mirrors
+    /// the resulting view-effects onto its own rendered transcript and surfaces
+    /// `core`'s streaming state to the view via `streaming_buffer()` /
+    /// `streaming_is_active_for_view()` / `is_streaming()`. The open
+    /// conversation's id is dual-written into `core` on load so its
+    /// originating-conversation checks (TUI-4 / GTK-2) judge against the
+    /// conversation actually in view.
+    core: WindowState,
 }
 
 impl App {
-    const PENDING_STREAM_REQUEST_ID: &str = "__pending_stream_request_id__";
-
     pub fn new() -> Self {
         Self {
-            conversations: Vec::new(),
             selected_conversation: None,
-            current_conversation: None,
             textarea: new_textarea(),
-            streaming_buffer: String::new(),
-            pending_request_id: None,
-            streaming_conversation_id: None,
-            streaming_is_external: false,
             mode: InputMode::Normal,
             status_message: "Connected".to_string(),
+            connected: true,
             should_quit: false,
+            show_help: false,
             scroll_offset: 0,
             show_archived: false,
             rename_textarea: new_textarea(),
@@ -315,17 +245,31 @@ impl App {
             show_sidebar: true,
             switch_requested: false,
             pending_conversation_refresh: false,
-            kb_requested: false,
-            connections_requested: false,
-            purposes_requested: false,
-            model_picker_requested: false,
-            personality_picker_requested: false,
+            pending_screen: None,
             pending_model_override: None,
             tasks: TaskPane::new(),
             pending_task_cancel: None,
-            voice_in: HashMap::new(),
-            adele_output: HashMap::new(),
+            core: WindowState::default(),
         }
+    }
+
+    /// Toggle the keymap help overlay (`?`/F1). Any key closes it (handled in the
+    /// event loop), so the action only ever opens it.
+    pub fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+    }
+
+    /// Ask the run loop to open `screen` as a modal on its next iteration.
+    /// Mutually exclusive: a newer request supersedes any not-yet-serviced one
+    /// (the loop services at most one modal per turn, then redraws).
+    pub fn request_screen(&mut self, screen: ScreenRequest) {
+        self.pending_screen = Some(screen);
+    }
+
+    /// Take (and clear) the pending modal-screen request, if any. The run loop
+    /// calls this once per iteration to drive its single modal-dispatch point.
+    pub fn take_pending_screen(&mut self) -> Option<ScreenRequest> {
+        self.pending_screen.take()
     }
 
     // --- Per-conversation You/Adele voice controls (adele-tui#77) ---
@@ -341,13 +285,14 @@ impl App {
     /// Whether `You:` (voice input) is Enabled for `conversation_id`. A
     /// conversation absent from the map is Disabled (the default).
     pub fn voice_in_for(&self, conversation_id: &str) -> bool {
-        self.voice_in.get(conversation_id).copied().unwrap_or(false)
+        self.core.voice_in_for(conversation_id)
     }
 
     /// Whether `You:` is Enabled for the currently-open conversation. `false`
     /// when no conversation is open.
     pub fn current_voice_in(&self) -> bool {
-        self.current_conversation
+        self.core
+            .current_conversation
             .as_ref()
             .is_some_and(|c| self.voice_in_for(&c.id))
     }
@@ -355,25 +300,33 @@ impl App {
     /// Flip `You:` for the currently-open conversation and return the new state
     /// (used by the `Ctrl+V` keybind). `None` when no conversation is open.
     pub fn toggle_current_voice_in(&mut self) -> Option<bool> {
-        let conv_id = self.current_conversation.as_ref()?.id.clone();
-        let next = !self.voice_in_for(&conv_id);
-        self.voice_in.insert(conv_id, next);
+        let conv_id = self.core.current_conversation.as_ref()?.id.clone();
+        let next = !self.core.voice_in_for(&conv_id);
+        self.set_voice_in(&conv_id, next);
         Some(next)
+    }
+
+    /// Set `You:` (voice input) for an explicit `conversation_id`.
+    /// Per-conversation: only the named conversation is affected. Mirrors
+    /// [`Self::set_adele_output`]; routes the write through `core.apply`.
+    pub fn set_voice_in(&mut self, conversation_id: &str, enabled: bool) {
+        self.core.apply(UiMessage::SetVoiceIn {
+            conversation_id: conversation_id.to_string(),
+            enabled,
+        });
     }
 
     /// The `Adele:` (voice output) level for `conversation_id`. `Disabled` when
     /// the conversation was never set (the default).
     pub fn adele_output_for(&self, conversation_id: &str) -> AdeleOutput {
-        self.adele_output
-            .get(conversation_id)
-            .copied()
-            .unwrap_or_default()
+        self.core.adele_output_for(conversation_id)
     }
 
     /// The `Adele:` level for the currently-open conversation. `Disabled` when
     /// no conversation is open.
     pub fn current_adele_output(&self) -> AdeleOutput {
-        self.current_conversation
+        self.core
+            .current_conversation
             .as_ref()
             .map(|c| self.adele_output_for(&c.id))
             .unwrap_or_default()
@@ -384,16 +337,19 @@ impl App {
     /// their own conversation). Per-conversation: only the named conversation is
     /// affected.
     pub fn set_adele_output(&mut self, conversation_id: &str, level: AdeleOutput) {
-        self.adele_output.insert(conversation_id.to_string(), level);
+        self.core.apply(UiMessage::SetAdeleOutput {
+            conversation_id: conversation_id.to_string(),
+            level,
+        });
     }
 
     /// Cycle `Adele:` for the currently-open conversation
     /// (`Disabled → OnDemand → Always → Disabled`) and return the new level
     /// (used by the `Ctrl+S` keybind). `None` when no conversation is open.
     pub fn cycle_current_adele_output(&mut self) -> Option<AdeleOutput> {
-        let conv_id = self.current_conversation.as_ref()?.id.clone();
-        let next = self.adele_output_for(&conv_id).next();
-        self.adele_output.insert(conv_id, next);
+        let conv_id = self.core.current_conversation.as_ref()?.id.clone();
+        let next = self.core.adele_output_for(&conv_id).next();
+        self.set_adele_output(&conv_id, next);
         Some(next)
     }
 
@@ -402,8 +358,7 @@ impl App {
     /// `You == Enabled`). `Disabled` never narrates. Delegates to the shared
     /// gate (desktop-assistant#274).
     pub fn narrate_for(&self, conversation_id: &str) -> bool {
-        self.adele_output_for(conversation_id)
-            .narrates_reply(self.voice_in_for(conversation_id))
+        self.core.narrate_for(conversation_id)
     }
 
     /// Whether a `say_this` aside is spoken for `conversation_id` (adele-tui#77):
@@ -411,7 +366,7 @@ impl App {
     /// downgrades the aside to inline text. Delegates to the shared gate
     /// (desktop-assistant#274).
     pub fn say_this_spoken_for(&self, conversation_id: &str) -> bool {
-        self.adele_output_for(conversation_id).speaks_aside()
+        self.core.say_this_spoken_for(conversation_id)
     }
 
     /// Render a `say_this` call whose aside is NOT spoken (Adele == Disabled) as
@@ -420,7 +375,7 @@ impl App {
     /// a stale/other conversation never bleeds into the visible chat. Returns
     /// whether the note was shown.
     pub fn push_speech_disabled_note(&mut self, conversation_id: &str, text: &str) -> bool {
-        let Some(conv) = self.current_conversation.as_mut() else {
+        let Some(conv) = self.core.current_conversation.as_mut() else {
             return false;
         };
         if conv.id != conversation_id {
@@ -461,7 +416,7 @@ impl App {
         // Move sidebar selection to the linked conversation if it's
         // present in the local list. Loading the detail itself is
         // main's responsibility (it needs the WS client).
-        if let Some(idx) = self.conversations.iter().position(|c| c.id == conv_id) {
+        if let Some(idx) = self.core.conversations.iter().position(|c| c.id == conv_id) {
             self.selected_conversation = Some(idx);
         }
         self.tasks.visible = false;
@@ -488,7 +443,7 @@ impl App {
         &mut self,
         override_selection: desktop_assistant_api_model::SendPromptOverride,
     ) {
-        if let Some(conv) = self.current_conversation.as_mut() {
+        if let Some(conv) = self.core.current_conversation.as_mut() {
             conv.model_selection = Some(
                 desktop_assistant_api_model::ConversationModelSelectionView {
                     connection_id: override_selection.connection_id.clone(),
@@ -516,17 +471,6 @@ impl App {
         }
     }
 
-    /// Record the latest context-window fill (#341). The daemon owns the
-    /// numbers; we only store and render. `conversation_id` lets us drop a
-    /// reading for a conversation that is not the one currently open (e.g. a
-    /// background turn), so the indicator always reflects the visible chat.
-    pub fn set_context_usage(&mut self, conversation_id: &str, usage: ContextUsageView) {
-        let open = self.current_conversation.as_ref().map(|c| c.id.as_str());
-        if open == Some(conversation_id) {
-            self.context_usage = Some(usage);
-        }
-    }
-
     pub fn quit(&mut self) {
         self.should_quit = true;
     }
@@ -534,12 +478,12 @@ impl App {
     // --- Navigation ---
 
     pub fn next_conversation(&mut self) {
-        if self.conversations.is_empty() {
+        if self.core.conversations.is_empty() {
             return;
         }
         self.selected_conversation = Some(match self.selected_conversation {
             Some(i) => {
-                if i >= self.conversations.len() - 1 {
+                if i >= self.core.conversations.len() - 1 {
                     0
                 } else {
                     i + 1
@@ -550,18 +494,18 @@ impl App {
     }
 
     pub fn previous_conversation(&mut self) {
-        if self.conversations.is_empty() {
+        if self.core.conversations.is_empty() {
             return;
         }
         self.selected_conversation = Some(match self.selected_conversation {
             Some(i) => {
                 if i == 0 {
-                    self.conversations.len() - 1
+                    self.core.conversations.len() - 1
                 } else {
                     i - 1
                 }
             }
-            None => self.conversations.len() - 1,
+            None => self.core.conversations.len() - 1,
         });
     }
 
@@ -586,76 +530,20 @@ impl App {
         self.textarea.lines().join("\n")
     }
 
-    /// Gate + mutate for a prompt submission (TUI-2 / TUI-7). Checks the
-    /// preconditions BEFORE touching any state, so a refused submission leaves
-    /// the composer and transcript untouched:
-    ///
-    /// * not connected → refuse with a status message (TUI-2: previously the
-    ///   message was appended to the transcript and the composer cleared, then
-    ///   silently never sent);
-    /// * a reply is still streaming (`pending_request_id` is claimed or the
-    ///   ack sentinel) → refuse with a status message (TUI-7 policy: **block
-    ///   concurrent sends**. The TUI renders a single streaming buffer for the
-    ///   open conversation; interleaving a second stream would cross-wire the
-    ///   request-id claim and drop one reply. Blocking keeps the composer text
-    ///   so nothing is lost — the user sends again once the reply lands).
-    ///
-    /// Only when both gates pass does it delegate to [`App::submit_prompt`].
-    pub fn prepare_submission(&mut self, connected: bool) -> Option<(String, String)> {
-        if !connected {
-            self.status_message =
-                "Not connected — message not sent (your text is preserved)".into();
-            return None;
-        }
-        if self.pending_request_id.is_some() {
-            self.status_message =
-                "A reply is still streaming — wait for it to finish (your text is preserved)"
-                    .into();
-            return None;
-        }
-        self.submit_prompt()
+    /// Empty the composer (after an accepted send). The submission gate, the
+    /// optimistic user-bubble append, and the streaming block (TUI-2 / TUI-7) all
+    /// live in the shared core now, reached via `UiMessage::SubmitPrompt`; the
+    /// composer is the one piece of pure view state the client still owns.
+    pub fn clear_composer(&mut self) {
+        self.textarea = new_textarea();
     }
 
-    /// Roll back a submission whose send RPC failed (TUI-2): remove the
-    /// optimistically appended user message (only when the originating
-    /// conversation is still open and the tail message matches) and put the
-    /// prompt text back into the composer so the user can retry without
-    /// retyping. The caller sets the status message with the send error.
-    pub fn restore_failed_submission(&mut self, conversation_id: &str, prompt: &str) {
-        if let Some(conv) = self
-            .current_conversation
-            .as_mut()
-            .filter(|c| c.id == conversation_id)
-            && conv
-                .messages
-                .last()
-                .is_some_and(|m| m.role == "user" && m.content == prompt)
-        {
-            conv.messages.pop();
-        }
+    /// Refill the composer with `text` (after a failed send, so the user can
+    /// retry without retyping). The matching transcript rollback runs in the core
+    /// via `UiMessage::SendFailed`.
+    pub fn set_composer(&mut self, text: &str) {
         self.textarea = new_textarea();
-        self.textarea.insert_str(prompt);
-    }
-
-    /// Returns (conversation_id, prompt) if valid, None otherwise.
-    pub fn submit_prompt(&mut self) -> Option<(String, String)> {
-        let content = self.textarea_content();
-        if content.is_empty() {
-            return None;
-        }
-        let conv = self.current_conversation.as_mut()?;
-        conv.messages.push(ChatMessage {
-            // Optimistic local echo of our own send; the daemon assigns the real
-            // message id (#1) when it persists the turn. Dedupe of the echoed-back
-            // `UserMessageAdded` is by request_id, not message id (see
-            // `user_message_added`), so an empty id here is correct.
-            id: String::new(),
-            role: "user".to_string(),
-            content: content.clone(),
-        });
-        self.textarea = new_textarea();
-        self.scroll_offset = 0;
-        Some((conv.id.clone(), content))
+        self.textarea.insert_str(text);
     }
 
     /// Apply a bracketed paste (TUI-3 / `Event::Paste`) to whichever input is
@@ -757,64 +645,147 @@ impl App {
         self.mode = InputMode::Normal;
     }
 
-    // --- Streaming ---
+    // --- Streaming (delegated to the shared core, CC-3) ---
     //
-    // The stream knows its conversation (TUI-4): `start_streaming` records the
-    // conversation the prompt was sent to, and completion/rendering/narration
-    // all target THAT conversation rather than whichever one is open when the
-    // event arrives.
+    // The stream knows its conversation (TUI-4 / GTK-2): the reducer records the
+    // conversation a prompt was sent to and keys chunk rendering, completion, and
+    // reply narration off THAT conversation, not whichever one is open when an
+    // event arrives. `App` holds none of that state — it feeds daemon stream
+    // events into `core.apply` via `apply_core` and mirrors the resulting
+    // view-effects onto its own transcript.
 
-    pub fn start_streaming(&mut self, request_id: String, conversation_id: String) {
-        self.pending_request_id = Some(request_id);
-        self.streaming_conversation_id = Some(conversation_id);
-        self.streaming_buffer.clear();
-        // A turn entering the slot via the normal send path is this client's
-        // own; only `user_message_added` flips this true for an adopted turn.
-        self.streaming_is_external = false;
-    }
-
-    pub fn start_streaming_without_request_id(&mut self, conversation_id: String) {
-        self.start_streaming(Self::PENDING_STREAM_REQUEST_ID.to_string(), conversation_id);
-    }
-
-    /// Apply the result of a `send_prompt` ack from the daemon, recording the
-    /// conversation the prompt targeted (TUI-4).
+    /// Feed a daemon-derived [`UiMessage`] into the shared core, apply the
+    /// *view-level* effects to `App`'s own state in place, and return the
+    /// *controller-level* effects the view can't perform itself (today:
+    /// [`Effect::Speak`] narration and [`Effect::FetchScratchpad`], which need
+    /// handles `App` doesn't hold). The caller (`main`'s signal loop) runs those.
     ///
-    /// The wire value is either a `task_id` (post-desktop-assistant #114
-    /// `SendMessageAck`) or an empty string (legacy `Ack`). Neither is the
-    /// chunk-stream `request_id` — that is server-generated and arrives
-    /// embedded in the first `AssistantDelta`. We therefore ignore the
-    /// ack payload and seed the sentinel; the first chunk claims it via
-    /// `stream_matches_or_claims_request_id`. See issue #52.
-    pub fn apply_prompt_ack(&mut self, _task_id: String, conversation_id: String) {
-        self.start_streaming_without_request_id(conversation_id);
+    /// View-effects are applied here because the TUI redraws from state every
+    /// frame: a streamed chunk is already on screen once it lands in
+    /// `core.streaming_buffer()`, so [`Effect::ReceiveChunk`] is a no-op — and
+    /// since the reducer now owns the open transcript and the conversation list
+    /// (CC-3 slice 4), the transcript-finalizing and `ClearChat` effects are
+    /// no-ops too. Only the TUI-only view state (status lines, context-usage
+    /// readout, positional selection) still needs a write here.
+    pub fn apply_core(&mut self, msg: UiMessage) -> Vec<Effect> {
+        let effects = self.core.apply(msg);
+        effects
+            .into_iter()
+            .filter_map(|effect| self.run_view_effect(effect))
+            .collect()
     }
 
-    /// Whether the in-flight stream belongs to the open conversation (TUI-4).
-    /// Gates rendering of the live streaming buffer so a backgrounded turn's
-    /// chunks never paint into a conversation the user switched to.
-    pub fn streaming_is_for_current(&self) -> bool {
-        self.pending_request_id.is_some()
-            && self.streaming_conversation_id.as_deref()
-                == self.current_conversation.as_ref().map(|c| c.id.as_str())
+    /// Apply one effect's view-level part to `App`, returning `Some(effect)` for
+    /// the controller-level effects the caller must still run (narration, RPCs).
+    fn run_view_effect(&mut self, effect: Effect) -> Option<Effect> {
+        match effect {
+            // The transcript view re-reads `core.streaming_buffer()` each frame,
+            // so the chunk is already visible — nothing to do. (Scroll follows
+            // only at the bottom, TUI-10, which needs no write either.)
+            Effect::ReceiveChunk(_) => None,
+            // The reducer now owns the open conversation's transcript
+            // (`core.current_conversation`, CC-3 slice 4) and pushes the finalized
+            // reply / adopted external user bubble into it itself — guarded so it
+            // only ever writes when the originating conversation is the one in view
+            // (TUI-4). The view re-reads that transcript each frame, so these
+            // effects carry no view-level work.
+            Effect::CompleteStreaming(_) | Effect::AddUserMessage(_) => None,
+            Effect::SetChatStatus(message) => {
+                self.set_assistant_status(message);
+                None
+            }
+            Effect::ClearChatStatus => {
+                self.assistant_status = None;
+                None
+            }
+            Effect::SetContextUsage(usage) => {
+                self.context_usage = usage;
+                None
+            }
+            Effect::SetStatusText(text) => {
+                self.status_message = text;
+                None
+            }
+            // Repaint the sidebar list. `set_conversations` re-clamps the
+            // positional selection and keeps core's list in sync.
+            Effect::SetConversations(convs) => {
+                self.set_conversations(convs);
+                None
+            }
+            // The TUI does not auto-open a conversation (unlike gtk): the sidebar
+            // selection is already clamped by `SetConversations`, and the open
+            // conversation is whatever the user last opened. So "ensure active"
+            // is a no-op here — the auto-load/create that gtk's executor performs
+            // is deliberately omitted (CC-3: behavior-preserving).
+            Effect::EnsureActiveConversation => None,
+            // The active conversation was deleted. The reducer already cleared
+            // `core.current_conversation` (and its id) before emitting this, so the
+            // view — which reads that field — needs no further write (CC-3 slice 4).
+            Effect::ClearChat => None,
+            // The TUI has no side pane (the scratchpad + per-conversation task
+            // list live in the gtk/kde clients), so these are inert here.
+            Effect::SidePaneSetScratchpad(_)
+            | Effect::RefreshSidePaneTasks
+            | Effect::FetchScratchpad(_) => None,
+            // Controller-level effects (narration, and — in later CC-3 slices —
+            // the open-conversation RPC effects) need handles the view doesn't
+            // hold; bubble them up to `main`'s executor.
+            other => Some(other),
+        }
     }
 
-    /// Reset all in-flight streaming state (TUI-8). Called on `Disconnected`:
-    /// the stream is dead, so the frozen `▌` buffer must not linger and the
-    /// ack sentinel must not mis-claim the first stream after reconnecting.
+    /// The live streaming partial for the open conversation, read back from the
+    /// shared core. Empty when nothing is buffering, or when the in-flight stream
+    /// belongs to a backgrounded conversation.
+    pub fn streaming_buffer(&self) -> &str {
+        self.core.streaming_buffer()
+    }
+
+    /// Whether the in-flight stream (if any) belongs to the open conversation
+    /// (TUI-4) — the render guard the transcript view consults before painting
+    /// the live partial.
+    pub fn streaming_is_active_for_view(&self) -> bool {
+        self.core.streaming_is_active_for_view()
+    }
+
+    /// Whether a streamed reply is currently in flight. The submit path gates on
+    /// this so a second prompt can't be sent mid-stream (TUI-7).
+    pub fn is_streaming(&self) -> bool {
+        self.core.is_streaming()
+    }
+
+    /// Record a `send_prompt` ack: register the in-flight turn (and its
+    /// originating conversation, TUI-4) in the shared core. The wire value is a
+    /// `task_id` (post-desktop-assistant#114 `SendMessageAck`) or an empty string
+    /// (legacy `Ack`) — neither is the chunk-stream `request_id` (server-generated,
+    /// arriving in the first `AssistantDelta`), so the reducer seeds a sentinel the
+    /// first stream event claims (#52). `PromptSent` emits no effects.
+    pub fn apply_prompt_ack(&mut self, task_id: String, conversation_id: String) {
+        let _ = self.core.apply(UiMessage::PromptSent {
+            task_id,
+            conversation_id,
+        });
+        // Immediate feedback in the gap between Enter and the first streamed
+        // token. The daemon's own `Status` events (e.g. "Searching…") overwrite
+        // this, and completion/error clears it.
+        self.set_assistant_status("Adele is thinking…");
+    }
+
+    /// Drop all in-flight streaming state on a connection teardown (TUI-8): the
+    /// stream died with the link, so the frozen `▌` buffer must not linger and the
+    /// ack sentinel must not mis-claim the first post-reconnect stream. Delegates
+    /// to the core (which owns the streaming state); also clears the TUI-only
+    /// transient assistant-status line.
     pub fn clear_streaming_state(&mut self) {
-        self.pending_request_id = None;
-        self.streaming_conversation_id = None;
-        self.streaming_buffer.clear();
+        self.core.reset_streaming_state();
         self.assistant_status = None;
-        self.streaming_is_external = false;
     }
 
     /// Move the sidebar selection to the conversation with `id`, returning
     /// whether it was found (TUI-8: selection is positional, so after a
     /// reconnect's list refresh we reselect by id, not index).
     pub fn select_conversation_by_id(&mut self, id: &str) -> bool {
-        match self.conversations.iter().position(|c| c.id == id) {
+        match self.core.conversations.iter().position(|c| c.id == id) {
             Some(idx) => {
                 self.selected_conversation = Some(idx);
                 true
@@ -823,140 +794,56 @@ impl App {
         }
     }
 
-    fn stream_matches_or_claims_request_id(&mut self, request_id: &str) -> bool {
-        match self.pending_request_id.as_deref() {
-            Some(Self::PENDING_STREAM_REQUEST_ID) => {
-                self.pending_request_id = Some(request_id.to_string());
-                true
-            }
-            Some(current) => current == request_id,
-            None => false,
-        }
-    }
-
-    pub fn receive_chunk(&mut self, request_id: &str, chunk: &str) {
-        if !self.stream_matches_or_claims_request_id(request_id) {
-            return;
-        }
-        self.streaming_buffer.push_str(chunk);
-        // Follow-only-at-bottom (TUI-10): the transcript renders anchored to
-        // the bottom, so `scroll_offset == 0` keeps following new chunks by
-        // itself. A non-zero offset means the user scrolled up to read —
-        // never yank them back down (and a backgrounded stream's chunks must
-        // never touch the OPEN conversation's scroll at all, TUI-4).
-    }
-
-    /// Finish the in-flight stream. Returns the ORIGINATING conversation id
-    /// when the event matched the pending stream (TUI-4) — the caller gates
-    /// narration on that conversation — or `None` when the event was unrelated.
-    /// The reply is appended to the transcript only when the originating
-    /// conversation is the open one; otherwise the daemon already persisted it
-    /// and it appears when that conversation is next opened.
-    pub fn complete_streaming(&mut self, request_id: &str, full_response: &str) -> Option<String> {
-        if !self.stream_matches_or_claims_request_id(request_id) {
-            return None;
-        }
-        let origin = self.streaming_conversation_id.take();
-        if let Some(conv) = self
-            .current_conversation
-            .as_mut()
-            .filter(|c| origin.as_deref() == Some(c.id.as_str()))
-        {
-            conv.messages.push(ChatMessage {
-                // Local copy of the just-streamed reply; the daemon already
-                // persisted the authoritative message (with its #1 id), which is
-                // re-fetched on the next open. Streaming dedupe is by request_id,
-                // so an empty id here is correct.
-                id: String::new(),
-                role: "assistant".to_string(),
-                content: full_response.to_string(),
-            });
-        }
-        self.streaming_buffer.clear();
-        self.pending_request_id = None;
-        self.assistant_status = None;
-        self.streaming_is_external = false;
-        origin
-    }
-
-    pub fn streaming_error(&mut self, request_id: &str, error: &str) {
-        if !self.stream_matches_or_claims_request_id(request_id) {
-            return;
-        }
-        self.status_message = format!("Error: {error}");
-        self.streaming_buffer.clear();
-        self.pending_request_id = None;
-        self.streaming_conversation_id = None;
-        self.assistant_status = None;
-        self.streaming_is_external = false;
-    }
-
-    /// Handle a `UserMessageAdded` (#1): the daemon announces a user message and
-    /// the turn it begins. For a turn this client did NOT initiate (a voice turn,
-    /// or another client on the same account) showing in the open conversation,
-    /// render the user bubble and adopt the turn so its reply streams live;
-    /// dedupe this client's own send (already shown optimistically).
-    pub fn user_message_added(&mut self, conversation_id: &str, request_id: &str, content: &str) {
-        // Case 1 — our own send, echoed back. `prepare_submission` already
-        // appended the user message and `apply_prompt_ack` pinned the sentinel
-        // (both run inline before any signal is processed). Claim the real
-        // request_id off the sentinel — it precedes the first chunk — and render
-        // nothing more. This also resolves the stream's request_id earlier and
-        // more reliably than the claim-on-first-chunk fallback.
-        if self.pending_request_id.as_deref() == Some(Self::PENDING_STREAM_REQUEST_ID)
-            && self.streaming_conversation_id.as_deref() == Some(conversation_id)
-        {
-            self.pending_request_id = Some(request_id.to_string());
-            return;
-        }
-        // Case 2 — a turn this client did NOT initiate, for the conversation on
-        // screen, with no turn already occupying the single in-flight slot. Adopt
-        // it so the existing chunk/completion path streams the reply live, append
-        // the user message now, and mark it external so its reply is NOT narrated
-        // here (the originator already speaks it). A turn for a background
-        // conversation, or one arriving while our own turn is in flight, is left
-        // to the reload-on-switch path (the daemon persists it).
-        let is_displayed =
-            self.current_conversation.as_ref().map(|c| c.id.as_str()) == Some(conversation_id);
-        if self.pending_request_id.is_none() && is_displayed {
-            self.pending_request_id = Some(request_id.to_string());
-            self.streaming_conversation_id = Some(conversation_id.to_string());
-            self.streaming_buffer.clear();
-            self.streaming_is_external = true;
-            if let Some(conv) = self.current_conversation.as_mut() {
-                conv.messages.push(ChatMessage {
-                    // Adopted external user bubble (#1 live sync). The turn is
-                    // tracked by request_id, not message id, so an empty id is
-                    // correct; the persisted message (with its real id) is
-                    // re-fetched on the next open.
-                    id: String::new(),
-                    role: "user".to_string(),
-                    content: content.to_string(),
-                });
-            }
-        }
-    }
-
     // --- Conversation management ---
 
+    /// The conversation list, owned by the shared core (CC-3 slice 4): the
+    /// reducer is authoritative for it (its conversation arms read + mutate
+    /// `core.conversations`), and the view reads it back through here. The TUI
+    /// keeps only the *positional* selection (`selected_conversation`) as view
+    /// state.
+    pub fn conversations(&self) -> &[ConversationSummary] {
+        &self.core.conversations
+    }
+
+    /// The open conversation's detail — transcript, title, and model selection —
+    /// owned by the shared core (CC-3 slice 4). The reducer maintains it: it
+    /// finalizes streamed replies into it, adopts external turns, and clears it
+    /// when the active conversation is deleted (`App::load_conversation` seeds it
+    /// on open). The view + controller read it back through here. `None` when no
+    /// conversation is open.
+    pub fn current_conversation(&self) -> Option<&ConversationDetail> {
+        self.core.current_conversation.as_ref()
+    }
+
     pub fn set_conversations(&mut self, conversations: Vec<ConversationSummary>) {
-        self.conversations = conversations;
-        // Fix selection if out of bounds
+        // The shared core owns the list (CC-3 slice 4): store it there directly.
+        // The reducer's conversation arms read `core.conversations` (e.g. to
+        // decide reconnect reload vs. fresh load), and paths that don't route
+        // through `core.apply` (connect-time load, create/delete) funnel here, so
+        // this keeps core authoritative regardless of the caller.
+        self.core.conversations = conversations;
+        // Fix selection if out of bounds (positional selection is TUI view state).
+        let len = self.core.conversations.len();
         if let Some(sel) = self.selected_conversation
-            && sel >= self.conversations.len()
+            && sel >= len
         {
-            self.selected_conversation = if self.conversations.is_empty() {
-                None
-            } else {
-                Some(self.conversations.len() - 1)
-            };
+            self.selected_conversation = if len == 0 { None } else { Some(len - 1) };
         }
     }
 
     pub fn load_conversation(&mut self, detail: ConversationDetail) {
-        let switching =
-            self.current_conversation.as_ref().map(|c| c.id.as_str()) != Some(detail.id.as_str());
-        self.current_conversation = Some(detail);
+        let switching = self
+            .core
+            .current_conversation
+            .as_ref()
+            .map(|c| c.id.as_str())
+            != Some(detail.id.as_str());
+        // Seed the shared core's open conversation (CC-3 slice 4): it owns both the
+        // rendered transcript (the reducer finalizes streamed replies into it) and
+        // the id its streaming originating-conversation checks (TUI-4 / GTK-2)
+        // judge against, so the stream events route to the conversation in view.
+        self.core.current_conversation_id = Some(detail.id.clone());
+        self.core.current_conversation = Some(detail);
         // Drop a stale context-fill reading when the visible conversation
         // changes; the next turn re-establishes it (#341).
         if switching {
@@ -964,22 +851,45 @@ impl App {
         }
     }
 
+    /// Apply a live `TitleChanged` signal: the sidebar list rename flows through
+    /// the shared core (which owns the list and repaints it via `SetConversations`),
+    /// and the open chat's cached title is refreshed locally — the reducer owns
+    /// only the list, but the TUI's chat header reads `current_conversation.title`.
     pub fn update_conversation_title(&mut self, conversation_id: &str, title: &str) {
-        for conv in &mut self.conversations {
-            if conv.id == conversation_id {
-                conv.title = title.to_string();
-            }
-        }
-        if let Some(current) = self.current_conversation.as_mut()
+        let _ = self.apply_core(UiMessage::TitleChanged {
+            conversation_id: conversation_id.to_string(),
+            title: title.to_string(),
+        });
+        self.set_open_conversation_title(conversation_id, title);
+    }
+
+    /// Refresh the open conversation's cached title if it is the one named (the
+    /// chat header reads it). No-op when a different conversation is open.
+    fn set_open_conversation_title(&mut self, conversation_id: &str, title: &str) {
+        if let Some(current) = self.core.current_conversation.as_mut()
             && current.id == conversation_id
         {
             current.title = title.to_string();
         }
     }
 
+    /// Optimistically update the open conversation's per-conversation personality
+    /// after the picker saves it, so the change shows without a re-fetch. The
+    /// picker owns the screen while open, so the open conversation is still the
+    /// one it was launched for; mirrors [`Self::apply_model_override`]. No-op when
+    /// no conversation is open.
+    pub fn set_open_conversation_personality(
+        &mut self,
+        personality: desktop_assistant_api_model::ConversationPersonalityView,
+    ) {
+        if let Some(conv) = self.core.current_conversation.as_mut() {
+            conv.conversation_personality = Some(personality);
+        }
+    }
+
     pub fn selected_conversation_id(&self) -> Option<&str> {
         let idx = self.selected_conversation?;
-        self.conversations.get(idx).map(|c| c.id.as_str())
+        self.core.conversations.get(idx).map(|c| c.id.as_str())
     }
 
     // --- Rename ---
@@ -990,7 +900,7 @@ impl App {
         let Some(idx) = self.selected_conversation else {
             return;
         };
-        let Some(conv) = self.conversations.get(idx) else {
+        let Some(conv) = self.core.conversations.get(idx) else {
             return;
         };
         let mut ta = new_textarea();
@@ -1014,6 +924,7 @@ impl App {
             return None;
         }
         let unchanged = self
+            .core
             .conversations
             .iter()
             .find(|c| c.id == id)
@@ -1031,35 +942,30 @@ impl App {
         self.mode = InputMode::Normal;
     }
 
-    /// Apply a renamed title locally (call after the daemon confirms).
+    /// Apply a renamed title (call after the daemon confirms). Routes the sidebar
+    /// rename through the shared core and refreshes the open chat's cached title.
     pub fn apply_rename(&mut self, conversation_id: &str, title: &str) {
-        self.update_conversation_title(conversation_id, title);
+        let _ = self.apply_core(UiMessage::ConversationRenamed {
+            id: conversation_id.to_string(),
+            title: title.to_string(),
+        });
+        self.set_open_conversation_title(conversation_id, title);
     }
 
     pub fn delete_selected_conversation(&mut self) -> Option<String> {
-        let idx = self.selected_conversation?;
-        if idx >= self.conversations.len() {
-            return None;
-        }
-        let id = self.conversations[idx].id.clone();
-        self.conversations.remove(idx);
-
-        // Clear current conversation if it was the deleted one
-        if self
-            .current_conversation
-            .as_ref()
-            .is_some_and(|c| c.id == id)
-        {
-            self.current_conversation = None;
-        }
-
-        // Fix selection
-        if self.conversations.is_empty() {
-            self.selected_conversation = None;
-        } else if idx >= self.conversations.len() {
-            self.selected_conversation = Some(self.conversations.len() - 1);
-        }
-
+        let id = self.selected_conversation_id()?.to_string();
+        // Route the removal through the shared core: the reducer drops the row,
+        // prunes the conversation's per-conversation voice state (GTK-9 — the TUI
+        // previously leaked it, growing the maps unbounded), and clears the open
+        // chat when the deleted conversation was the active one. The emitted
+        // effects are all view-effects (SetConversations re-clamps the positional
+        // selection; ClearChat blanks the chat; the side-pane + EnsureActive
+        // effects are TUI no-ops), so `apply_core` fully handles them.
+        let effects = self.apply_core(UiMessage::ConversationDeleted { id: id.clone() });
+        debug_assert!(
+            effects.is_empty(),
+            "ConversationDeleted must emit only view-effects: {effects:?}"
+        );
         Some(id)
     }
 }
@@ -1154,14 +1060,30 @@ mod tests {
     }
 
     #[test]
-    fn set_context_usage_only_applies_to_open_conversation() {
+    fn context_usage_signal_updates_the_indicator_only_for_the_open_conversation() {
+        // The reducer gates the `ContextUsage` signal on the open conversation
+        // (#341); apply_core wires the resulting `SetContextUsage` effect onto
+        // App's indicator. A background turn's reading must not paint.
         let mut app = App::new();
         app.load_conversation(detail("c1"));
-        // A reading for a different conversation (e.g. background turn) is dropped.
-        app.set_context_usage("c2", usage(10_000, 32_000, false));
-        assert_eq!(app.context_usage, None);
-        // A reading for the open conversation lands.
-        app.set_context_usage("c1", usage(10_000, 32_000, false));
+
+        app.apply_core(UiMessage::ContextUsage {
+            conversation_id: "c2".into(),
+            used_tokens: 10_000,
+            budget_tokens: 32_000,
+            compaction_active: false,
+        });
+        assert_eq!(
+            app.context_usage, None,
+            "a background reading must not paint"
+        );
+
+        app.apply_core(UiMessage::ContextUsage {
+            conversation_id: "c1".into(),
+            used_tokens: 10_000,
+            budget_tokens: 32_000,
+            compaction_active: false,
+        });
         assert_eq!(app.context_usage, Some(usage(10_000, 32_000, false)));
     }
 
@@ -1169,7 +1091,12 @@ mod tests {
     fn switching_conversation_clears_stale_context_usage() {
         let mut app = App::new();
         app.load_conversation(detail("c1"));
-        app.set_context_usage("c1", usage(10_000, 32_000, false));
+        app.apply_core(UiMessage::ContextUsage {
+            conversation_id: "c1".into(),
+            used_tokens: 10_000,
+            budget_tokens: 32_000,
+            compaction_active: false,
+        });
         assert!(app.context_usage.is_some());
         app.load_conversation(detail("c2"));
         assert_eq!(
@@ -1380,7 +1307,7 @@ mod tests {
     #[test]
     fn submit_prompt_sends_unwrapped_text_after_display_wrap() {
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "c1".into(),
             title: "t".into(),
             messages: vec![],
@@ -1393,10 +1320,13 @@ mod tests {
         // A render frame wraps for display only.
         let _ = app.wrapped_display_textarea(10);
 
-        let (conv_id, payload) = app.submit_prompt().expect("submission");
-        assert_eq!(conv_id, "c1");
-        assert_eq!(payload, typed);
-        assert!(!payload.contains('\n'));
+        // The prompt that reaches the send effect is the logical (unwrapped) text,
+        // not the display-wrapped copy.
+        let prompt = app.textarea_content();
+        let effects = app.apply_core(UiMessage::SubmitPrompt { prompt });
+        let sent = sent_prompt(&effects).expect("an accepted send emits SendPrompt");
+        assert_eq!(sent, typed);
+        assert!(!sent.contains('\n'));
     }
 
     /// Shrinking then regrowing the terminal must not leave wrap newlines
@@ -1419,7 +1349,7 @@ mod tests {
     #[test]
     fn submit_prompt_preserves_explicit_user_newlines() {
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "c1".into(),
             title: "t".into(),
             messages: vec![],
@@ -1431,8 +1361,12 @@ mod tests {
 
         let _ = app.wrapped_display_textarea(8);
 
-        let (_id, payload) = app.submit_prompt().expect("submission");
-        assert_eq!(payload, typed);
+        let prompt = app.textarea_content();
+        let effects = app.apply_core(UiMessage::SubmitPrompt { prompt });
+        assert_eq!(
+            sent_prompt(&effects).expect("an accepted send emits SendPrompt"),
+            typed
+        );
     }
 
     /// CJK (wide) glyphs are measured by display width, not char count, so a
@@ -1451,51 +1385,10 @@ mod tests {
         assert_eq!(app.textarea_content(), "一二三四五");
     }
 
-    #[test]
-    fn submit_prompt_without_conversation_returns_none() {
-        let mut app = App::new();
-        app.textarea.insert_str("hello");
-        assert!(app.submit_prompt().is_none());
-        assert_eq!(app.textarea_content(), "hello"); // input preserved
-    }
-
-    #[test]
-    fn submit_prompt_with_empty_input_returns_none() {
-        let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
-            id: "1".into(),
-            title: "Test".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-        });
-        assert!(app.submit_prompt().is_none());
-    }
-
-    #[test]
-    fn submit_prompt_appends_user_message_and_clears_input() {
-        let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
-            id: "conv1".into(),
-            title: "Test".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-        });
-        app.textarea.insert_str("What is Rust?");
-
-        let result = app.submit_prompt();
-        assert_eq!(
-            result,
-            Some(("conv1".to_string(), "What is Rust?".to_string()))
-        );
-        assert_eq!(app.textarea_content(), "");
-
-        let msgs = &app.current_conversation.as_ref().unwrap().messages;
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].role, "user");
-        assert_eq!(msgs[0].content, "What is Rust?");
-    }
+    // The submit gate, the optimistic user-bubble append, and the empty/
+    // no-conversation rejections moved to the shared core (`UiMessage::SubmitPrompt`,
+    // Phase-2) and are spec'd by client-ui-common's reducer tests. The App tests
+    // below cover only the TUI's own send-path wiring (composer text → effect).
 
     // --- Bracketed paste (TUI-3) ---
 
@@ -1522,7 +1415,7 @@ mod tests {
         // Acceptance (TUI-3): a 3-line paste yields ONE submitted prompt with
         // the newlines intact, not three partial prompts.
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "c1".into(),
             title: "Test".into(),
             messages: vec![],
@@ -1531,12 +1424,13 @@ mod tests {
         });
         app.enter_editing_mode();
         app.apply_paste("first\nsecond\nthird");
-        let result = app.submit_prompt();
+        let prompt = app.textarea_content();
+        let effects = app.apply_core(UiMessage::SubmitPrompt { prompt });
         assert_eq!(
-            result,
-            Some(("c1".to_string(), "first\nsecond\nthird".to_string()))
+            sent_prompt(&effects).expect("an accepted send emits SendPrompt"),
+            "first\nsecond\nthird"
         );
-        let msgs = &app.current_conversation.as_ref().unwrap().messages;
+        let msgs = &app.current_conversation().unwrap().messages;
         assert_eq!(msgs.len(), 1, "exactly one user message appended");
     }
 
@@ -1559,166 +1453,24 @@ mod tests {
         assert_eq!(app.textarea_content(), "");
     }
 
-    // --- Send-path integrity (TUI-2 / TUI-7) ---
+    // --- Send-path wiring (TUI-2 / TUI-7) ---
+    //
+    // The send *decision* (gate, optimistic append, refinement, rollback) now
+    // lives in the shared core (`UiMessage::SubmitPrompt` / `SendFailed`) and is
+    // spec'd by client-ui-common's reducer tests. What stays here is the TUI's
+    // own wiring: the composer text becomes the prompt, and an accepted send
+    // surfaces as a `SendPrompt` effect for `send_prompt_from_input` to run. The
+    // connection gate + the transport RPC live in `main.rs` (not unit-testable
+    // without a daemon), so they're covered by the live smoke test.
 
-    fn app_ready_to_send(conv_id: &str, prompt: &str) -> App {
-        let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
-            id: conv_id.into(),
-            title: "Test".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-        });
-        app.enter_editing_mode();
-        app.textarea.insert_str(prompt);
-        app
-    }
-
-    #[test]
-    fn submit_while_disconnected_preserves_composer_and_appends_nothing() {
-        // Acceptance (TUI-2): disconnected submit → composer text preserved,
-        // status message set, nothing appended to the transcript.
-        let mut app = app_ready_to_send("c1", "important prompt");
-        app.status_message.clear();
-
-        let result = app.prepare_submission(false);
-
-        assert!(result.is_none(), "nothing must be sent while disconnected");
-        assert_eq!(
-            app.textarea_content(),
-            "important prompt",
-            "composer text must be preserved"
-        );
-        assert!(
-            app.current_conversation
-                .as_ref()
-                .unwrap()
-                .messages
-                .is_empty(),
-            "transcript must not gain a user message"
-        );
-        assert!(
-            !app.status_message.is_empty(),
-            "the refusal must be surfaced in the status line"
-        );
-    }
-
-    #[test]
-    fn submit_while_streaming_is_blocked_and_composer_preserved() {
-        // Acceptance (TUI-7, chosen policy = block concurrent sends): a second
-        // send while a reply streams is refused with a status message and the
-        // composer keeps its text.
-        let mut app = app_ready_to_send("c1", "second question");
-        app.start_streaming("req-in-flight".into(), "c1".into());
-        app.status_message.clear();
-
-        let result = app.prepare_submission(true);
-
-        assert!(result.is_none(), "second send must be blocked mid-stream");
-        assert_eq!(app.textarea_content(), "second question");
-        assert!(
-            app.current_conversation
-                .as_ref()
-                .unwrap()
-                .messages
-                .is_empty()
-        );
-        assert!(!app.status_message.is_empty());
-    }
-
-    #[test]
-    fn submit_while_awaiting_ack_sentinel_is_also_blocked() {
-        // Unhappy path: the window between send and the first chunk uses the
-        // pending sentinel; a send in that window must be blocked too.
-        let mut app = app_ready_to_send("c1", "rapid second send");
-        app.start_streaming_without_request_id("c1".into());
-
-        assert!(app.prepare_submission(true).is_none());
-        assert_eq!(app.textarea_content(), "rapid second send");
-    }
-
-    #[test]
-    fn submit_when_connected_and_idle_goes_through() {
-        let mut app = app_ready_to_send("c1", "hello");
-        let result = app.prepare_submission(true);
-        assert_eq!(result, Some(("c1".to_string(), "hello".to_string())));
-        assert_eq!(app.textarea_content(), "");
-        assert_eq!(app.current_conversation.as_ref().unwrap().messages.len(), 1);
-    }
-
-    #[test]
-    fn restore_failed_submission_pops_message_and_refills_composer() {
-        // Acceptance (TUI-2): a failed send RPC rolls back the optimistic
-        // transcript append and puts the prompt back in the composer.
-        let mut app = app_ready_to_send("c1", "doomed prompt");
-        let (conv_id, prompt) = app.prepare_submission(true).unwrap();
-
-        app.restore_failed_submission(&conv_id, &prompt);
-
-        assert!(
-            app.current_conversation
-                .as_ref()
-                .unwrap()
-                .messages
-                .is_empty(),
-            "optimistic user message must be rolled back"
-        );
-        assert_eq!(app.textarea_content(), "doomed prompt");
-    }
-
-    #[test]
-    fn restore_failed_submission_after_switching_conversations_keeps_other_transcript() {
-        // Unhappy path: the user switched conversations between submit and the
-        // send failure. The other conversation's tail message must NOT be
-        // popped; the composer still gets the text back.
-        let mut app = app_ready_to_send("c1", "prompt for c1");
-        let (conv_id, prompt) = app.prepare_submission(true).unwrap();
-
-        // Switch to a different conversation that already has a user message.
-        app.load_conversation(ConversationDetail {
-            id: "c2".into(),
-            title: "Other".into(),
-            messages: vec![ChatMessage {
-                id: String::new(),
-                role: "user".into(),
-                content: "prompt for c1".into(), // same text, different conv
-            }],
-            model_selection: None,
-            conversation_personality: None,
-        });
-
-        app.restore_failed_submission(&conv_id, &prompt);
-
-        assert_eq!(
-            app.current_conversation.as_ref().unwrap().messages.len(),
-            1,
-            "the other conversation's transcript must be untouched"
-        );
-        assert_eq!(app.textarea_content(), "prompt for c1");
-    }
-
-    #[test]
-    fn restore_failed_submission_does_not_pop_a_non_matching_tail() {
-        // Unhappy path: something else (e.g. an inline note) landed after the
-        // optimistic append; only an exact matching tail is rolled back.
-        let mut app = app_ready_to_send("c1", "prompt");
-        let (conv_id, prompt) = app.prepare_submission(true).unwrap();
-        app.current_conversation
-            .as_mut()
-            .unwrap()
-            .messages
-            .push(ChatMessage {
-                id: String::new(),
-                role: "assistant".into(),
-                content: "(speech mode disabled) aside".into(),
-            });
-
-        app.restore_failed_submission(&conv_id, &prompt);
-
-        let msgs = &app.current_conversation.as_ref().unwrap().messages;
-        assert_eq!(msgs.len(), 2, "non-matching tail must not be popped");
-        assert_eq!(app.textarea_content(), "prompt");
+    /// The prompt carried by the `SendPrompt` effect when a submission was
+    /// accepted (the send path runs this effect as the RPC); `None` when the core
+    /// rejected the submit.
+    fn sent_prompt(effects: &[Effect]) -> Option<String> {
+        effects.iter().find_map(|e| match e {
+            Effect::SendPrompt { prompt, .. } => Some(prompt.clone()),
+            _ => None,
+        })
     }
 
     // --- Conversation-id threading (TUI-4) + disconnect reset (TUI-8) ---
@@ -1733,106 +1485,122 @@ mod tests {
         }
     }
 
+    // These exercise the TUI's *integration* with the shared core — that
+    // `apply_core` applies the reducer's streaming effects onto `App`'s own
+    // transcript / buffer / status, and routes the `clear_streaming_state`
+    // teardown through core. The streaming *state machine itself* (request-id
+    // claiming, originating-conversation targeting, external-turn handling,
+    // error/disconnect finalization) is spec'd by client-ui-common's reducer
+    // tests; we don't re-test that logic here, only the wiring.
+
     #[test]
-    fn complete_after_switching_conversations_targets_the_originating_one() {
-        // Acceptance (TUI-4): a Complete arriving after the user switched
-        // conversations must NOT append to the newly opened conversation; it
-        // reports the ORIGINATING conversation id so narration gates there.
+    fn apply_core_finalizes_an_open_streams_reply_into_the_transcript() {
+        // The ack carries a task id; the chunks carry a DIFFERENT server request
+        // id (#52). They must still be accepted, buffer live, and finalize into
+        // the open conversation's transcript on completion.
         let mut app = App::new();
-        app.current_conversation = Some(detail("c1"));
+        app.load_conversation(detail("c1"));
+        app.apply_prompt_ack("task-abc".into(), "c1".into());
+
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "server-xyz".into(),
+            chunk: "Hello ".into(),
+        });
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "server-xyz".into(),
+            chunk: "world!".into(),
+        });
+        assert_eq!(
+            app.streaming_buffer(),
+            "Hello world!",
+            "the partial buffers live"
+        );
+
+        app.apply_core(UiMessage::StreamComplete {
+            request_id: "server-xyz".into(),
+            full_response: "Hello world!".into(),
+        });
+
+        assert!(!app.is_streaming(), "the slot clears on completion");
+        assert_eq!(app.streaming_buffer(), "", "the live partial is gone");
+        let msgs = &app.current_conversation().unwrap().messages;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "assistant");
+        assert_eq!(msgs[0].content, "Hello world!");
+    }
+
+    #[test]
+    fn apply_core_does_not_bleed_a_backgrounded_completion_into_the_open_chat() {
+        // TUI-4: a Complete arriving after the user switched conversations must
+        // NOT append to the newly opened conversation, emits no narration, and
+        // still clears the slot.
+        let mut app = App::new();
+        app.load_conversation(detail("c1"));
         app.apply_prompt_ack("task-1".into(), "c1".into());
-        app.receive_chunk("req-1", "partial ");
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "req-1".into(),
+            chunk: "partial ".into(),
+        });
 
-        // User switches to c2 mid-stream.
-        app.load_conversation(detail("c2"));
+        app.load_conversation(detail("c2")); // switch away mid-stream
 
-        let origin = app.complete_streaming("req-1", "partial reply done");
-        assert_eq!(origin.as_deref(), Some("c1"), "origin must be reported");
+        let controller = app.apply_core(UiMessage::StreamComplete {
+            request_id: "req-1".into(),
+            full_response: "done".into(),
+        });
         assert!(
-            app.current_conversation
-                .as_ref()
-                .unwrap()
-                .messages
-                .is_empty(),
+            controller.is_empty(),
+            "a backgrounded completion emits no controller effect (no narration)"
+        );
+        assert!(
+            app.current_conversation().unwrap().messages.is_empty(),
             "the reply must not bleed into the switched-to conversation"
         );
-        assert_eq!(app.pending_request_id, None, "stream state must clear");
-        assert_eq!(app.streaming_buffer, "");
+        assert!(!app.is_streaming(), "the slot still clears");
     }
 
     #[test]
-    fn complete_appends_when_user_switched_away_and_back() {
-        // Switching away and back re-opens the originating conversation; the
-        // completion then lands in its transcript.
+    fn backgrounded_stream_chunks_do_not_reset_the_open_conversations_scroll() {
+        // Scroll belongs to the OPEN conversation; a backgrounded stream's chunks
+        // must neither yank it nor paint into the open chat (TUI-4 / TUI-10).
         let mut app = App::new();
-        app.current_conversation = Some(detail("c1"));
+        app.load_conversation(detail("c1"));
         app.apply_prompt_ack("task-1".into(), "c1".into());
         app.load_conversation(detail("c2"));
-        app.load_conversation(detail("c1")); // back again (fresh fetch)
-
-        let origin = app.complete_streaming("req-1", "the reply");
-        assert_eq!(origin.as_deref(), Some("c1"));
-        let msgs = &app.current_conversation.as_ref().unwrap().messages;
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content, "the reply");
-    }
-
-    #[test]
-    fn unmatched_complete_reports_no_origin() {
-        // An unrelated Complete (wrong request id) must not be narrated or
-        // appended anywhere — no origin is reported.
-        let mut app = App::new();
-        app.current_conversation = Some(detail("c1"));
-        app.start_streaming("req-1".into(), "c1".into());
-        assert_eq!(app.complete_streaming("other-req", "noise"), None);
-        assert!(app.pending_request_id.is_some(), "stream still pending");
-    }
-
-    #[test]
-    fn streaming_buffer_renders_only_into_the_originating_conversation() {
-        // The UI gate (TUI-4): mid-stream chunks must not paint into a
-        // conversation the user switched to.
-        let mut app = App::new();
-        app.current_conversation = Some(detail("c1"));
-        app.start_streaming("req-1".into(), "c1".into());
-        app.receive_chunk("req-1", "partial");
-        assert!(app.streaming_is_for_current());
-
-        app.load_conversation(detail("c2"));
-        assert!(
-            !app.streaming_is_for_current(),
-            "stream belongs to c1, not the open c2"
-        );
-    }
-
-    #[test]
-    fn chunks_for_a_backgrounded_stream_do_not_reset_scroll() {
-        // Scroll position belongs to the OPEN conversation; a backgrounded
-        // stream's chunks must not yank it.
-        let mut app = App::new();
-        app.current_conversation = Some(detail("c1"));
-        app.start_streaming("req-1".into(), "c1".into());
-        app.load_conversation(detail("c2"));
         app.scroll_up(7);
-        app.receive_chunk("req-1", "background chunk");
-        assert_eq!(app.scroll_offset, 7);
+
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "req-1".into(),
+            chunk: "background chunk".into(),
+        });
+
+        assert_eq!(
+            app.scroll_offset, 7,
+            "scroll is untouched by a backgrounded chunk"
+        );
+        assert!(
+            !app.streaming_is_active_for_view(),
+            "and it is not painted into the open chat"
+        );
     }
 
     #[test]
     fn clear_streaming_state_resets_everything_on_disconnect() {
-        // Acceptance (TUI-8): after a disconnect there is no frozen ▌ buffer
-        // and no stale pending id.
+        // Acceptance (TUI-8): after a disconnect there is no frozen ▌ buffer, no
+        // stale pending slot, and the transient assistant-status line is cleared.
         let mut app = App::new();
-        app.current_conversation = Some(detail("c1"));
+        app.load_conversation(detail("c1"));
         app.apply_prompt_ack("task-1".into(), "c1".into());
-        app.receive_chunk("req-1", "now-dead partial");
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "req-1".into(),
+            chunk: "now-dead partial".into(),
+        });
         app.set_assistant_status("Calling tool…");
 
         app.clear_streaming_state();
 
-        assert_eq!(app.pending_request_id, None);
-        assert_eq!(app.streaming_buffer, "");
-        assert!(app.streaming_conversation_id.is_none());
+        assert!(!app.is_streaming());
+        assert_eq!(app.streaming_buffer(), "");
         assert!(app.assistant_status.is_none());
     }
 
@@ -1841,13 +1609,16 @@ mod tests {
         // Unhappy path (TUI-8): a leftover ack sentinel from before the
         // disconnect must not claim the first post-reconnect stream.
         let mut app = App::new();
-        app.current_conversation = Some(detail("c1"));
+        app.load_conversation(detail("c1"));
         app.apply_prompt_ack("task-1".into(), "c1".into()); // sentinel armed
         app.clear_streaming_state();
 
-        app.receive_chunk("post-reconnect-req", "someone else's chunk");
-        assert_eq!(app.streaming_buffer, "", "chunk must be ignored");
-        assert_eq!(app.pending_request_id, None);
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "post-reconnect-req".into(),
+            chunk: "someone else's chunk".into(),
+        });
+        assert_eq!(app.streaming_buffer(), "", "chunk must be ignored");
+        assert!(!app.is_streaming());
     }
 
     #[test]
@@ -1866,226 +1637,165 @@ mod tests {
     }
 
     // --- Streaming tests ---
+    //
+    // These cover the TUI's wiring of the shared core's streaming effects. The
+    // happy-path lifecycle (claim → buffer → finalize) is exercised by
+    // `apply_core_finalizes_an_open_streams_reply_into_the_transcript` above; the
+    // reducer's state machine itself is spec'd in client-ui-common.
 
     #[test]
-    fn streaming_lifecycle() {
+    fn streaming_error_surfaces_in_the_status_line() {
+        // apply_core wires StreamError's `SetStatusText` onto App's status line
+        // and `ClearChatStatus` onto the transient assistant-status, and clears
+        // the slot + buffer.
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
-            id: "c1".into(),
-            title: "Test".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
+        app.load_conversation(detail("c1"));
+        app.apply_prompt_ack("task-1".into(), "c1".into());
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "req1".into(),
+            chunk: "half a thought".into(),
+        });
+        app.set_assistant_status("Calling tool…");
+
+        app.apply_core(UiMessage::StreamError {
+            request_id: "req1".into(),
+            error: "LLM timeout".into(),
         });
 
-        app.start_streaming("req1".into(), "c1".into());
-        assert_eq!(app.pending_request_id, Some("req1".to_string()));
-
-        app.receive_chunk("req1", "Hello ");
-        app.receive_chunk("req1", "world!");
-        assert_eq!(app.streaming_buffer, "Hello world!");
-
-        app.complete_streaming("req1", "Hello world!");
-        assert_eq!(app.streaming_buffer, "");
-        assert_eq!(app.pending_request_id, None);
-
-        let msgs = &app.current_conversation.as_ref().unwrap().messages;
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].role, "assistant");
-        assert_eq!(msgs[0].content, "Hello world!");
-    }
-
-    #[test]
-    fn wrong_request_id_ignored() {
-        let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
-            id: "c1".into(),
-            title: "Test".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-        });
-
-        app.start_streaming("req1".into(), "c1".into());
-        app.receive_chunk("wrong_id", "bad data");
-        assert_eq!(app.streaming_buffer, "");
-
-        app.complete_streaming("wrong_id", "bad");
-        assert!(app.pending_request_id.is_some()); // not cleared
-    }
-
-    #[test]
-    fn streaming_error_sets_status() {
-        let mut app = App::new();
-        app.start_streaming("req1".into(), "c1".into());
-        app.streaming_error("req1", "LLM timeout");
         assert_eq!(app.status_message, "Error: LLM timeout");
-        assert_eq!(app.pending_request_id, None);
-        assert_eq!(app.streaming_buffer, "");
+        assert!(
+            app.assistant_status.is_none(),
+            "the transient status clears"
+        );
+        assert!(!app.is_streaming());
+        assert_eq!(app.streaming_buffer(), "");
     }
 
     // --- Live external-turn rendering (#1) --------------------------------
 
-    /// A `UserMessageAdded` for the open conversation, with no turn in flight,
-    /// is a turn this client did not initiate (voice / another client). It
-    /// renders the user message and adopts the turn so the reply streams live.
     #[test]
-    fn external_user_message_in_open_conversation_renders_and_adopts() {
+    fn external_user_message_renders_and_adopts_into_the_open_conversation() {
+        // A `UserMessageAdded` for the open conversation with nothing in flight
+        // is an external turn (voice / another client): apply_core renders the
+        // user bubble (the `AddUserMessage` effect) and adopts the turn, so a
+        // following chunk for it streams live into the open chat.
         let mut app = app_with_open_conversation("c1");
-        app.user_message_added("c1", "voice-req", "what's the weather?");
 
-        let msgs = &app.current_conversation.as_ref().unwrap().messages;
+        let controller = app.apply_core(UiMessage::UserMessageAdded {
+            conversation_id: "c1".into(),
+            request_id: "voice-req".into(),
+            content: "what's the weather?".into(),
+        });
+        assert!(
+            controller.is_empty(),
+            "rendering the bubble needs no controller effect"
+        );
+
+        let msgs = &app.current_conversation().unwrap().messages;
         assert_eq!(msgs.len(), 1, "the external user message must be rendered");
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[0].content, "what's the weather?");
-        assert_eq!(
-            app.pending_request_id.as_deref(),
-            Some("voice-req"),
-            "the turn must be adopted so its reply streams live"
-        );
-        assert_eq!(app.streaming_conversation_id.as_deref(), Some("c1"));
-        assert!(
-            app.streaming_is_external,
-            "an adopted turn is external so tui does not also narrate it"
-        );
+
+        // Adopted: its reply now streams live into the open chat.
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "voice-req".into(),
+            chunk: "Sunny.".into(),
+        });
+        assert_eq!(app.streaming_buffer(), "Sunny.");
+        assert!(app.streaming_is_active_for_view());
     }
 
-    /// This client's own send is echoed back as `UserMessageAdded`. The user
-    /// message was already appended optimistically and the sentinel pinned, so
-    /// the echo renders nothing — it only claims the real request_id.
     #[test]
-    fn own_send_echo_dedupes_and_claims_request_id() {
-        let mut app = app_with_open_conversation("c1");
-        // Mirror the local send: optimistic append + sentinel via the ack.
-        app.current_conversation
-            .as_mut()
-            .unwrap()
-            .messages
-            .push(ChatMessage {
-                id: String::new(),
-                role: "user".to_string(),
-                content: "typed this".to_string(),
-            });
-        app.apply_prompt_ack(String::new(), "c1".to_string());
-
-        app.user_message_added("c1", "real-req", "typed this");
-
-        assert_eq!(
-            app.current_conversation.as_ref().unwrap().messages.len(),
-            1,
-            "our own send's echo must not double-append the user message"
-        );
-        assert_eq!(
-            app.pending_request_id.as_deref(),
-            Some("real-req"),
-            "the echo must claim the real request_id off the sentinel"
-        );
-        assert!(
-            !app.streaming_is_external,
-            "our own turn must NOT be flagged external (tui owns its narration)"
-        );
-    }
-
-    /// An adopted external turn is narrated by its originator — tui must not
-    /// also speak it even when the conversation's gate is open. Verifies the
-    /// flag main.rs captures (`was_external`) to suppress `enqueue_narration`.
-    #[test]
-    fn adopted_external_turn_suppresses_tui_narration() {
+    fn adopted_external_turn_is_not_narrated_by_this_client() {
+        // An adopted external turn is narrated by its originator (the voice
+        // daemon); even with the conversation's gate wide open (Adele=Always),
+        // completing it must emit NO `Speak` controller effect.
         let mut app = app_with_open_conversation("c1");
         app.set_adele_output("c1", AdeleOutput::Always);
         assert!(
             app.narrate_for("c1"),
-            "precondition: the gate alone would narrate (Adele=Always)"
+            "precondition: the gate alone would narrate"
         );
 
-        app.user_message_added("c1", "voice-req", "a question");
-        // main.rs captures this BEFORE complete_streaming resets it, then gates
-        // narration on `!was_external && narrate_for(origin)`.
-        let was_external = app.streaming_is_external;
-        let origin = app.complete_streaming("voice-req", "the spoken answer");
-
-        assert!(was_external, "external turn must suppress tui narration");
-        assert_eq!(origin.as_deref(), Some("c1"));
-        assert!(
-            !app.streaming_is_external,
-            "the external flag must reset at turn completion"
-        );
-    }
-
-    /// A `UserMessageAdded` for a conversation NOT on screen is left to the
-    /// reload-on-switch path — it must not touch the open transcript or the
-    /// in-flight slot.
-    #[test]
-    fn external_turn_for_background_conversation_is_ignored() {
-        let mut app = app_with_open_conversation("c1");
-        app.user_message_added("c2", "bg-req", "background");
-
-        assert!(
-            app.current_conversation
-                .as_ref()
-                .unwrap()
-                .messages
-                .is_empty(),
-            "a background turn must not render into the open transcript"
-        );
-        assert!(
-            app.pending_request_id.is_none(),
-            "a background turn must not be adopted into the in-flight slot"
-        );
-    }
-
-    /// While this client's own turn is in flight, a concurrent external turn is
-    /// NOT adopted — the single in-flight slot stays bound to our turn.
-    #[test]
-    fn external_turn_ignored_while_own_turn_in_flight() {
-        let mut app = app_with_open_conversation("c1");
-        app.start_streaming("mine".to_string(), "c1".to_string());
-
-        app.user_message_added("c1", "other", "concurrent");
-
-        assert_eq!(
-            app.pending_request_id.as_deref(),
-            Some("mine"),
-            "the in-flight turn's slot must be preserved"
-        );
-        assert!(
-            app.current_conversation
-                .as_ref()
-                .unwrap()
-                .messages
-                .is_empty(),
-            "must not append a second user message while a turn is in flight"
-        );
-    }
-
-    #[test]
-    fn assistant_status_set_and_cleared_on_complete() {
-        let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
-            id: "c1".into(),
-            title: "Test".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
+        app.apply_core(UiMessage::UserMessageAdded {
+            conversation_id: "c1".into(),
+            request_id: "voice-req".into(),
+            content: "a question".into(),
         });
-        app.start_streaming("req1".into(), "c1".into());
-        app.set_assistant_status("Searching knowledge base...");
+        let controller = app.apply_core(UiMessage::StreamComplete {
+            request_id: "voice-req".into(),
+            full_response: "the spoken answer".into(),
+        });
+
+        assert!(
+            !controller.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "an external turn must not be narrated here: {controller:?}"
+        );
+    }
+
+    #[test]
+    fn own_narrating_turn_completion_returns_a_speak_effect() {
+        // The flip side: this client's OWN turn, in a narrating conversation
+        // (Adele=Always), must bubble up a `Speak` controller effect on
+        // completion for `main` to enqueue.
+        let mut app = app_with_open_conversation("c1");
+        app.set_adele_output("c1", AdeleOutput::Always);
+        app.apply_prompt_ack("task-1".into(), "c1".into());
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "req1".into(),
+            chunk: "hi".into(),
+        });
+
+        let controller = app.apply_core(UiMessage::StreamComplete {
+            request_id: "req1".into(),
+            full_response: "the spoken answer".into(),
+        });
+
+        assert!(
+            controller
+                .iter()
+                .any(|e| matches!(e, Effect::Speak(text) if text == "the spoken answer")),
+            "an own narrating turn must bubble up a Speak effect: {controller:?}"
+        );
+    }
+
+    #[test]
+    fn assistant_status_set_and_cleared_through_apply_core() {
+        // A daemon `Status` event paints the transient indicator (SetChatStatus);
+        // completion clears it (ClearChatStatus) — both via apply_core.
+        let mut app = App::new();
+        app.load_conversation(detail("c1"));
+        app.apply_prompt_ack("task-1".into(), "c1".into());
+        app.apply_core(UiMessage::AssistantStatus {
+            request_id: "req1".into(),
+            message: "Searching knowledge base...".into(),
+        });
         assert_eq!(
             app.assistant_status.as_deref(),
             Some("Searching knowledge base...")
         );
 
-        app.complete_streaming("req1", "done");
+        app.apply_core(UiMessage::StreamComplete {
+            request_id: "req1".into(),
+            full_response: "done".into(),
+        });
         assert!(app.assistant_status.is_none());
     }
 
     #[test]
-    fn assistant_status_cleared_on_error() {
+    fn prompt_ack_shows_thinking_status() {
+        // The send was accepted but no token has arrived yet — show an immediate
+        // "thinking" cue so there's no dead air after pressing Enter.
         let mut app = App::new();
-        app.start_streaming("req1".into(), "c1".into());
-        app.set_assistant_status("Calling tool...");
-        app.streaming_error("req1", "boom");
-        assert!(app.assistant_status.is_none());
+        app.load_conversation(ConversationDetail {
+            id: "c1".into(),
+            title: "Test".into(),
+            messages: vec![],
+            model_selection: None,
+            conversation_personality: None,
+        });
+        app.apply_prompt_ack("t-1".into(), "c1".into());
+        assert_eq!(app.assistant_status.as_deref(), Some("Adele is thinking…"));
     }
 
     #[test]
@@ -2096,81 +1806,11 @@ mod tests {
         assert!(app.assistant_status.is_none());
     }
 
-    #[test]
-    fn pending_stream_claims_first_request_id_from_chunk() {
-        let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
-            id: "c1".into(),
-            title: "Test".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-        });
-
-        app.start_streaming_without_request_id("c1".into());
-        app.receive_chunk("ws-req-1", "Hello ");
-        app.receive_chunk("ws-req-1", "world");
-        app.complete_streaming("ws-req-1", "Hello world");
-
-        assert_eq!(app.pending_request_id, None);
-        let msgs = &app.current_conversation.as_ref().unwrap().messages;
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content, "Hello world");
-    }
-
-    #[test]
-    fn pending_stream_rejects_unrelated_request_after_claim() {
-        let mut app = App::new();
-        app.start_streaming_without_request_id("c1".into());
-
-        app.receive_chunk("ws-req-1", "good");
-        app.receive_chunk("ws-req-2", "ignored");
-
-        assert_eq!(app.streaming_buffer, "good");
-        assert_eq!(app.pending_request_id, Some("ws-req-1".to_string()));
-    }
-
-    /// Regression test for issue #52.
-    ///
-    /// `WsClient::send_prompt` returns the daemon's `task_id`
-    /// (post-desktop-assistant #114 `SendMessageAck`). That value is
-    /// distinct from the chunk-stream `request_id` embedded in
-    /// `AssistantDelta` events — the latter is server-generated per
-    /// streaming response. Treating the ack value as the stream's
-    /// request_id makes every chunk get filtered out by
-    /// `stream_matches_or_claims_request_id`, so the assistant's
-    /// streaming reply never appears.
-    ///
-    /// After `apply_prompt_ack(task_id)` the next chunk — carrying the
-    /// real, different server request_id — must still be accepted.
-    #[test]
-    fn apply_prompt_ack_accepts_chunks_with_distinct_server_request_id() {
-        let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
-            id: "c1".into(),
-            title: "Test".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-        });
-
-        // Daemon ack carries a task_id (post-#114 wire protocol).
-        app.apply_prompt_ack("task-abc123".to_string(), "c1".to_string());
-
-        // Streaming chunks then arrive with a *different* server-generated
-        // request_id. They must be accepted, not filtered out.
-        app.receive_chunk("server-req-xyz789", "Hello ");
-        app.receive_chunk("server-req-xyz789", "world!");
-
-        assert_eq!(app.streaming_buffer, "Hello world!");
-
-        app.complete_streaming("server-req-xyz789", "Hello world!");
-        assert_eq!(app.pending_request_id, None);
-        let msgs = &app.current_conversation.as_ref().unwrap().messages;
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].role, "assistant");
-        assert_eq!(msgs[0].content, "Hello world!");
-    }
+    // The pending-sentinel claim, unrelated-request rejection, and the issue #52
+    // distinct-ack-vs-server-request-id regression are all spec'd by
+    // client-ui-common's reducer tests (and exercised end-to-end through the TUI
+    // by `apply_core_finalizes_an_open_streams_reply_into_the_transcript`, which
+    // uses a distinct ack task id and server request id).
 
     // --- Mode transition tests ---
 
@@ -2211,10 +1851,11 @@ mod tests {
 
     #[test]
     fn list_refetch_replaces_sidebar_without_disturbing_open_conversation() {
-        // A `SignalEvent::ConversationListChanged` (#1) refetches the whole
-        // conversation list via `set_conversations`. That must repaint the
-        // sidebar but leave the OPEN conversation and its transcript intact —
-        // even when the change elsewhere renamed and removed rows.
+        // A `ConversationListChanged` / archive refetch (#1) routes through the
+        // reducer's `ConversationListRefetched`: apply_core repaints the sidebar
+        // (SetConversations) and re-syncs selection (EnsureActiveConversation, a
+        // TUI no-op) — emitting only view-effects — while the OPEN conversation
+        // and its transcript stay intact, even when rows were renamed/removed.
         let mut app = app_with_conversations();
         app.selected_conversation = Some(1);
         app.load_conversation(ConversationDetail {
@@ -2236,9 +1877,9 @@ mod tests {
             conversation_personality: None,
         });
 
-        // Simulate the refetched list: "1" was renamed and "3" was deleted
-        // elsewhere; "2" (the open one) survives.
-        app.set_conversations(vec![
+        // Refetched list: "1" was renamed and "3" was deleted elsewhere; "2"
+        // (the open one) survives.
+        let effects = app.apply_core(UiMessage::ConversationListRefetched(vec![
             ConversationSummary {
                 id: "1".into(),
                 title: "First (renamed elsewhere)".into(),
@@ -2251,13 +1892,17 @@ mod tests {
                 message_count: 2,
                 archived: false,
             },
-        ]);
+        ]));
+        assert!(
+            effects.is_empty(),
+            "a list refetch must emit only view-effects: {effects:?}"
+        );
 
-        // Sidebar reflects the new list...
-        assert_eq!(app.conversations.len(), 2);
-        assert_eq!(app.conversations[0].title, "First (renamed elsewhere)");
+        // Sidebar reflects the new list (and core stays authoritative for it)...
+        assert_eq!(app.conversations().len(), 2);
+        assert_eq!(app.conversations()[0].title, "First (renamed elsewhere)");
         // ...but the open conversation + its transcript are byte-for-byte intact.
-        let open = app.current_conversation.as_ref().expect("still open");
+        let open = app.current_conversation().expect("still open");
         assert_eq!(open.id, "2");
         assert_eq!(open.messages.len(), 2);
         assert_eq!(open.messages[1].content, "hi there");
@@ -2276,7 +1921,9 @@ mod tests {
     fn delete_selected_conversation() {
         let mut app = app_with_conversations();
         app.selected_conversation = Some(1);
-        app.current_conversation = Some(ConversationDetail {
+        // `load_conversation` (not a raw field write) so core's open-conversation
+        // id is set — the reducer's delete keys its "clear the open chat" on it.
+        app.load_conversation(ConversationDetail {
             id: "2".into(),
             title: "Second".into(),
             messages: vec![],
@@ -2286,9 +1933,53 @@ mod tests {
 
         let deleted = app.delete_selected_conversation();
         assert_eq!(deleted, Some("2".to_string()));
-        assert_eq!(app.conversations.len(), 2);
-        assert!(app.current_conversation.is_none());
+        assert_eq!(app.conversations().len(), 2);
+        assert!(
+            app.current_conversation().is_none(),
+            "deleting the active conversation clears the open chat"
+        );
         assert_eq!(app.selected_conversation, Some(1)); // stays at 1 (now "Third")
+    }
+
+    #[test]
+    fn deleting_a_conversation_prunes_its_per_conversation_voice_state() {
+        // GTK-9 / bug fix: the pre-flip TUI delete left the per-conversation
+        // voice maps untouched, leaking state (and risking a later id-reuse
+        // inheriting a stale setting). Routing delete through the core prunes it.
+        let mut app = app_with_conversations();
+        app.set_adele_output("2", AdeleOutput::Always);
+        app.set_voice_in("2", true);
+        assert!(app.narrate_for("2"), "precondition: voice state is set");
+
+        app.selected_conversation = Some(1); // id "2"
+        app.delete_selected_conversation();
+
+        assert!(
+            !app.narrate_for("2"),
+            "voice state must be pruned on delete"
+        );
+        assert_eq!(app.adele_output_for("2"), AdeleOutput::Disabled);
+        assert!(!app.voice_in_for("2"));
+    }
+
+    #[test]
+    fn rename_routes_through_core_and_refreshes_the_open_title() {
+        let mut app = app_with_conversations();
+        app.load_conversation(ConversationDetail {
+            id: "2".into(),
+            title: "Second".into(),
+            messages: vec![],
+            model_selection: None,
+            conversation_personality: None,
+        });
+
+        app.apply_rename("2", "Renamed Second");
+
+        // The sidebar row is updated via the core-owned list...
+        let row = app.conversations().iter().find(|c| c.id == "2").unwrap();
+        assert_eq!(row.title, "Renamed Second");
+        // ...and the open chat's cached title (the header reads it) is refreshed.
+        assert_eq!(app.current_conversation().unwrap().title, "Renamed Second");
     }
 
     #[test]
@@ -2404,7 +2095,7 @@ mod tests {
     #[test]
     fn apply_rename_updates_sidebar_and_current() {
         let mut app = app_with_conversations();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "2".into(),
             title: "Second".into(),
             messages: vec![],
@@ -2412,8 +2103,8 @@ mod tests {
             conversation_personality: None,
         });
         app.apply_rename("2", "Renamed");
-        assert_eq!(app.conversations[1].title, "Renamed");
-        assert_eq!(app.current_conversation.as_ref().unwrap().title, "Renamed");
+        assert_eq!(app.conversations()[1].title, "Renamed");
+        assert_eq!(app.current_conversation().unwrap().title, "Renamed");
     }
 
     #[test]
@@ -2422,9 +2113,38 @@ mod tests {
     }
 
     #[test]
+    fn pending_screen_request_round_trips_and_is_taken_once() {
+        let mut app = App::new();
+        assert_eq!(app.take_pending_screen(), None, "none pending by default");
+
+        app.request_screen(ScreenRequest::KnowledgeBase);
+        assert_eq!(
+            app.take_pending_screen(),
+            Some(ScreenRequest::KnowledgeBase)
+        );
+        assert_eq!(
+            app.take_pending_screen(),
+            None,
+            "taking clears it so the loop services it exactly once"
+        );
+    }
+
+    #[test]
+    fn requesting_a_screen_supersedes_an_unserviced_one() {
+        // The invariant the `ScreenRequest` enum buys over the old set of
+        // independent `*_requested` bools: only ONE screen can be pending, so a
+        // second request can't leave two queued to open in arbitrary order.
+        let mut app = App::new();
+        app.request_screen(ScreenRequest::Connections);
+        app.request_screen(ScreenRequest::Purposes);
+        assert_eq!(app.take_pending_screen(), Some(ScreenRequest::Purposes));
+        assert_eq!(app.take_pending_screen(), None);
+    }
+
+    #[test]
     fn apply_model_override_updates_current_conversation_and_stages_pending() {
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "c1".into(),
             title: "Chat".into(),
             messages: vec![],
@@ -2439,8 +2159,7 @@ mod tests {
         app.apply_model_override(ovr.clone());
         assert!(app.pending_model_override.is_some());
         let sel = app
-            .current_conversation
-            .as_ref()
+            .current_conversation()
             .unwrap()
             .model_selection
             .as_ref()
@@ -2489,11 +2208,14 @@ mod tests {
     #[test]
     fn receive_chunk_at_bottom_keeps_following() {
         // TUI-10: when the user is at the bottom (offset 0), streaming keeps
-        // auto-following.
+        // auto-following — applying a chunk through the core never moves scroll.
         let mut app = App::new();
-        app.current_conversation = Some(detail("c1"));
-        app.start_streaming("req1".into(), "c1".into());
-        app.receive_chunk("req1", "data");
+        app.load_conversation(detail("c1"));
+        app.apply_prompt_ack("task1".into(), "c1".into());
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "req1".into(),
+            chunk: "data".into(),
+        });
         assert_eq!(app.scroll_offset, 0);
     }
 
@@ -2502,28 +2224,15 @@ mod tests {
         // Acceptance (TUI-10): the user can read scrollback during a long
         // reply — chunks must not yank the view back to the bottom.
         let mut app = App::new();
-        app.current_conversation = Some(detail("c1"));
-        app.start_streaming("req1".into(), "c1".into());
+        app.load_conversation(detail("c1"));
+        app.apply_prompt_ack("task1".into(), "c1".into());
         app.scroll_up(10);
-        app.receive_chunk("req1", "data");
-        assert_eq!(app.scroll_offset, 10);
-        assert_eq!(app.streaming_buffer, "data", "chunk still buffered");
-    }
-
-    #[test]
-    fn submit_prompt_resets_scroll() {
-        let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
-            id: "c1".into(),
-            title: "Test".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "req1".into(),
+            chunk: "data".into(),
         });
-        app.scroll_up(10);
-        app.textarea.insert_str("hello");
-        app.submit_prompt();
-        assert_eq!(app.scroll_offset, 0);
+        assert_eq!(app.scroll_offset, 10);
+        assert_eq!(app.streaming_buffer(), "data", "chunk still buffered");
     }
 
     // --- Tasks pane integration ---
@@ -2652,7 +2361,8 @@ mod tests {
 
     fn app_with_open_conversation(id: &str) -> App {
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        // Via `load_conversation` so core's open-conversation id is dual-written.
+        app.load_conversation(ConversationDetail {
             id: id.into(),
             title: "Chat".into(),
             messages: vec![],
@@ -2733,7 +2443,7 @@ mod tests {
         // Always reads every reply aloud whether or not You is Enabled.
         for you in [false, true] {
             let mut app = app_with_open_conversation("c1");
-            app.voice_in.insert("c1".to_string(), you);
+            app.set_voice_in("c1", you);
             app.set_adele_output("c1", AdeleOutput::Always);
             assert!(app.narrate_for("c1"), "Always must narrate (You={you})");
             assert!(
@@ -2750,7 +2460,7 @@ mod tests {
         app.set_adele_output("c1", AdeleOutput::OnDemand);
 
         // You Disabled → reply text-only, but say_this aside still spoken.
-        app.voice_in.insert("c1".to_string(), false);
+        app.set_voice_in("c1", false);
         assert!(
             !app.narrate_for("c1"),
             "OnDemand + You=Disabled: no narration"
@@ -2761,7 +2471,7 @@ mod tests {
         );
 
         // You Enabled → reply narrated.
-        app.voice_in.insert("c1".to_string(), true);
+        app.set_voice_in("c1", true);
         assert!(app.narrate_for("c1"), "OnDemand + You=Enabled narrates");
         assert!(app.say_this_spoken_for("c1"));
     }
@@ -2771,7 +2481,7 @@ mod tests {
         let mut app = app_with_open_conversation("c1");
         app.set_adele_output("c1", AdeleOutput::Disabled);
         for you in [false, true] {
-            app.voice_in.insert("c1".to_string(), you);
+            app.set_voice_in("c1", you);
             assert!(
                 !app.narrate_for("c1"),
                 "Disabled never narrates (You={you})"
@@ -2787,7 +2497,7 @@ mod tests {
     fn set_voice_in_targets_an_explicit_conversation() {
         // The model's tools / the streaming path carry their own conversation id.
         let mut app = app_with_open_conversation("c1");
-        app.voice_in.insert("c2".to_string(), true);
+        app.set_voice_in("c2", true);
         assert!(app.voice_in_for("c2"));
         assert!(!app.voice_in_for("c1")); // open conversation untouched
     }
@@ -2815,19 +2525,39 @@ mod tests {
     }
 
     #[test]
-    fn narration_gates_on_the_originating_conversation_not_the_open_one() {
-        // TUI-4: a backgrounded turn's reply is narrated per ITS
-        // conversation's settings, not the open conversation's. c1 narrates
-        // (Always), the open c2 is Disabled — the completion still reports c1
-        // and the c1 gate holds.
+    fn backgrounded_turn_completion_is_not_narrated_into_the_open_conversation() {
+        // TUI-4 / GTK-2 convergence: when the originating conversation (c1,
+        // Adele=Always) is backgrounded — the user switched to c2 mid-stream —
+        // its completion touches NOTHING in the open chat and emits no narration.
+        // The reply is persisted daemon-side and re-appears when c1 is reopened.
+        //
+        // This is a deliberate behavior change adopting the shared reducer's
+        // semantics: the pre-migration TUI narrated a backgrounded reply per its
+        // origin's gate even while another conversation was on screen.
         let mut app = app_with_open_conversation("c1");
         app.set_adele_output("c1", AdeleOutput::Always);
         app.apply_prompt_ack("task-1".into(), "c1".into());
-        app.load_conversation(detail("c2"));
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "req-1".into(),
+            chunk: "partial".into(),
+        });
+        app.load_conversation(detail("c2")); // switch away mid-stream
 
-        let origin = app.complete_streaming("req-1", "spoken reply");
-        assert_eq!(origin.as_deref(), Some("c1"));
-        assert!(app.narrate_for("c1"), "origin's gate holds");
+        let controller = app.apply_core(UiMessage::StreamComplete {
+            request_id: "req-1".into(),
+            full_response: "spoken reply".into(),
+        });
+
+        assert!(
+            !controller.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "a backgrounded turn must not be narrated into the open chat: {controller:?}"
+        );
+        assert!(
+            app.current_conversation().unwrap().messages.is_empty(),
+            "and it must not append to the open (c2) transcript"
+        );
+        // The gate predicate itself is unchanged and still origin-keyed.
+        assert!(app.narrate_for("c1"), "origin's gate still holds");
         assert!(!app.narrate_for("c2"), "open conversation stays silent");
     }
 
@@ -2835,7 +2565,7 @@ mod tests {
     fn push_speech_disabled_note_appends_inline_to_open_conversation() {
         let mut app = app_with_open_conversation("c1");
         assert!(app.push_speech_disabled_note("c1", "the kettle is on"));
-        let msgs = &app.current_conversation.as_ref().unwrap().messages;
+        let msgs = &app.current_conversation().unwrap().messages;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "assistant");
         assert_eq!(msgs[0].content, "(speech mode disabled) the kettle is on");
@@ -2847,13 +2577,7 @@ mod tests {
         // must NOT bleed text into the visible transcript.
         let mut app = app_with_open_conversation("c1");
         assert!(!app.push_speech_disabled_note("c2", "wrong conversation"));
-        assert!(
-            app.current_conversation
-                .as_ref()
-                .unwrap()
-                .messages
-                .is_empty()
-        );
+        assert!(app.current_conversation().unwrap().messages.is_empty());
     }
 
     #[test]

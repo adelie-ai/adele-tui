@@ -27,7 +27,7 @@
 //!
 //! Delete-confirm overlay:
 //! - `y/Enter`: confirm
-//! - any other key: cancel
+//! - `n`/`Esc`: cancel (any other key is ignored)
 
 use std::{io, time::Duration};
 
@@ -51,17 +51,7 @@ const LIST_LIMIT: u32 = 100;
 const SEARCH_LIMIT: u32 = 50;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 
-const COLOR_BORDER: Color = Color::Rgb(82, 104, 173);
-const COLOR_BORDER_ACTIVE: Color = Color::Rgb(120, 183, 109);
-const COLOR_TITLE: Color = Color::Rgb(166, 182, 255);
-const COLOR_HINT_KEY: Color = Color::Rgb(216, 223, 236);
-const COLOR_HINT_DESC: Color = Color::Rgb(143, 153, 174);
-const COLOR_HINT_SEP: Color = Color::Rgb(82, 90, 110);
-const COLOR_LIST_HIGHLIGHT: Color = Color::Rgb(72, 102, 180);
-const COLOR_LIST_HIGHLIGHT_FG: Color = Color::Rgb(245, 248, 255);
-const COLOR_ERROR: Color = Color::Rgb(232, 130, 130);
-const COLOR_DELETE_BORDER: Color = Color::Rgb(232, 130, 130);
-const COLOR_TIMESTAMP: Color = Color::Rgb(140, 156, 196);
+use crate::theme::theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -222,6 +212,19 @@ struct State {
     closing: bool,
 }
 
+use crate::in_flight::InFlight;
+
+/// Resolved outcome of an off-loop KB RPC (modal-freeze fix). `Entries` covers
+/// both the list and search RPCs (both return entry vecs).
+enum RpcOutcome {
+    Entries(Result<Vec<KnowledgeEntryView>, String>),
+    Saved(Result<KnowledgeEntryView, String>),
+    Deleted {
+        id: String,
+        result: Result<(), String>,
+    },
+}
+
 /// The KB browser as a [`Screen`]: its mutable [`State`] plus the borrowed
 /// transport client the key/timer handlers need. The shared driver supplies the
 /// event loop and — the reason it's shared — drains daemon signals while this
@@ -229,6 +232,9 @@ struct State {
 struct KbScreen<'a> {
     state: State,
     client: &'a TransportClient,
+    /// In-flight list/search/save/delete RPCs, polled off the draw loop by
+    /// `poll_pending` so the browser never freezes during a round-trip.
+    pending: InFlight<'a, RpcOutcome>,
 }
 
 impl Screen for KbScreen<'_> {
@@ -238,8 +244,9 @@ impl Screen for KbScreen<'_> {
         draw(frame, &self.state);
     }
 
-    async fn handle_key(&mut self, key: KeyEvent) {
-        handle_key(&mut self.state, key, self.client).await;
+    fn handle_key(&mut self, key: KeyEvent) -> impl std::future::Future<Output = ()> {
+        handle_key(&mut self.state, key, self.client, &mut self.pending);
+        std::future::ready(())
     }
 
     fn take_outcome(&mut self) -> Option<()> {
@@ -250,10 +257,24 @@ impl Screen for KbScreen<'_> {
         self.state.search_deadline
     }
 
-    async fn on_timer(&mut self) {
+    fn on_timer(&mut self) -> impl std::future::Future<Output = ()> {
+        // Debounced search: enqueue it off-loop instead of awaiting here, so the
+        // browser keeps drawing/handling input while the search runs.
         self.state.search_deadline = None;
         let query = self.state.search.lines().join(" ").trim().to_string();
-        run_search(&mut self.state, self.client, query).await;
+        run_search(&mut self.state, &mut self.pending, self.client, query);
+        std::future::ready(())
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    async fn poll_pending(&mut self) {
+        let resolved = self.pending.next().await;
+        if let Some(outcome) = resolved {
+            apply_outcome(&mut self.state, outcome);
+        }
     }
 }
 
@@ -282,24 +303,35 @@ pub async fn run(
             closing: false,
         },
         client,
+        pending: InFlight::new(),
     };
 
-    // Initial fetch.
-    refresh_list(&mut screen.state, client).await;
+    // Initial fetch (off-loop).
+    refresh_list(&mut screen.state, &mut screen.pending, client);
 
     crate::screen::run_screen(terminal, &mut screen, signal_rx, sink).await
 }
 
-async fn handle_key(state: &mut State, key: KeyEvent, client: &TransportClient) {
+fn handle_key<'a>(
+    state: &mut State,
+    key: KeyEvent,
+    client: &'a TransportClient,
+    pending: &mut InFlight<'a, RpcOutcome>,
+) {
     match state.mode {
-        Mode::List => handle_list_key(state, key, client).await,
+        Mode::List => handle_list_key(state, key, client, pending),
         Mode::Search => handle_search_key(state, key),
-        Mode::Edit => handle_edit_key(state, key, client).await,
-        Mode::DeleteConfirm => handle_delete_key(state, key, client).await,
+        Mode::Edit => handle_edit_key(state, key, client, pending),
+        Mode::DeleteConfirm => handle_delete_key(state, key, client, pending),
     }
 }
 
-async fn handle_list_key(state: &mut State, key: KeyEvent, client: &TransportClient) {
+fn handle_list_key<'a>(
+    state: &mut State,
+    key: KeyEvent,
+    client: &'a TransportClient,
+    pending: &mut InFlight<'a, RpcOutcome>,
+) {
     match (key.code, key.modifiers) {
         (KeyCode::Esc | KeyCode::Char('q'), m) if m.is_empty() => {
             state.closing = true;
@@ -324,9 +356,7 @@ async fn handle_list_key(state: &mut State, key: KeyEvent, client: &TransportCli
         (KeyCode::Char('/'), m) if m.is_empty() => {
             state.mode = Mode::Search;
         }
-        (KeyCode::Char('r'), m) if m.is_empty() => {
-            refresh_list(state, client).await;
-        }
+        (KeyCode::Char('r'), m) if m.is_empty() => refresh_list(state, pending, client),
         _ => {}
     }
 }
@@ -352,11 +382,16 @@ fn handle_search_key(state: &mut State, key: KeyEvent) {
     }
 }
 
-async fn handle_edit_key(state: &mut State, key: KeyEvent, client: &TransportClient) {
+fn handle_edit_key<'a>(
+    state: &mut State,
+    key: KeyEvent,
+    client: &'a TransportClient,
+    pending: &mut InFlight<'a, RpcOutcome>,
+) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
     if ctrl && key.code == KeyCode::Char('s') {
-        save_edit(state, client).await;
+        save_edit(state, pending, client);
         return;
     }
 
@@ -386,28 +421,35 @@ async fn handle_edit_key(state: &mut State, key: KeyEvent, client: &TransportCli
     }
 }
 
-async fn handle_delete_key(state: &mut State, key: KeyEvent, client: &TransportClient) {
+fn handle_delete_key<'a>(
+    state: &mut State,
+    key: KeyEvent,
+    client: &'a TransportClient,
+    pending: &mut InFlight<'a, RpcOutcome>,
+) {
     match (key.code, key.modifiers) {
         (KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter, _) => {
             if let Some(entry) = state.entries.get(state.selected).cloned() {
                 state.busy = Some("Deleting entry...".into());
-                match client.delete_knowledge_entry(&entry.id).await {
-                    Ok(()) => {
-                        state.entries.remove(state.selected);
-                        if state.selected >= state.entries.len() {
-                            state.selected = state.entries.len().saturating_sub(1);
-                        }
-                        state.busy = None;
+                let id = entry.id.clone();
+                pending.push(async move {
+                    RpcOutcome::Deleted {
+                        result: client
+                            .delete_knowledge_entry(&id)
+                            .await
+                            .map_err(|e| format!("Delete failed: {e}")),
+                        id,
                     }
-                    Err(e) => {
-                        state.busy = None;
-                        state.error = Some(format!("Delete failed: {e}"));
-                    }
-                }
+                });
             }
             state.mode = state.return_mode;
         }
-        _ => state.mode = Mode::List,
+        // A destructive confirm is dismissed only by an explicit cancel
+        // (n/Esc); any other key is ignored rather than silently closing it.
+        (KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc, _) => {
+            state.mode = Mode::List;
+        }
+        _ => {}
     }
 }
 
@@ -426,47 +468,48 @@ fn advance_selection(state: &mut State, delta: i32) {
     state.selected = idx as usize;
 }
 
-async fn refresh_list(state: &mut State, client: &TransportClient) {
+fn refresh_list<'a>(
+    state: &mut State,
+    pending: &mut InFlight<'a, RpcOutcome>,
+    client: &'a TransportClient,
+) {
     state.busy = Some("Loading entries...".into());
-    let result = client.list_knowledge_entries(LIST_LIMIT, 0, None).await;
-    state.busy = None;
-    match result {
-        Ok(entries) => {
-            state.entries = entries;
-            if state.selected >= state.entries.len() {
-                state.selected = state.entries.len().saturating_sub(1);
-            }
-        }
-        Err(e) => {
-            state.error = Some(format!("Failed to load entries: {e}"));
-        }
-    }
+    pending.push(async move {
+        RpcOutcome::Entries(
+            client
+                .list_knowledge_entries(LIST_LIMIT, 0, None)
+                .await
+                .map_err(|e| format!("Failed to load entries: {e}")),
+        )
+    });
 }
 
-async fn run_search(state: &mut State, client: &TransportClient, query: String) {
+fn run_search<'a>(
+    state: &mut State,
+    pending: &mut InFlight<'a, RpcOutcome>,
+    client: &'a TransportClient,
+    query: String,
+) {
     if query.is_empty() {
-        refresh_list(state, client).await;
+        refresh_list(state, pending, client);
         return;
     }
     state.busy = Some("Searching...".into());
-    let result = client
-        .search_knowledge_entries(&query, None, SEARCH_LIMIT)
-        .await;
-    state.busy = None;
-    match result {
-        Ok(entries) => {
-            state.entries = entries;
-            if state.selected >= state.entries.len() {
-                state.selected = state.entries.len().saturating_sub(1);
-            }
-        }
-        Err(e) => {
-            state.error = Some(format!("Search failed: {e}"));
-        }
-    }
+    pending.push(async move {
+        RpcOutcome::Entries(
+            client
+                .search_knowledge_entries(&query, None, SEARCH_LIMIT)
+                .await
+                .map_err(|e| format!("Search failed: {e}")),
+        )
+    });
 }
 
-async fn save_edit(state: &mut State, client: &TransportClient) {
+fn save_edit<'a>(
+    state: &mut State,
+    pending: &mut InFlight<'a, RpcOutcome>,
+    client: &'a TransportClient,
+) {
     let (content, tags, metadata) = match state.edit.submit() {
         Ok(parts) => parts,
         Err(e) => {
@@ -476,19 +519,34 @@ async fn save_edit(state: &mut State, client: &TransportClient) {
     };
 
     state.busy = Some("Saving...".into());
-    let result = if let Some(id) = state.edit.editing_id.clone() {
-        client
-            .update_knowledge_entry(&id, &content, tags, metadata)
-            .await
-    } else {
-        client
-            .create_knowledge_entry(&content, tags, metadata)
-            .await
-    };
-    state.busy = None;
+    let editing_id = state.edit.editing_id.clone();
+    pending.push(async move {
+        let result = if let Some(id) = editing_id {
+            client
+                .update_knowledge_entry(&id, &content, tags, metadata)
+                .await
+        } else {
+            client
+                .create_knowledge_entry(&content, tags, metadata)
+                .await
+        };
+        RpcOutcome::Saved(result.map_err(|e| format!("Save failed: {e}")))
+    });
+}
 
-    match result {
-        Ok(saved) => {
+/// Apply a resolved KB RPC. `Saved`/`Deleted` patch the list in place (no
+/// refetch); `Entries` replaces it (used by both the list and search RPCs).
+fn apply_outcome(state: &mut State, outcome: RpcOutcome) {
+    state.busy = None;
+    match outcome {
+        RpcOutcome::Entries(Ok(entries)) => {
+            state.entries = entries;
+            if state.selected >= state.entries.len() {
+                state.selected = state.entries.len().saturating_sub(1);
+            }
+        }
+        RpcOutcome::Entries(Err(e)) => state.error = Some(e),
+        RpcOutcome::Saved(Ok(saved)) => {
             // Replace or insert the saved entry in the list.
             if let Some(existing) = state.entries.iter_mut().find(|e| e.id == saved.id) {
                 *existing = saved.clone();
@@ -504,9 +562,18 @@ async fn save_edit(state: &mut State, client: &TransportClient) {
             state.edit = EditForm::empty();
             state.mode = Mode::List;
         }
-        Err(e) => {
-            state.error = Some(format!("Save failed: {e}"));
-        }
+        RpcOutcome::Saved(Err(e)) => state.error = Some(e),
+        RpcOutcome::Deleted { id, result } => match result {
+            Ok(()) => {
+                if let Some(pos) = state.entries.iter().position(|e| e.id == id) {
+                    state.entries.remove(pos);
+                    if state.selected >= state.entries.len() {
+                        state.selected = state.entries.len().saturating_sub(1);
+                    }
+                }
+            }
+            Err(e) => state.error = Some(e),
+        },
     }
 }
 
@@ -546,12 +613,12 @@ fn draw_header(f: &mut Frame, area: Rect) {
         Span::styled(
             "Knowledge base",
             Style::default()
-                .fg(COLOR_TITLE)
+                .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             "  —  Esc to return to chat",
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         ),
     ]);
     f.render_widget(Paragraph::new(line), area);
@@ -561,9 +628,9 @@ fn draw_search_bar(f: &mut Frame, state: &State, area: Rect) {
     let focused = matches!(state.mode, Mode::Search);
     let mut ta = state.search.clone();
     let border_color = if focused {
-        COLOR_BORDER_ACTIVE
+        theme().border_active
     } else {
-        COLOR_BORDER
+        theme().border
     };
     ta.set_block(
         Block::default()
@@ -575,7 +642,7 @@ fn draw_search_bar(f: &mut Frame, state: &State, area: Rect) {
                 } else {
                     "Search (press / to focus)"
                 },
-                Style::default().fg(COLOR_TITLE),
+                Style::default().fg(theme().title),
             ))),
     );
     f.render_widget(&ta, area);
@@ -585,7 +652,7 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
     let items: Vec<ListItem> = if state.entries.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "(no entries — press 'n' to create one)",
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         )))]
     } else {
         state
@@ -605,7 +672,7 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
                 if !entry.tags.is_empty() {
                     spans.push(Span::styled(
                         format!("  [{}]", entry.tags.join(", ")),
-                        Style::default().fg(COLOR_HINT_DESC),
+                        Style::default().fg(theme().text_dim),
                     ));
                 }
                 ListItem::new(Line::from(spans))
@@ -623,18 +690,18 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BORDER))
+                .border_style(Style::default().fg(theme().border))
                 .title(Line::from(Span::styled(
                     title,
                     Style::default()
-                        .fg(COLOR_TITLE)
+                        .fg(theme().title)
                         .add_modifier(Modifier::BOLD),
                 ))),
         )
         .highlight_style(
             Style::default()
-                .bg(COLOR_LIST_HIGHLIGHT)
-                .fg(COLOR_LIST_HIGHLIGHT_FG)
+                .bg(theme().list_highlight)
+                .fg(theme().list_highlight_fg)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ");
@@ -649,7 +716,7 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
 fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_BORDER))
+        .border_style(Style::default().fg(theme().border))
         .title(Line::from(Span::styled(
             if state.edit.editing_id.is_some() {
                 "Edit entry"
@@ -657,7 +724,7 @@ fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
                 "New entry"
             },
             Style::default()
-                .fg(COLOR_TITLE)
+                .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(area);
@@ -688,7 +755,7 @@ fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
     f.render_widget(
         Paragraph::new(Span::styled(
             header_text,
-            Style::default().fg(COLOR_TIMESTAMP),
+            Style::default().fg(theme().debug_system),
         )),
         rows[0],
     );
@@ -726,9 +793,9 @@ fn draw_text_field_with_label(
 ) {
     let mut ta = textarea.clone();
     let border_color = if focused {
-        COLOR_BORDER_ACTIVE
+        theme().border_active
     } else {
-        COLOR_BORDER
+        theme().border
     };
     ta.set_block(
         Block::default()
@@ -736,7 +803,7 @@ fn draw_text_field_with_label(
             .border_style(Style::default().fg(border_color))
             .title(Line::from(Span::styled(
                 title.to_string(),
-                Style::default().fg(COLOR_TITLE),
+                Style::default().fg(theme().title),
             ))),
     );
     f.render_widget(&ta, area);
@@ -745,10 +812,10 @@ fn draw_text_field_with_label(
 fn draw_field_label(f: &mut Frame, area: Rect, label: &str, focused: bool) {
     let style = if focused {
         Style::default()
-            .fg(COLOR_BORDER_ACTIVE)
+            .fg(theme().border_active)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(COLOR_HINT_DESC)
+        Style::default().fg(theme().text_dim)
     };
     f.render_widget(Paragraph::new(Span::styled(label.to_string(), style)), area);
 }
@@ -756,9 +823,9 @@ fn draw_field_label(f: &mut Frame, area: Rect, label: &str, focused: bool) {
 fn draw_text_field(f: &mut Frame, area: Rect, textarea: &TextArea<'static>, focused: bool) {
     let mut ta = textarea.clone();
     let border_color = if focused {
-        COLOR_BORDER_ACTIVE
+        theme().border_active
     } else {
-        COLOR_BORDER
+        theme().border
     };
     ta.set_block(
         Block::default()
@@ -771,14 +838,14 @@ fn draw_text_field(f: &mut Frame, area: Rect, textarea: &TextArea<'static>, focu
 fn draw_status(f: &mut Frame, state: &State, area: Rect) {
     if let Some(busy) = &state.busy {
         let style = Style::default()
-            .fg(Color::Rgb(178, 220, 245))
+            .fg(theme().assistant_indicator)
             .add_modifier(Modifier::ITALIC);
         f.render_widget(
             Paragraph::new(Span::styled(format!(" ● {busy}"), style)),
             area,
         );
     } else if let Some(err) = &state.error {
-        let style = Style::default().fg(COLOR_ERROR);
+        let style = Style::default().fg(theme().error);
         f.render_widget(
             Paragraph::new(Span::styled(format!(" • {err}"), style)),
             area,
@@ -798,24 +865,24 @@ fn draw_hints(f: &mut Frame, state: &State, area: Rect) {
         ],
         Mode::Search => &[("Enter", "search"), ("Esc", "clear & back")],
         Mode::Edit => &[("Tab", "next field"), ("Ctrl+S", "save"), ("Esc", "cancel")],
-        Mode::DeleteConfirm => &[("y/Enter", "confirm"), ("any", "cancel")],
+        Mode::DeleteConfirm => &[("y/Enter", "confirm"), ("n/Esc", "cancel")],
     };
 
     let mut spans: Vec<Span> = Vec::with_capacity(hints.len() * 4);
     for (idx, (key, desc)) in hints.iter().enumerate() {
         if idx > 0 {
-            spans.push(Span::styled("  ·  ", Style::default().fg(COLOR_HINT_SEP)));
+            spans.push(Span::styled("  ·  ", Style::default().fg(theme().hint_sep)));
         }
         spans.push(Span::styled(
             (*key).to_string(),
             Style::default()
-                .fg(COLOR_HINT_KEY)
+                .fg(theme().hint_key)
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             (*desc).to_string(),
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -847,11 +914,11 @@ fn draw_delete_overlay(f: &mut Frame, state: &State, area: Rect) {
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_DELETE_BORDER))
+        .border_style(Style::default().fg(theme().error))
         .title(Line::from(Span::styled(
             "Delete entry",
             Style::default()
-                .fg(Color::Rgb(255, 200, 200))
+                .fg(theme().error_text)
                 .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(popup);
@@ -862,8 +929,8 @@ fn draw_delete_overlay(f: &mut Frame, state: &State, area: Rect) {
             Style::default().fg(Color::White),
         )),
         Line::from(Span::styled(
-            "y/Enter = confirm · any other key = cancel",
-            Style::default().fg(COLOR_HINT_DESC),
+            "y/Enter = confirm · n/Esc = cancel",
+            Style::default().fg(theme().text_dim),
         )),
     ])
     .wrap(Wrap { trim: true });

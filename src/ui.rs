@@ -7,42 +7,48 @@ use ratatui::{
 };
 
 use crate::app::{AdeleOutput, App, InputMode};
+use crate::theme::theme;
 
 const INPUT_VISIBLE_LINES: u16 = 4;
 const INPUT_TOTAL_HEIGHT: u16 = INPUT_VISIBLE_LINES + 2; // +2 for borders
-const COLOR_PANEL_BORDER: Color = Color::Rgb(82, 104, 173);
-const COLOR_LIST_BORDER: Color = Color::Rgb(62, 125, 146);
-const COLOR_INPUT_BORDER_IDLE: Color = Color::Rgb(109, 122, 143);
-const COLOR_INPUT_BORDER_EDIT: Color = Color::Rgb(120, 183, 109);
-const COLOR_LIST_HIGHLIGHT: Color = Color::Rgb(72, 102, 180);
-const COLOR_LIST_HIGHLIGHT_FG: Color = Color::Rgb(245, 248, 255);
-const COLOR_USER_PREFIX: Color = Color::Rgb(255, 189, 89);
-const COLOR_ASSISTANT_PREFIX: Color = Color::Rgb(92, 206, 154);
-const COLOR_ASSISTANT_STREAMING: Color = Color::Rgb(132, 218, 193);
-const COLOR_STATUS_DIM: Color = Color::Rgb(143, 153, 174);
-// Context-fill indicator colours (#341): green well under the 0.85
-// compaction line, amber approaching it, red at/over budget.
-const COLOR_CTX_GREEN: Color = Color::Rgb(122, 200, 132);
-const COLOR_CTX_AMBER: Color = Color::Rgb(232, 184, 96);
-const COLOR_CTX_RED: Color = Color::Rgb(232, 106, 106);
-const COLOR_COUNT_DIM: Color = Color::Rgb(124, 132, 148);
-const COLOR_DEBUG_TOOL: Color = Color::Rgb(178, 138, 220);
-const COLOR_DEBUG_SYSTEM: Color = Color::Rgb(140, 156, 196);
-const COLOR_ASSISTANT_INDICATOR: Color = Color::Rgb(178, 220, 245);
+
+/// Below this width the conversation sidebar auto-hides so the chat keeps a
+/// usable column count. This is a render-time decision only — the user's
+/// `show_sidebar` toggle is never mutated, so widening the terminal restores it.
+const SIDEBAR_MIN_WIDTH: u16 = 50;
+/// The message area never shrinks below this; the input box gives up rows first
+/// on a short terminal (so messages can't be squeezed to nothing).
+const MIN_MESSAGE_ROWS: u16 = 1;
+
+/// Whether to actually render the sidebar: the user opted in *and* the terminal
+/// is wide enough to spare the columns.
+fn sidebar_visible(show_sidebar: bool, width: u16) -> bool {
+    show_sidebar && width >= SIDEBAR_MIN_WIDTH
+}
+
+/// Height for the composer box in a chat pane `available_height` rows tall, with
+/// `status_height` rows of assistant-status line. The box wants
+/// `INPUT_TOTAL_HEIGHT` rows but collapses on a short terminal so the message
+/// area keeps at least `MIN_MESSAGE_ROWS` (toolbar + status bar are 1 row each).
+fn chat_input_height(available_height: u16, status_height: u16) -> u16 {
+    let fixed_chrome = status_height + 2; // toolbar + status bar
+    let spare = available_height.saturating_sub(fixed_chrome + MIN_MESSAGE_ROWS);
+    INPUT_TOTAL_HEIGHT.min(spare)
+}
 
 fn mode_chip_style(mode: &InputMode) -> Style {
     match mode {
         InputMode::Normal => Style::default()
             .fg(Color::Black)
-            .bg(Color::Rgb(122, 163, 255))
+            .bg(theme().run)
             .add_modifier(Modifier::BOLD),
         InputMode::Editing => Style::default()
             .fg(Color::Black)
-            .bg(Color::Rgb(120, 214, 118))
+            .bg(theme().mode_edit_bg)
             .add_modifier(Modifier::BOLD),
         InputMode::Renaming => Style::default()
             .fg(Color::Black)
-            .bg(Color::Rgb(255, 189, 89))
+            .bg(theme().user_prefix)
             .add_modifier(Modifier::BOLD),
     }
 }
@@ -57,7 +63,7 @@ fn split_display_lines(content: &str) -> Vec<String> {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    if app.show_sidebar {
+    if sidebar_visible(app.show_sidebar, f.area().width) {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
@@ -77,6 +83,59 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.tasks.visible {
         crate::tasks::draw_overlay(f, &app.tasks, f.area());
     }
+
+    // Keymap help (?/F1) sits on top of everything.
+    if app.show_help {
+        draw_help_overlay(f, f.area());
+    }
+}
+
+/// The `?`/F1 keymap help overlay. Content comes from `keys::help_sections` so
+/// the bindings stay single-sourced.
+fn draw_help_overlay(f: &mut Frame, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+    for (section, binds) in crate::keys::help_sections() {
+        lines.push(Line::from(Span::styled(
+            *section,
+            Style::default()
+                .fg(theme().title)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for (key, desc) in *binds {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {key:<22}"),
+                    Style::default().fg(theme().hint_key),
+                ),
+                Span::styled(*desc, Style::default().fg(theme().text_dim)),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        "Inside modal screens (KB / connections / purposes), Ctrl+S = save.",
+        Style::default()
+            .fg(theme().text_dim)
+            .add_modifier(Modifier::ITALIC),
+    )));
+
+    let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let width = 60u16.min(area.width.saturating_sub(4));
+    let popup = centered_rect(width, height, area);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme().border))
+        .title(Line::from(Span::styled(
+            " Keys — press any key to close ",
+            Style::default()
+                .fg(theme().title)
+                .add_modifier(Modifier::BOLD),
+        )));
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, popup);
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -100,11 +159,11 @@ fn draw_rename_popup(f: &mut Frame, app: &mut App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(255, 189, 89)))
+        .border_style(Style::default().fg(theme().user_prefix))
         .title(Line::from(Span::styled(
             "Rename (Enter save, Esc cancel)",
             Style::default()
-                .fg(Color::Rgb(255, 220, 160))
+                .fg(theme().rename_title)
                 .add_modifier(Modifier::BOLD),
         )));
 
@@ -114,7 +173,7 @@ fn draw_rename_popup(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_conversation_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let items: Vec<ListItem> = app
-        .conversations
+        .conversations()
         .iter()
         .map(|c| {
             let mut spans = vec![];
@@ -131,7 +190,7 @@ fn draw_conversation_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect)
             ));
             spans.push(Span::styled(
                 format!(" ({})", c.message_count),
-                Style::default().fg(COLOR_COUNT_DIM),
+                Style::default().fg(theme().count_dim),
             ));
             ListItem::new(Line::from(spans))
         })
@@ -147,18 +206,18 @@ fn draw_conversation_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_LIST_BORDER))
+                .border_style(Style::default().fg(theme().list_border))
                 .title(Line::from(Span::styled(
                     title,
                     Style::default()
-                        .fg(Color::Rgb(136, 214, 240))
+                        .fg(theme().list_title)
                         .add_modifier(Modifier::BOLD),
                 ))),
         )
         .highlight_style(
             Style::default()
-                .bg(COLOR_LIST_HIGHLIGHT)
-                .fg(COLOR_LIST_HIGHLIGHT_FG)
+                .bg(theme().list_highlight)
+                .fg(theme().list_highlight_fg)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ");
@@ -171,13 +230,14 @@ fn draw_conversation_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect)
 fn draw_chat_panel(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let show_status = app.assistant_status.is_some();
     let status_height: u16 = if show_status { 1 } else { 0 };
+    let input_height = chat_input_height(area.height, status_height);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(status_height),
-            Constraint::Length(INPUT_TOTAL_HEIGHT),
+            Constraint::Length(input_height),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
@@ -200,13 +260,13 @@ fn draw_assistant_status(f: &mut Frame, app: &App, area: ratatui::layout::Rect) 
         Span::styled(
             "● ",
             Style::default()
-                .fg(COLOR_ASSISTANT_INDICATOR)
+                .fg(theme().assistant_indicator)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             message,
             Style::default()
-                .fg(COLOR_ASSISTANT_INDICATOR)
+                .fg(theme().assistant_indicator)
                 .add_modifier(Modifier::ITALIC),
         ),
     ]));
@@ -306,39 +366,39 @@ fn push_assistant_markdown(lines: &mut Vec<Line<'static>>, content: &str, style:
 fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let mut lines: Vec<Line> = Vec::new();
 
-    if let Some(conv) = &app.current_conversation {
+    if let Some(conv) = app.current_conversation() {
         for msg in &conv.messages {
             // Roles fall into a few buckets: user/assistant render normally
             // (assistant via markdown); tool/system/empty-assistant render
             // only when the debug view is enabled.
             match msg.role.as_str() {
                 "user" => {
-                    let style = Style::default().fg(COLOR_USER_PREFIX);
+                    let style = Style::default().fg(theme().user_prefix);
                     push_user_message(&mut lines, &msg.content, style);
                     lines.push(Line::from(""));
                 }
                 "assistant" if !msg.content.trim().is_empty() => {
-                    let style = Style::default().fg(COLOR_ASSISTANT_PREFIX);
+                    let style = Style::default().fg(theme().assistant_prefix);
                     push_assistant_markdown(&mut lines, &msg.content, style);
                     lines.push(Line::from(""));
                 }
                 "tool" if app.show_debug => {
                     let style = Style::default()
-                        .fg(COLOR_DEBUG_TOOL)
+                        .fg(theme().debug_tool)
                         .add_modifier(Modifier::DIM | Modifier::ITALIC);
                     push_prefixed_message(&mut lines, "tool: ", &msg.content, style);
                     lines.push(Line::from(""));
                 }
                 "system" if app.show_debug => {
                     let style = Style::default()
-                        .fg(COLOR_DEBUG_SYSTEM)
+                        .fg(theme().debug_system)
                         .add_modifier(Modifier::DIM | Modifier::ITALIC);
                     push_prefixed_message(&mut lines, "system: ", &msg.content, style);
                     lines.push(Line::from(""));
                 }
                 "assistant" if app.show_debug => {
                     let style = Style::default()
-                        .fg(COLOR_ASSISTANT_PREFIX)
+                        .fg(theme().assistant_prefix)
                         .add_modifier(Modifier::DIM | Modifier::ITALIC);
                     push_prefixed_message(&mut lines, "Adele (empty): ", &msg.content, style);
                     lines.push(Line::from(""));
@@ -353,9 +413,9 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         // when the in-flight stream belongs to THIS conversation (TUI-4): a
         // backgrounded turn keeps buffering invisibly and re-appears when the
         // user switches back to its conversation.
-        if !app.streaming_buffer.is_empty() && app.streaming_is_for_current() {
-            let style = Style::default().fg(COLOR_ASSISTANT_STREAMING);
-            push_assistant_markdown(&mut lines, &app.streaming_buffer, style);
+        if !app.streaming_buffer().is_empty() && app.streaming_is_active_for_view() {
+            let style = Style::default().fg(theme().ok);
+            push_assistant_markdown(&mut lines, app.streaming_buffer(), style);
             // Cursor on last line
             if let Some(last) = lines.last_mut() {
                 last.spans.push(Span::styled("▌", style));
@@ -366,46 +426,43 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     }
 
     let chat_title = app
-        .current_conversation
-        .as_ref()
+        .current_conversation()
         .map(|conv| conv.title.as_str())
         .unwrap_or("Chat");
     let model_suffix = app
-        .current_conversation
-        .as_ref()
+        .current_conversation()
         .and_then(|conv| conv.model_selection.as_ref())
         .map(|sel| format!("  ·  {} · {}", sel.connection_id, sel.model_id))
         .unwrap_or_default();
     // Persistent cue for the two per-conversation voice controls (adele-tui#77),
-    // so the user can always see both states. `Adele:` (voice output, Ctrl+S
-    // cycles) shows only when not Disabled — the common default stays
-    // uncluttered; `You:` (voice input, Ctrl+V toggles) shows only when Enabled.
-    // A speaker glyph for Adele, a mic glyph for You so they read distinctly.
+    // so the user can always see both states. `Adele:` (voice output) shows only
+    // when not Disabled — the common default stays uncluttered; `You:` (voice
+    // input) shows only when Enabled. The keybindings (Ctrl+S / Ctrl+V) live in
+    // the `?`/F1 help overlay and the mode toolbar, so they aren't repeated in
+    // the title (declutter, CC-4); plain ASCII labels keep it width-safe (the
+    // former 🔊/🎙 glyphs risked double-width cells on some terminals).
     let adele_suffix = match app.current_adele_output() {
         AdeleOutput::Disabled => String::new(),
-        level => format!("  ·  🔊 Adele: {} (Ctrl+S)", level.label()),
+        level => format!("  ·  Adele: {}", level.label()),
     };
     let you_suffix = if app.current_voice_in() {
-        "  ·  🎙 You: Enabled (Ctrl+V)"
+        "  ·  You: on"
     } else {
         ""
     };
-    let title = if app.scroll_offset > 0 {
-        format!(
-            "{chat_title}{model_suffix}{adele_suffix}{you_suffix} \
-             (Ctrl+u/d scroll, Ctrl+e bottom)"
-        )
-    } else {
-        format!("{chat_title}{model_suffix}{adele_suffix}{you_suffix}")
-    };
+    // A bare up-arrow marks "scrolled up from the bottom"; the scroll keys
+    // themselves are in the help overlay / toolbar, so the old verbose
+    // "(Ctrl+u/d scroll, Ctrl+e bottom)" prose is gone (declutter, CC-4).
+    let scroll_marker = if app.scroll_offset > 0 { "  ↑" } else { "" };
+    let title = format!("{chat_title}{model_suffix}{adele_suffix}{you_suffix}{scroll_marker}");
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_PANEL_BORDER))
+        .border_style(Style::default().fg(theme().border))
         .title(Line::from(Span::styled(
             title,
             Style::default()
-                .fg(Color::Rgb(166, 182, 255))
+                .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
         )));
     let inner_width = block.inner(area).width;
@@ -431,13 +488,22 @@ fn draw_input(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     // sent — is never mutated by terminal-width line breaks.
     let mut display = app.wrapped_display_textarea(wrap_width);
 
-    let (title, border_color) = match app.mode {
-        InputMode::Normal => ("Input (press 'i' to edit)", COLOR_INPUT_BORDER_IDLE),
+    let (base_title, mode_color) = match app.mode {
+        InputMode::Normal => ("Input (press 'i' to edit)", theme().input_border_idle),
         InputMode::Editing => (
             "Input (Esc cancel, Enter send, Shift+Enter/Ctrl+J newline)",
-            COLOR_INPUT_BORDER_EDIT,
+            theme().border_active,
         ),
-        InputMode::Renaming => ("Input", COLOR_INPUT_BORDER_IDLE),
+        InputMode::Renaming => ("Input", theme().input_border_idle),
+    };
+    // When the daemon link is down the run loop projects `connected = false`;
+    // surface it where the user types — a warn-colored border plus an `offline`
+    // tag. The tag is text (not color-only) so it still reads under NO_COLOR,
+    // where the recolor is a no-op; the status bar carries the backoff detail.
+    let (title, border_color) = if app.connected {
+        (base_title.to_string(), mode_color)
+    } else {
+        (format!("offline · {base_title}"), theme().warn)
     };
 
     display.set_block(
@@ -446,7 +512,7 @@ fn draw_input(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             .border_style(Style::default().fg(border_color))
             .title(Line::from(Span::styled(
                 title,
-                Style::default().fg(Color::Rgb(216, 223, 236)),
+                Style::default().fg(theme().hint_key),
             ))),
     );
 
@@ -485,7 +551,7 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         return;
     }
     let mut spans: Vec<Span> = Vec::with_capacity(4);
-    spans.push(Span::styled(" • ", Style::default().fg(COLOR_STATUS_DIM)));
+    spans.push(Span::styled(" • ", Style::default().fg(theme().text_dim)));
     spans.push(Span::styled(
         app.status_message.as_str(),
         Style::default().fg(Color::White),
@@ -495,7 +561,7 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         spans.push(Span::styled(
             badge,
             Style::default()
-                .fg(Color::Rgb(122, 163, 255))
+                .fg(theme().run)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -507,10 +573,12 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 /// Pure so the colour-threshold contract is unit-testable without a frame.
 fn context_usage_span(usage: crate::app::ContextUsageView) -> (String, Color) {
     use crate::app::ContextFillLevel;
+    // Context-fill indicator colours (#341): green well under the 0.85
+    // compaction line, amber approaching it, red at/over budget.
     let color = match usage.level() {
-        ContextFillLevel::Green => COLOR_CTX_GREEN,
-        ContextFillLevel::Amber => COLOR_CTX_AMBER,
-        ContextFillLevel::Red => COLOR_CTX_RED,
+        ContextFillLevel::Green => theme().ctx_green,
+        ContextFillLevel::Amber => theme().ctx_amber,
+        ContextFillLevel::Red => theme().ctx_red,
     };
     (usage.readout(), color)
 }
@@ -530,13 +598,13 @@ mod tests {
             compaction_active: false,
         };
         // Green below 0.85.
-        assert_eq!(context_usage_span(mk(12_000, 32_000)).1, COLOR_CTX_GREEN);
+        assert_eq!(context_usage_span(mk(12_000, 32_000)).1, theme().ctx_green);
         // Amber at exactly 0.85 (27_200) and between line and budget.
-        assert_eq!(context_usage_span(mk(27_200, 32_000)).1, COLOR_CTX_AMBER);
-        assert_eq!(context_usage_span(mk(30_000, 32_000)).1, COLOR_CTX_AMBER);
+        assert_eq!(context_usage_span(mk(27_200, 32_000)).1, theme().ctx_amber);
+        assert_eq!(context_usage_span(mk(30_000, 32_000)).1, theme().ctx_amber);
         // Red at/over budget.
-        assert_eq!(context_usage_span(mk(32_000, 32_000)).1, COLOR_CTX_RED);
-        assert_eq!(context_usage_span(mk(40_000, 32_000)).1, COLOR_CTX_RED);
+        assert_eq!(context_usage_span(mk(32_000, 32_000)).1, theme().ctx_red);
+        assert_eq!(context_usage_span(mk(40_000, 32_000)).1, theme().ctx_red);
         // Text carries the readout.
         assert_eq!(context_usage_span(mk(12_000, 32_000)).0, "12k / 32k (38%)");
     }
@@ -604,7 +672,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "1".into(),
             title: "Test".into(),
             messages: vec![
@@ -644,7 +712,7 @@ mod tests {
         // the chat title only when the open conversation's level is not Disabled,
         // and reflects the current level label.
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "c1".into(),
             title: "ChatProbe".into(),
             messages: vec![],
@@ -677,7 +745,7 @@ mod tests {
         // the chat title only while the open conversation's You is Enabled, and
         // is distinct from the Adele cue.
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "c1".into(),
             title: "ChatProbe".into(),
             messages: vec![],
@@ -695,18 +763,25 @@ mod tests {
 
     #[test]
     fn draw_with_streaming_buffer_does_not_panic() {
+        use client_ui_common::UiMessage;
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        // `load_conversation` dual-writes the open-conversation id into core so
+        // the in-flight stream is active for the view; the chunk then buffers and
+        // paints through the same render guard production uses.
+        app.load_conversation(ConversationDetail {
             id: "1".into(),
             title: "Test".into(),
             messages: vec![],
             model_selection: None,
             conversation_personality: None,
         });
-        app.start_streaming("req1".into(), "1".into());
-        app.receive_chunk("req1", "Partial response...");
+        app.apply_prompt_ack("task1".into(), "1".into());
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "req1".into(),
+            chunk: "Partial response...".into(),
+        });
         terminal.draw(|f| draw(f, &mut app)).unwrap();
     }
 
@@ -727,6 +802,143 @@ mod tests {
         let mut app = App::new();
         app.status_message = "Error: connection lost".into();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn draw_input_marks_offline_when_disconnected() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.connected = false;
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(
+            dump.contains("offline"),
+            "offline tag must show when disconnected"
+        );
+    }
+
+    #[test]
+    fn draw_input_has_no_offline_tag_when_connected() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        // App::new() defaults connected = true.
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(!dump.contains("offline"), "no offline tag while connected");
+    }
+
+    #[test]
+    fn draw_input_border_recolors_to_warn_only_when_disconnected() {
+        // The disconnect cue is two-channel: the text tag (asserted above, the
+        // NO_COLOR-safe channel) *and* a warn-recolored input border. `warn` is
+        // unique among the palette's border colors, so a warn-colored border
+        // glyph appears iff the link is down — letting us assert the recolor
+        // directly rather than only the tag.
+        fn input_border_has_warn(app: &mut App) -> bool {
+            let backend = TestBackend::new(80, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| draw(f, app)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            buf.content.iter().any(|c| {
+                matches!(c.symbol(), "┌" | "┐" | "└" | "┘" | "│" | "─") && c.fg == theme().warn
+            })
+        }
+
+        let mut offline = App::new();
+        offline.connected = false;
+        assert!(
+            input_border_has_warn(&mut offline),
+            "a disconnected input border must be warn-colored"
+        );
+
+        let mut online = App::new();
+        // App::new() defaults connected = true.
+        assert!(
+            !input_border_has_warn(&mut online),
+            "no border should be warn-colored while connected"
+        );
+    }
+
+    #[test]
+    fn sidebar_visible_requires_opt_in_and_width() {
+        assert!(sidebar_visible(true, 80));
+        assert!(sidebar_visible(true, SIDEBAR_MIN_WIDTH));
+        // One column under the threshold hides it even though the user opted in.
+        assert!(!sidebar_visible(true, SIDEBAR_MIN_WIDTH - 1));
+        // Opt-out always hides it, however wide the terminal.
+        assert!(!sidebar_visible(false, 200));
+    }
+
+    #[test]
+    fn chat_input_height_is_full_when_tall_and_shrinks_when_short() {
+        // Tall pane: the composer gets its full height, status line or not.
+        assert_eq!(chat_input_height(24, 0), INPUT_TOTAL_HEIGHT);
+        assert_eq!(chat_input_height(24, 1), INPUT_TOTAL_HEIGHT);
+        // Short pane (height 8, no status): chrome(2) + message(1) leaves 5.
+        assert_eq!(chat_input_height(8, 0), 5);
+        // Tiny pane: shrinks toward zero rather than starving the messages.
+        assert_eq!(chat_input_height(4, 0), 1);
+        assert_eq!(chat_input_height(3, 0), 0);
+    }
+
+    #[test]
+    fn chat_input_height_always_leaves_a_message_row_when_possible() {
+        // Whenever the pane is tall enough to hold the fixed chrome plus a
+        // message row, the composer must not consume that row.
+        for h in 0..40u16 {
+            for status in 0..=1u16 {
+                let consumed = chat_input_height(h, status) + status + 2;
+                if h >= status + 2 + MIN_MESSAGE_ROWS {
+                    assert!(
+                        h.saturating_sub(consumed) >= MIN_MESSAGE_ROWS,
+                        "h={h} status={status}: only {} rows left for messages",
+                        h.saturating_sub(consumed)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn draw_auto_hides_sidebar_on_a_narrow_terminal() {
+        // Wide terminal: the opted-in sidebar (its "Conversations" title) shows.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(); // show_sidebar defaults true
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let wide: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            wide.contains("Conversations"),
+            "sidebar should show on a wide terminal"
+        );
+
+        // Narrow terminal, same opted-in state: the sidebar is suppressed so the
+        // chat keeps the columns — and the user's toggle is left untouched.
+        let backend = TestBackend::new(40, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let narrow: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            !narrow.contains("Conversations"),
+            "sidebar should auto-hide on a narrow terminal"
+        );
+        assert!(app.show_sidebar, "the user's toggle must be left untouched");
     }
 
     #[test]
@@ -792,7 +1004,7 @@ mod tests {
     fn app_with_debug_messages(show_debug: bool) -> App {
         let mut app = App::new();
         app.show_debug = show_debug;
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "1".into(),
             title: "Test".into(),
             messages: vec![
@@ -863,7 +1075,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "1".into(),
             title: "Test".into(),
             messages: vec![],
@@ -924,7 +1136,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "1".into(),
             title: "Test".into(),
             messages: vec![ChatMessage {

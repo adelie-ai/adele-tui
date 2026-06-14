@@ -25,15 +25,7 @@ use crate::{
     profile::{Profile, ProfileStore},
 };
 
-const COLOR_BORDER: Color = Color::Rgb(82, 104, 173);
-const COLOR_BORDER_ACTIVE: Color = Color::Rgb(120, 183, 109);
-const COLOR_TITLE: Color = Color::Rgb(166, 182, 255);
-const COLOR_HINT_KEY: Color = Color::Rgb(216, 223, 236);
-const COLOR_HINT_DESC: Color = Color::Rgb(143, 153, 174);
-const COLOR_HINT_SEP: Color = Color::Rgb(82, 90, 110);
-const COLOR_LIST_HIGHLIGHT: Color = Color::Rgb(72, 102, 180);
-const COLOR_LIST_HIGHLIGHT_FG: Color = Color::Rgb(245, 248, 255);
-const COLOR_ERROR: Color = Color::Rgb(232, 130, 130);
+use crate::theme::theme;
 
 /// Outcome of running the picker.
 pub enum PickerOutcome {
@@ -389,6 +381,24 @@ fn advance_selection(state: &mut PickerState, delta: i32) {
     state.selected = idx as usize;
 }
 
+/// Validate and commit the connection form: on success, store the profile and
+/// return to the list; on failure, surface the validation error in place.
+/// Shared by the Enter key and the Ctrl+S accelerator.
+fn submit_form(state: &mut PickerState) {
+    match state.form.submit() {
+        Ok(submitted) => {
+            if let Err(e) = apply_submission(state, submitted) {
+                state.error = Some(e);
+            } else {
+                state.error = None;
+                state.mode = Mode::List;
+                state.form = FormState::empty();
+            }
+        }
+        Err(msg) => state.error = Some(msg),
+    }
+}
+
 fn handle_form_key(state: &mut PickerState, key: KeyEvent) {
     // Ctrl+L: launch OAuth flow against the URL currently in the form.
     if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -400,6 +410,15 @@ fn handle_form_key(state: &mut PickerState, key: KeyEvent) {
             state.error =
                 Some("OAuth requires a WebSocket URL — fill in the URL field first".into());
         }
+        return;
+    }
+
+    // Ctrl+S saves the form — the universal "submit a form" accelerator shared
+    // with the modal screens (KB / connections / purposes). There a multi-line
+    // field makes Enter a newline, so Ctrl+S is the only save key; here the
+    // fields are single-line so Enter also saves, but Ctrl+S works everywhere.
+    if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        submit_form(state);
         return;
     }
 
@@ -422,18 +441,7 @@ fn handle_form_key(state: &mut PickerState, key: KeyEvent) {
         (KeyCode::BackTab, _) => state.form.prev_field(),
         (KeyCode::Up, m) if m.is_empty() => state.form.prev_field(),
         (KeyCode::Down, m) if m.is_empty() => state.form.next_field(),
-        (KeyCode::Enter, m) if m.is_empty() => match state.form.submit() {
-            Ok(submitted) => {
-                if let Err(e) = apply_submission(state, submitted) {
-                    state.error = Some(e);
-                } else {
-                    state.error = None;
-                    state.mode = Mode::List;
-                    state.form = FormState::empty();
-                }
-            }
-            Err(msg) => state.error = Some(msg),
-        },
+        (KeyCode::Enter, m) if m.is_empty() => submit_form(state),
         // Transport field cycles Local → WebSocket → D-Bus with left/right
         // (space steps forward).
         (KeyCode::Right | KeyCode::Char(' '), _) if state.form.focus == Field::Transport => {
@@ -621,7 +629,12 @@ fn handle_delete_key(state: &mut PickerState, key: KeyEvent) {
                 state.form = FormState::empty();
             }
         }
-        _ => state.mode = Mode::List,
+        // A destructive confirm is dismissed only by an explicit cancel
+        // (n/Esc); any other key is ignored rather than silently closing it.
+        (KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc, _) => {
+            state.mode = Mode::List;
+        }
+        _ => {}
     }
 }
 
@@ -662,12 +675,12 @@ fn draw_header(f: &mut Frame, area: Rect) {
         Line::from(Span::styled(
             "Adele connection profiles",
             Style::default()
-                .fg(COLOR_TITLE)
+                .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             "Pick a daemon to connect to, or create a new profile.",
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         )),
     ]);
     f.render_widget(title, area);
@@ -677,7 +690,7 @@ fn draw_list(f: &mut Frame, state: &PickerState, area: Rect) {
     let items: Vec<ListItem> = if state.store.profiles.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "(no saved profiles — press 'a' to add one)",
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         )))]
     } else {
         state
@@ -688,10 +701,7 @@ fn draw_list(f: &mut Frame, state: &PickerState, area: Rect) {
             .map(|(idx, p)| {
                 let mut spans: Vec<Span<'static>> = Vec::new();
                 if state.store.last_used_index() == Some(idx) {
-                    spans.push(Span::styled(
-                        "★ ",
-                        Style::default().fg(Color::Rgb(255, 207, 119)),
-                    ));
+                    spans.push(Span::styled("★ ", Style::default().fg(theme().pinned)));
                 }
                 spans.push(Span::styled(p.display_label(), Style::default()));
                 ListItem::new(Line::from(spans))
@@ -703,18 +713,18 @@ fn draw_list(f: &mut Frame, state: &PickerState, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BORDER))
+                .border_style(Style::default().fg(theme().border))
                 .title(Line::from(Span::styled(
                     "Profiles",
                     Style::default()
-                        .fg(COLOR_TITLE)
+                        .fg(theme().title)
                         .add_modifier(Modifier::BOLD),
                 ))),
         )
         .highlight_style(
             Style::default()
-                .bg(COLOR_LIST_HIGHLIGHT)
-                .fg(COLOR_LIST_HIGHLIGHT_FG)
+                .bg(theme().list_highlight)
+                .fg(theme().list_highlight_fg)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ");
@@ -729,7 +739,7 @@ fn draw_list(f: &mut Frame, state: &PickerState, area: Rect) {
 fn draw_form(f: &mut Frame, state: &PickerState, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_BORDER))
+        .border_style(Style::default().fg(theme().border))
         .title(Line::from(Span::styled(
             if state.form.editing_id.is_some() {
                 "Edit profile"
@@ -737,7 +747,7 @@ fn draw_form(f: &mut Frame, state: &PickerState, area: Rect) {
                 "New profile"
             },
             Style::default()
-                .fg(COLOR_TITLE)
+                .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(area);
@@ -829,10 +839,10 @@ fn draw_form(f: &mut Frame, state: &PickerState, area: Rect) {
 fn draw_field_label(f: &mut Frame, area: Rect, label: &str, focused: bool) {
     let style = if focused {
         Style::default()
-            .fg(COLOR_BORDER_ACTIVE)
+            .fg(theme().border_active)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(COLOR_HINT_DESC)
+        Style::default().fg(theme().text_dim)
     };
     f.render_widget(Paragraph::new(Span::styled(label.to_string(), style)), area);
 }
@@ -840,9 +850,9 @@ fn draw_field_label(f: &mut Frame, area: Rect, label: &str, focused: bool) {
 fn draw_text_field(f: &mut Frame, area: Rect, textarea: &TextArea<'static>, focused: bool) {
     let mut ta = textarea.clone();
     let border_color = if focused {
-        COLOR_BORDER_ACTIVE
+        theme().border_active
     } else {
-        COLOR_BORDER
+        theme().border
     };
     ta.set_block(
         Block::default()
@@ -855,9 +865,9 @@ fn draw_text_field(f: &mut Frame, area: Rect, textarea: &TextArea<'static>, focu
 fn draw_transport_toggle(f: &mut Frame, area: Rect, state: &PickerState) {
     let focused = state.form.focus == Field::Transport;
     let border_color = if focused {
-        COLOR_BORDER_ACTIVE
+        theme().border_active
     } else {
-        COLOR_BORDER
+        theme().border
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -869,10 +879,10 @@ fn draw_transport_toggle(f: &mut Frame, area: Rect, state: &PickerState) {
         let style = if selected {
             Style::default()
                 .fg(Color::Black)
-                .bg(COLOR_BORDER_ACTIVE)
+                .bg(theme().border_active)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(COLOR_HINT_DESC)
+            Style::default().fg(theme().text_dim)
         };
         Span::styled(format!(" {label} "), style)
     };
@@ -905,11 +915,11 @@ fn draw_delete_overlay(f: &mut Frame, state: &PickerState, area: Rect) {
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(232, 130, 130)))
+        .border_style(Style::default().fg(theme().error))
         .title(Line::from(Span::styled(
             "Delete profile",
             Style::default()
-                .fg(Color::Rgb(255, 200, 200))
+                .fg(theme().error_text)
                 .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(popup);
@@ -920,8 +930,8 @@ fn draw_delete_overlay(f: &mut Frame, state: &PickerState, area: Rect) {
             Style::default().fg(Color::White),
         )),
         Line::from(Span::styled(
-            "y/Enter = confirm · any other key = cancel",
-            Style::default().fg(COLOR_HINT_DESC),
+            "y/Enter = confirm · n/Esc = cancel",
+            Style::default().fg(theme().text_dim),
         )),
     ])
     .wrap(Wrap { trim: true });
@@ -931,14 +941,14 @@ fn draw_delete_overlay(f: &mut Frame, state: &PickerState, area: Rect) {
 fn draw_error(f: &mut Frame, state: &PickerState, area: Rect) {
     if let Some(busy) = &state.busy {
         let style = Style::default()
-            .fg(Color::Rgb(178, 220, 245))
+            .fg(theme().assistant_indicator)
             .add_modifier(Modifier::ITALIC);
         f.render_widget(
             Paragraph::new(Span::styled(format!(" ● {busy}"), style)),
             area,
         );
     } else if let Some(err) = &state.error {
-        let style = Style::default().fg(COLOR_ERROR);
+        let style = Style::default().fg(theme().error);
         f.render_widget(
             Paragraph::new(Span::styled(format!(" • {err}"), style)),
             area,
@@ -957,28 +967,28 @@ fn draw_hints(f: &mut Frame, state: &PickerState, area: Rect) {
         ],
         Mode::Form => &[
             ("Tab", "next field"),
-            ("Enter", "save"),
+            ("Enter/Ctrl+S", "save"),
             ("Ctrl+L", "OAuth sign-in"),
             ("Esc", "back"),
         ],
-        Mode::DeleteConfirm => &[("y/Enter", "confirm"), ("any", "cancel")],
+        Mode::DeleteConfirm => &[("y/Enter", "confirm"), ("n/Esc", "cancel")],
     };
 
     let mut spans: Vec<Span> = Vec::with_capacity(hints.len() * 4);
     for (idx, (key, desc)) in hints.iter().enumerate() {
         if idx > 0 {
-            spans.push(Span::styled("  ·  ", Style::default().fg(COLOR_HINT_SEP)));
+            spans.push(Span::styled("  ·  ", Style::default().fg(theme().hint_sep)));
         }
         spans.push(Span::styled(
             (*key).to_string(),
             Style::default()
-                .fg(COLOR_HINT_KEY)
+                .fg(theme().hint_key)
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             (*desc).to_string(),
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -1033,6 +1043,15 @@ mod tests {
         KeyEvent {
             code,
             modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
@@ -1132,6 +1151,33 @@ mod tests {
     }
 
     #[test]
+    fn form_ctrl_s_saves_like_enter() {
+        // Ctrl+S is the universal form-save accelerator (it's the only save key
+        // in the multi-line modal forms); on a valid form it must commit the
+        // profile and return to the list, exactly as Enter does here.
+        let mut state = make_state(vec![]);
+        state.mode = Mode::Form;
+        state.form.name.insert_str("My Conn"); // UDS default needs only a name
+        handle_form_key(&mut state, ctrl(KeyCode::Char('s')));
+        assert_eq!(state.store.profiles.len(), 1);
+        assert_eq!(state.store.profiles[0].name, "My Conn");
+        assert_eq!(state.mode, Mode::List);
+        assert!(state.error.is_none());
+    }
+
+    #[test]
+    fn form_ctrl_s_on_blank_form_records_error_like_enter() {
+        // And it routes through the same validation: a blank form errors in
+        // place rather than committing.
+        let mut state = make_state(vec![]);
+        state.mode = Mode::Form;
+        handle_form_key(&mut state, ctrl(KeyCode::Char('s')));
+        assert!(state.error.is_some());
+        assert_eq!(state.mode, Mode::Form);
+        assert!(state.store.profiles.is_empty());
+    }
+
+    #[test]
     fn delete_confirm_y_removes_profile() {
         let p = Profile::new(
             "Local".into(),
@@ -1148,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_confirm_other_key_cancels() {
+    fn delete_confirm_n_cancels() {
         let p = Profile::new(
             "Local".into(),
             TransportMode::Ws,
@@ -1160,5 +1206,118 @@ mod tests {
         handle_delete_key(&mut state, key(KeyCode::Char('n')));
         assert_eq!(state.store.profiles.len(), 1);
         assert_eq!(state.mode, Mode::List);
+    }
+
+    #[test]
+    fn delete_confirm_esc_cancels() {
+        let p = Profile::new(
+            "Local".into(),
+            TransportMode::Ws,
+            "ws://x".into(),
+            "s".into(),
+        );
+        let mut state = make_state(vec![p]);
+        state.mode = Mode::DeleteConfirm;
+        handle_delete_key(&mut state, key(KeyCode::Esc));
+        assert_eq!(state.store.profiles.len(), 1);
+        assert_eq!(state.mode, Mode::List);
+    }
+
+    #[test]
+    fn delete_confirm_stray_key_is_ignored() {
+        // A key that is neither confirm (y/Enter) nor cancel (n/Esc) must
+        // leave the overlay up rather than silently dismissing it.
+        let p = Profile::new(
+            "Local".into(),
+            TransportMode::Ws,
+            "ws://x".into(),
+            "s".into(),
+        );
+        let mut state = make_state(vec![p]);
+        state.mode = Mode::DeleteConfirm;
+        handle_delete_key(&mut state, key(KeyCode::Char('x')));
+        assert_eq!(state.store.profiles.len(), 1);
+        assert_eq!(state.mode, Mode::DeleteConfirm);
+    }
+
+    #[test]
+    fn delete_confirm_enter_confirms() {
+        // Enter is a second confirm binding alongside `y`; guard it so a
+        // refactor of the match arm can't silently drop it.
+        let p = Profile::new(
+            "Solo".into(),
+            TransportMode::Ws,
+            "ws://x".into(),
+            "s".into(),
+        );
+        let mut state = make_state(vec![p]);
+        state.mode = Mode::DeleteConfirm;
+        handle_delete_key(&mut state, key(KeyCode::Enter));
+        assert!(state.store.profiles.is_empty());
+    }
+
+    #[test]
+    fn delete_confirm_uppercase_y_confirms() {
+        // The confirm matrix is case-insensitive (`y`/`Y`).
+        let p = Profile::new(
+            "Solo".into(),
+            TransportMode::Ws,
+            "ws://x".into(),
+            "s".into(),
+        );
+        let mut state = make_state(vec![p]);
+        state.mode = Mode::DeleteConfirm;
+        handle_delete_key(&mut state, key(KeyCode::Char('Y')));
+        assert!(state.store.profiles.is_empty());
+    }
+
+    #[test]
+    fn delete_confirm_uppercase_n_cancels() {
+        // The cancel matrix is case-insensitive (`n`/`N`).
+        let p = Profile::new(
+            "Solo".into(),
+            TransportMode::Ws,
+            "ws://x".into(),
+            "s".into(),
+        );
+        let mut state = make_state(vec![p]);
+        state.mode = Mode::DeleteConfirm;
+        handle_delete_key(&mut state, key(KeyCode::Char('N')));
+        assert_eq!(state.store.profiles.len(), 1);
+        assert_eq!(state.mode, Mode::List);
+    }
+
+    #[test]
+    fn delete_confirm_with_multiple_profiles_returns_to_list_and_clamps_selection() {
+        // Deleting the last-selected of several profiles must keep the picker in
+        // the list (not fall back to the new-profile form) and clamp `selected`
+        // so it still points at a live row.
+        let alpha = Profile::new(
+            "Alpha".into(),
+            TransportMode::Ws,
+            "ws://a".into(),
+            "s".into(),
+        );
+        let beta = Profile::new(
+            "Beta".into(),
+            TransportMode::Ws,
+            "ws://b".into(),
+            "s".into(),
+        );
+        let mut state = make_state(vec![alpha, beta]);
+        state.selected = 1; // Beta, the last row
+        state.mode = Mode::DeleteConfirm;
+        handle_delete_key(&mut state, key(KeyCode::Char('y')));
+        assert_eq!(state.store.profiles.len(), 1);
+        assert_eq!(
+            state.store.profiles[0].name, "Alpha",
+            "the unselected profile survives"
+        );
+        assert_eq!(
+            state.mode,
+            Mode::List,
+            "stays in the list while profiles remain"
+        );
+        assert_eq!(state.selected, 0, "selection clamps to a valid row");
     }
 }

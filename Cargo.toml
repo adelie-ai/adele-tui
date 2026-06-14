@@ -41,6 +41,9 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 desktop-assistant-client-common = { git = "https://github.com/adelie-ai/desktop-assistant.git", branch = "main" }
 desktop-assistant-api-model = { git = "https://github.com/adelie-ai/desktop-assistant.git", branch = "main" }
 
+# The shared view-agnostic model+controller (CC-3, desktop-assistant#358).
+client-ui-common = { path = "../client-ui-common" }
+
 # Embeddable voice module (adelie-ai/voice phase 1) for in-app dictation +
 # reply playback with no voice daemon — see adele-tui#67 / voice#34. Path-dep
 # of the sibling `voice` checkout, mirroring how we path-dep desktop-assistant
@@ -66,6 +69,15 @@ path = "../voice/crates/vad-silero"
 
 [dependencies.adele-voice-stt-whisper]
 path = "../voice/crates/stt-whisper"
+
+# Option D dep-sourcing: client-ui-common path-deps the desktop-assistant crates
+# while adele keeps its git pin above. Redirect those transitive deps onto the SAME
+# path so cargo resolves exactly ONE client-common / api-model (a git source and a
+# path source otherwise split SignalEvent into two incompatible types -> E0308).
+[patch."https://github.com/adelie-ai/desktop-assistant.git"]
+desktop-assistant-client-common = { path = "../desktop-assistant/crates/client-common" }
+desktop-assistant-api-model = { path = "../desktop-assistant/crates/api-model" }
+
 
 [lints.rust]
 warnings = "deny"
