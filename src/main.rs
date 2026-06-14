@@ -239,23 +239,6 @@ enum ReconnectState {
 const RECONNECT_INITIAL_SECS: u64 = 2;
 const RECONNECT_MAX_SECS: u64 = 30;
 
-/// The system refinement to attach on the next send for `conversation_id`,
-/// chosen by its `Adele:` level: `OnDemand` → brief/conversational/speakable;
-/// `Always` → speakable-but-full (don't shorten); `Disabled` → none. Pure
-/// decision the send path consults to choose the refinement string (empty =
-/// none).
-///
-/// The refinement prose + the level→refinement mapping now live in the shared
-/// `adele-voice-client-common` crate (desktop-assistant#274) so the GTK and TUI
-/// clients send byte-identical refinements. The shared helper returns
-/// `Option<&str>`; we keep this client's empty-string-means-none convention so
-/// the send call sites are untouched.
-fn refinement_for_send(app: &App, conversation_id: &str) -> &'static str {
-    app.adele_output_for(conversation_id)
-        .send_refinement()
-        .unwrap_or("")
-}
-
 fn next_backoff(prev_secs: u64) -> u64 {
     prev_secs.saturating_mul(2).min(RECONNECT_MAX_SECS)
 }
@@ -1946,53 +1929,69 @@ fn insert_dictated_text(app: &mut App, text: &str) {
 /// (which appends a transcript to the input, then submits via the same route),
 /// so both honor the staged model override and the same ack handling.
 ///
-/// The connected/streaming gates run BEFORE any state mutation
-/// (`App::prepare_submission`, TUI-2/TUI-7), and a failed send RPC rolls the
-/// optimistic transcript append back and refills the composer
-/// (`App::restore_failed_submission`).
+/// The send *decision* lives in the shared core (`UiMessage::SubmitPrompt`,
+/// Phase-2): it runs the streaming/empty gate (TUI-7), draws the user bubble
+/// optimistically, and — when accepted — hands back an [`Effect::SendPrompt`]
+/// for this executor to run as the actual RPC. Only the connection gate and the
+/// transport-specific RPC + override stay here. A failed send rolls the
+/// optimistic bubble back via `UiMessage::SendFailed` and refills the composer.
 async fn send_prompt_from_input(app: &mut App, connector: &Option<Rc<Connector>>) {
-    if let Some((conv_id, prompt)) = app.prepare_submission(connector.is_some())
-        && let Some(connector) = connector.as_ref()
-    {
-        let client = connector.client();
-        let override_selection = app.take_pending_override();
-        // Per the conversation's `Adele:` level (adele-tui#77) carry a system
-        // refinement so the reply is shaped for speech: OnDemand → brief and
-        // conversational; Always → speakable but full (not shortened); Disabled →
-        // none. It only refines the system prompt for THIS turn — never stored,
-        // never in the transcript.
-        let refinement = refinement_for_send(app, &conv_id);
-        // Use the command-channel `send_prompt_full` when a model override is
-        // staged (model picker) and/or a refinement applies; the high-level
-        // `send_prompt` carries neither. `as_commands()` is `Some` on both
-        // socket transports (UDS + WS) but `None` on D-Bus. The Connector's
-        // refinement helper already folds the refinement into the prompt over
-        // D-Bus, so the no-override voice-mode path works everywhere.
-        let result = match (override_selection, client.as_commands()) {
-            (Some(ovr), Some(commands)) => {
-                commands
-                    .send_prompt_full(&conv_id, &prompt, Some(ovr), refinement.to_string())
-                    .await
-            }
-            (Some(_), None) => {
-                app.status_message =
-                    "Model override isn't supported over D-Bus — sent without override".into();
-                connector
-                    .send_prompt_with_system_refinement(&conv_id, &prompt, refinement)
-                    .await
-            }
-            (None, _) => {
-                connector
-                    .send_prompt_with_system_refinement(&conv_id, &prompt, refinement)
-                    .await
-            }
-        };
-        match result {
-            Ok(task_id) => app.apply_prompt_ack(task_id, conv_id.clone()),
-            Err(e) => {
-                app.restore_failed_submission(&conv_id, &prompt);
-                app.status_message = format!("Send error: {e} (your text is preserved)");
-            }
+    // Connection gate: transport state the core doesn't own.
+    let Some(connector) = connector.as_ref() else {
+        app.status_message = "Not connected — message not sent (your text is preserved)".into();
+        return;
+    };
+    let prompt = app.textarea_content();
+    let effects = app.apply_core(UiMessage::SubmitPrompt { prompt });
+    let Some(Effect::SendPrompt {
+        conversation_id,
+        prompt,
+        system_refinement,
+    }) = effects
+        .into_iter()
+        .find(|e| matches!(e, Effect::SendPrompt { .. }))
+    else {
+        // Rejected (still streaming / empty / no open conversation): the core
+        // already surfaced any status message and left the composer untouched.
+        return;
+    };
+    // Accepted: the user bubble is drawn, so clear the composer and snap to the
+    // bottom, then run the RPC. `send_prompt_full` carries the staged model
+    // override (socket transports only); over D-Bus the refinement folds into the
+    // prompt, so the no-override voice path works everywhere. `system_refinement`
+    // is `None` when the conversation's `Adele:` level is Disabled.
+    app.clear_composer();
+    app.scroll_to_bottom();
+    let client = connector.client();
+    let refinement = system_refinement.as_deref().unwrap_or("");
+    let result = match (app.take_pending_override(), client.as_commands()) {
+        (Some(ovr), Some(commands)) => {
+            commands
+                .send_prompt_full(&conversation_id, &prompt, Some(ovr), refinement.to_string())
+                .await
+        }
+        (Some(_), None) => {
+            app.status_message =
+                "Model override isn't supported over D-Bus — sent without override".into();
+            connector
+                .send_prompt_with_system_refinement(&conversation_id, &prompt, refinement)
+                .await
+        }
+        (None, _) => {
+            connector
+                .send_prompt_with_system_refinement(&conversation_id, &prompt, refinement)
+                .await
+        }
+    };
+    match result {
+        Ok(task_id) => app.apply_prompt_ack(task_id, conversation_id),
+        Err(e) => {
+            let _ = app.apply_core(UiMessage::SendFailed {
+                conversation_id,
+                prompt: prompt.clone(),
+            });
+            app.set_composer(&prompt);
+            app.status_message = format!("Send error: {e} (your text is preserved)");
         }
     }
 }

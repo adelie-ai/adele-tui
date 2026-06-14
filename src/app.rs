@@ -530,77 +530,20 @@ impl App {
         self.textarea.lines().join("\n")
     }
 
-    /// Gate + mutate for a prompt submission (TUI-2 / TUI-7). Checks the
-    /// preconditions BEFORE touching any state, so a refused submission leaves
-    /// the composer and transcript untouched:
-    ///
-    /// * not connected → refuse with a status message (TUI-2: previously the
-    ///   message was appended to the transcript and the composer cleared, then
-    ///   silently never sent);
-    /// * a reply is still streaming (`pending_request_id` is claimed or the
-    ///   ack sentinel) → refuse with a status message (TUI-7 policy: **block
-    ///   concurrent sends**. The TUI renders a single streaming buffer for the
-    ///   open conversation; interleaving a second stream would cross-wire the
-    ///   request-id claim and drop one reply. Blocking keeps the composer text
-    ///   so nothing is lost — the user sends again once the reply lands).
-    ///
-    /// Only when both gates pass does it delegate to [`App::submit_prompt`].
-    pub fn prepare_submission(&mut self, connected: bool) -> Option<(String, String)> {
-        if !connected {
-            self.status_message =
-                "Not connected — message not sent (your text is preserved)".into();
-            return None;
-        }
-        if self.is_streaming() {
-            self.status_message =
-                "A reply is still streaming — wait for it to finish (your text is preserved)"
-                    .into();
-            return None;
-        }
-        self.submit_prompt()
+    /// Empty the composer (after an accepted send). The submission gate, the
+    /// optimistic user-bubble append, and the streaming block (TUI-2 / TUI-7) all
+    /// live in the shared core now, reached via `UiMessage::SubmitPrompt`; the
+    /// composer is the one piece of pure view state the client still owns.
+    pub fn clear_composer(&mut self) {
+        self.textarea = new_textarea();
     }
 
-    /// Roll back a submission whose send RPC failed (TUI-2): remove the
-    /// optimistically appended user message (only when the originating
-    /// conversation is still open and the tail message matches) and put the
-    /// prompt text back into the composer so the user can retry without
-    /// retyping. The caller sets the status message with the send error.
-    pub fn restore_failed_submission(&mut self, conversation_id: &str, prompt: &str) {
-        if let Some(conv) = self
-            .core
-            .current_conversation
-            .as_mut()
-            .filter(|c| c.id == conversation_id)
-            && conv
-                .messages
-                .last()
-                .is_some_and(|m| m.role == "user" && m.content == prompt)
-        {
-            conv.messages.pop();
-        }
+    /// Refill the composer with `text` (after a failed send, so the user can
+    /// retry without retyping). The matching transcript rollback runs in the core
+    /// via `UiMessage::SendFailed`.
+    pub fn set_composer(&mut self, text: &str) {
         self.textarea = new_textarea();
-        self.textarea.insert_str(prompt);
-    }
-
-    /// Returns (conversation_id, prompt) if valid, None otherwise.
-    pub fn submit_prompt(&mut self) -> Option<(String, String)> {
-        let content = self.textarea_content();
-        if content.is_empty() {
-            return None;
-        }
-        let conv = self.core.current_conversation.as_mut()?;
-        conv.messages.push(ChatMessage {
-            // Optimistic local echo of our own send; the daemon assigns the real
-            // message id (#1) when it persists the turn. Dedupe of the echoed-back
-            // `UserMessageAdded` is by request_id, not message id (see
-            // `user_message_added`), so an empty id here is correct.
-            id: String::new(),
-            role: "user".to_string(),
-            content: content.clone(),
-        });
-        self.textarea = new_textarea();
-        self.scroll_offset = 0;
-        Some((conv.id.clone(), content))
+        self.textarea.insert_str(text);
     }
 
     /// Apply a bracketed paste (TUI-3 / `Event::Paste`) to whichever input is
@@ -1377,10 +1320,13 @@ mod tests {
         // A render frame wraps for display only.
         let _ = app.wrapped_display_textarea(10);
 
-        let (conv_id, payload) = app.submit_prompt().expect("submission");
-        assert_eq!(conv_id, "c1");
-        assert_eq!(payload, typed);
-        assert!(!payload.contains('\n'));
+        // The prompt that reaches the send effect is the logical (unwrapped) text,
+        // not the display-wrapped copy.
+        let prompt = app.textarea_content();
+        let effects = app.apply_core(UiMessage::SubmitPrompt { prompt });
+        let sent = sent_prompt(&effects).expect("an accepted send emits SendPrompt");
+        assert_eq!(sent, typed);
+        assert!(!sent.contains('\n'));
     }
 
     /// Shrinking then regrowing the terminal must not leave wrap newlines
@@ -1415,8 +1361,12 @@ mod tests {
 
         let _ = app.wrapped_display_textarea(8);
 
-        let (_id, payload) = app.submit_prompt().expect("submission");
-        assert_eq!(payload, typed);
+        let prompt = app.textarea_content();
+        let effects = app.apply_core(UiMessage::SubmitPrompt { prompt });
+        assert_eq!(
+            sent_prompt(&effects).expect("an accepted send emits SendPrompt"),
+            typed
+        );
     }
 
     /// CJK (wide) glyphs are measured by display width, not char count, so a
@@ -1435,51 +1385,10 @@ mod tests {
         assert_eq!(app.textarea_content(), "一二三四五");
     }
 
-    #[test]
-    fn submit_prompt_without_conversation_returns_none() {
-        let mut app = App::new();
-        app.textarea.insert_str("hello");
-        assert!(app.submit_prompt().is_none());
-        assert_eq!(app.textarea_content(), "hello"); // input preserved
-    }
-
-    #[test]
-    fn submit_prompt_with_empty_input_returns_none() {
-        let mut app = App::new();
-        app.load_conversation(ConversationDetail {
-            id: "1".into(),
-            title: "Test".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-        });
-        assert!(app.submit_prompt().is_none());
-    }
-
-    #[test]
-    fn submit_prompt_appends_user_message_and_clears_input() {
-        let mut app = App::new();
-        app.load_conversation(ConversationDetail {
-            id: "conv1".into(),
-            title: "Test".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-        });
-        app.textarea.insert_str("What is Rust?");
-
-        let result = app.submit_prompt();
-        assert_eq!(
-            result,
-            Some(("conv1".to_string(), "What is Rust?".to_string()))
-        );
-        assert_eq!(app.textarea_content(), "");
-
-        let msgs = &app.current_conversation().unwrap().messages;
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].role, "user");
-        assert_eq!(msgs[0].content, "What is Rust?");
-    }
+    // The submit gate, the optimistic user-bubble append, and the empty/
+    // no-conversation rejections moved to the shared core (`UiMessage::SubmitPrompt`,
+    // Phase-2) and are spec'd by client-ui-common's reducer tests. The App tests
+    // below cover only the TUI's own send-path wiring (composer text → effect).
 
     // --- Bracketed paste (TUI-3) ---
 
@@ -1515,10 +1424,11 @@ mod tests {
         });
         app.enter_editing_mode();
         app.apply_paste("first\nsecond\nthird");
-        let result = app.submit_prompt();
+        let prompt = app.textarea_content();
+        let effects = app.apply_core(UiMessage::SubmitPrompt { prompt });
         assert_eq!(
-            result,
-            Some(("c1".to_string(), "first\nsecond\nthird".to_string()))
+            sent_prompt(&effects).expect("an accepted send emits SendPrompt"),
+            "first\nsecond\nthird"
         );
         let msgs = &app.current_conversation().unwrap().messages;
         assert_eq!(msgs.len(), 1, "exactly one user message appended");
@@ -1543,155 +1453,24 @@ mod tests {
         assert_eq!(app.textarea_content(), "");
     }
 
-    // --- Send-path integrity (TUI-2 / TUI-7) ---
+    // --- Send-path wiring (TUI-2 / TUI-7) ---
+    //
+    // The send *decision* (gate, optimistic append, refinement, rollback) now
+    // lives in the shared core (`UiMessage::SubmitPrompt` / `SendFailed`) and is
+    // spec'd by client-ui-common's reducer tests. What stays here is the TUI's
+    // own wiring: the composer text becomes the prompt, and an accepted send
+    // surfaces as a `SendPrompt` effect for `send_prompt_from_input` to run. The
+    // connection gate + the transport RPC live in `main.rs` (not unit-testable
+    // without a daemon), so they're covered by the live smoke test.
 
-    fn app_ready_to_send(conv_id: &str, prompt: &str) -> App {
-        let mut app = App::new();
-        // `load_conversation` (not a raw field write) so the open-conversation id
-        // is dual-written into core — the streaming gate/render checks key off it.
-        app.load_conversation(ConversationDetail {
-            id: conv_id.into(),
-            title: "Test".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-        });
-        app.enter_editing_mode();
-        app.textarea.insert_str(prompt);
-        app
-    }
-
-    #[test]
-    fn submit_while_disconnected_preserves_composer_and_appends_nothing() {
-        // Acceptance (TUI-2): disconnected submit → composer text preserved,
-        // status message set, nothing appended to the transcript.
-        let mut app = app_ready_to_send("c1", "important prompt");
-        app.status_message.clear();
-
-        let result = app.prepare_submission(false);
-
-        assert!(result.is_none(), "nothing must be sent while disconnected");
-        assert_eq!(
-            app.textarea_content(),
-            "important prompt",
-            "composer text must be preserved"
-        );
-        assert!(
-            app.current_conversation().unwrap().messages.is_empty(),
-            "transcript must not gain a user message"
-        );
-        assert!(
-            !app.status_message.is_empty(),
-            "the refusal must be surfaced in the status line"
-        );
-    }
-
-    #[test]
-    fn submit_while_streaming_is_blocked_and_composer_preserved() {
-        // Acceptance (TUI-7, chosen policy = block concurrent sends): a second
-        // send while a reply streams is refused with a status message and the
-        // composer keeps its text.
-        let mut app = app_ready_to_send("c1", "second question");
-        // Drive a genuine in-flight stream through the core: ack arms the slot,
-        // the first chunk claims the real request id.
-        app.apply_prompt_ack("task".into(), "c1".into());
-        app.apply_core(UiMessage::StreamChunk {
-            request_id: "req-in-flight".into(),
-            chunk: "partial".into(),
-        });
-        app.status_message.clear();
-
-        let result = app.prepare_submission(true);
-
-        assert!(result.is_none(), "second send must be blocked mid-stream");
-        assert_eq!(app.textarea_content(), "second question");
-        assert!(app.current_conversation().unwrap().messages.is_empty());
-        assert!(!app.status_message.is_empty());
-    }
-
-    #[test]
-    fn submit_while_awaiting_ack_sentinel_is_also_blocked() {
-        // Unhappy path: the window between send and the first chunk uses the
-        // pending sentinel; a send in that window must be blocked too.
-        let mut app = app_ready_to_send("c1", "rapid second send");
-        // Ack received but no chunk yet: the slot holds the pending sentinel.
-        app.apply_prompt_ack("task".into(), "c1".into());
-
-        assert!(app.prepare_submission(true).is_none());
-        assert_eq!(app.textarea_content(), "rapid second send");
-    }
-
-    #[test]
-    fn submit_when_connected_and_idle_goes_through() {
-        let mut app = app_ready_to_send("c1", "hello");
-        let result = app.prepare_submission(true);
-        assert_eq!(result, Some(("c1".to_string(), "hello".to_string())));
-        assert_eq!(app.textarea_content(), "");
-        assert_eq!(app.current_conversation().unwrap().messages.len(), 1);
-    }
-
-    #[test]
-    fn restore_failed_submission_pops_message_and_refills_composer() {
-        // Acceptance (TUI-2): a failed send RPC rolls back the optimistic
-        // transcript append and puts the prompt back in the composer.
-        let mut app = app_ready_to_send("c1", "doomed prompt");
-        let (conv_id, prompt) = app.prepare_submission(true).unwrap();
-
-        app.restore_failed_submission(&conv_id, &prompt);
-
-        assert!(
-            app.current_conversation().unwrap().messages.is_empty(),
-            "optimistic user message must be rolled back"
-        );
-        assert_eq!(app.textarea_content(), "doomed prompt");
-    }
-
-    #[test]
-    fn restore_failed_submission_after_switching_conversations_keeps_other_transcript() {
-        // Unhappy path: the user switched conversations between submit and the
-        // send failure. The other conversation's tail message must NOT be
-        // popped; the composer still gets the text back.
-        let mut app = app_ready_to_send("c1", "prompt for c1");
-        let (conv_id, prompt) = app.prepare_submission(true).unwrap();
-
-        // Switch to a different conversation that already has a user message.
-        app.load_conversation(ConversationDetail {
-            id: "c2".into(),
-            title: "Other".into(),
-            messages: vec![ChatMessage {
-                id: String::new(),
-                role: "user".into(),
-                content: "prompt for c1".into(), // same text, different conv
-            }],
-            model_selection: None,
-            conversation_personality: None,
-        });
-
-        app.restore_failed_submission(&conv_id, &prompt);
-
-        assert_eq!(
-            app.current_conversation().unwrap().messages.len(),
-            1,
-            "the other conversation's transcript must be untouched"
-        );
-        assert_eq!(app.textarea_content(), "prompt for c1");
-    }
-
-    #[test]
-    fn restore_failed_submission_does_not_pop_a_non_matching_tail() {
-        // Unhappy path: something else (e.g. an inline note) landed after the
-        // optimistic append; only an exact matching tail is rolled back.
-        let mut app = app_ready_to_send("c1", "prompt");
-        let (conv_id, prompt) = app.prepare_submission(true).unwrap();
-        // A non-matching message lands after the optimistic user append — exactly
-        // how an Adele-disabled `say_this` aside reaches the transcript.
-        app.push_speech_disabled_note("c1", "aside");
-
-        app.restore_failed_submission(&conv_id, &prompt);
-
-        let msgs = &app.current_conversation().unwrap().messages;
-        assert_eq!(msgs.len(), 2, "non-matching tail must not be popped");
-        assert_eq!(app.textarea_content(), "prompt");
+    /// The prompt carried by the `SendPrompt` effect when a submission was
+    /// accepted (the send path runs this effect as the RPC); `None` when the core
+    /// rejected the submit.
+    fn sent_prompt(effects: &[Effect]) -> Option<String> {
+        effects.iter().find_map(|e| match e {
+            Effect::SendPrompt { prompt, .. } => Some(prompt.clone()),
+            _ => None,
+        })
     }
 
     // --- Conversation-id threading (TUI-4) + disconnect reset (TUI-8) ---
@@ -2454,22 +2233,6 @@ mod tests {
         });
         assert_eq!(app.scroll_offset, 10);
         assert_eq!(app.streaming_buffer(), "data", "chunk still buffered");
-    }
-
-    #[test]
-    fn submit_prompt_resets_scroll() {
-        let mut app = App::new();
-        app.load_conversation(ConversationDetail {
-            id: "c1".into(),
-            title: "Test".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-        });
-        app.scroll_up(10);
-        app.textarea.insert_str("hello");
-        app.submit_prompt();
-        assert_eq!(app.scroll_offset, 0);
     }
 
     // --- Tasks pane integration ---
