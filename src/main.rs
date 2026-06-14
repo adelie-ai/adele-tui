@@ -36,7 +36,7 @@ use tokio::{
 // `personality_selector` + `voice_client` from `lib.rs`). Only the orchestration
 // wiring them together (the `run` event loop, its RPC/signal helpers, the voice
 // plumbing types) lives in this file.
-use adele::app::{AdeleOutput, App, InputMode};
+use adele::app::{AdeleOutput, App, InputMode, ScreenRequest};
 use adele::in_flight::InFlight;
 use adele::keys::{Action, handle_key_event};
 use adele::picker::PickerOutcome;
@@ -453,27 +453,149 @@ async fn run(
             ReconnectState::Connected => None,
         };
 
-        // Sub-screens (TUI-12): each modal screen now runs over the shared
-        // `screen::run_screen` driver, which drains the daemon signal stream via
-        // `handle_signal` while the screen is open so a turn parked on the TUI's
-        // `say_this` client tool is answered immediately instead of stalling
-        // until the screen closes. A `Disconnected` that arrives mid-screen is
-        // recorded by the drain callback and actioned right after the screen
-        // returns (the teardown touches loop-local state the callback can't own).
-        if app.kb_requested {
-            app.kb_requested = false;
+        // Sub-screens: each modal runs over the shared `screen::run_screen`
+        // driver, which drains the daemon signal stream while the screen is open
+        // (TUI-12) so a turn parked on the TUI's `say_this` client tool is
+        // answered immediately instead of stalling until the screen closes.
+        //
+        // A single dispatch point (CC-3): the user's request is mutually exclusive
+        // (`ScreenRequest`), so the loop opens at most one modal per turn. Every
+        // screen shares the same disconnect handling — a `Disconnected` drained
+        // mid-screen is recorded into `disconnect` and actioned once the screen
+        // returns, since the teardown touches loop-local state the sink can't own
+        // — so that skeleton is hoisted around the per-screen `match`.
+        if let Some(screen) = app.take_pending_screen() {
             let mut disconnect: Option<String> = None;
-            if let Some(conn) = connector.clone() {
-                let mut sink = SubScreenSink {
-                    app: &mut app,
-                    connector: &connector,
-                    voice_daemon: &voice_daemon,
-                    voice_session: &voice_session,
-                    narration_tx: &narration_tx,
-                    disconnect: &mut disconnect,
-                };
-                if let Err(e) = kb::run(terminal, conn.client(), &mut signal_rx, &mut sink).await {
-                    sink.app.status_message = format!("KB error: {e}");
+            match screen {
+                ScreenRequest::KnowledgeBase => {
+                    if let Some(conn) = connector.clone() {
+                        let mut sink = SubScreenSink {
+                            app: &mut app,
+                            connector: &connector,
+                            voice_daemon: &voice_daemon,
+                            voice_session: &voice_session,
+                            narration_tx: &narration_tx,
+                            disconnect: &mut disconnect,
+                        };
+                        if let Err(e) =
+                            kb::run(terminal, conn.client(), &mut signal_rx, &mut sink).await
+                        {
+                            sink.app.status_message = format!("KB error: {e}");
+                        }
+                    }
+                }
+                ScreenRequest::Connections => {
+                    if let Some(conn) = connector.clone() {
+                        let mut sink = SubScreenSink {
+                            app: &mut app,
+                            connector: &connector,
+                            voice_daemon: &voice_daemon,
+                            voice_session: &voice_session,
+                            narration_tx: &narration_tx,
+                            disconnect: &mut disconnect,
+                        };
+                        if let Err(e) =
+                            connections::run(terminal, conn.client(), &mut signal_rx, &mut sink)
+                                .await
+                        {
+                            sink.app.status_message = format!("Connections error: {e}");
+                        }
+                    }
+                }
+                ScreenRequest::Purposes => {
+                    if let Some(conn) = connector.clone() {
+                        let mut sink = SubScreenSink {
+                            app: &mut app,
+                            connector: &connector,
+                            voice_daemon: &voice_daemon,
+                            voice_session: &voice_session,
+                            narration_tx: &narration_tx,
+                            disconnect: &mut disconnect,
+                        };
+                        if let Err(e) =
+                            purposes::run(terminal, conn.client(), &mut signal_rx, &mut sink).await
+                        {
+                            sink.app.status_message = format!("Purposes error: {e}");
+                        }
+                    }
+                }
+                ScreenRequest::ModelPicker => {
+                    let mut picked_outcome = None;
+                    if let Some(conn) = connector.clone() {
+                        let current = app
+                            .current_conversation()
+                            .and_then(|c| c.model_selection.clone());
+                        let mut sink = SubScreenSink {
+                            app: &mut app,
+                            connector: &connector,
+                            voice_daemon: &voice_daemon,
+                            voice_session: &voice_session,
+                            narration_tx: &narration_tx,
+                            disconnect: &mut disconnect,
+                        };
+                        match model_selector::run(
+                            terminal,
+                            conn.client(),
+                            current,
+                            &mut signal_rx,
+                            &mut sink,
+                        )
+                        .await
+                        {
+                            Ok(outcome) => picked_outcome = Some(outcome),
+                            Err(e) => sink.app.status_message = format!("Model picker error: {e}"),
+                        }
+                    }
+                    // Apply the selection AFTER the sink's borrow of `app` ends.
+                    if let Some(model_selector::Outcome::Selected(picked)) = picked_outcome {
+                        let label = format!("{} · {}", picked.connection_id, picked.model_id);
+                        app.apply_model_override(picked);
+                        app.status_message = format!("Model: {label} (applies to next message)");
+                    }
+                }
+                ScreenRequest::PersonalityPicker => {
+                    let mut saved_outcome = None;
+                    // Only reachable with a loaded conversation (handle_action gates
+                    // on `current_conversation`), but re-check so the borrow stays
+                    // clean.
+                    let conv_info = app
+                        .current_conversation()
+                        .map(|conv| (conv.id.clone(), conv.conversation_personality));
+                    if let (Some(conn), Some((conv_id, current))) = (connector.clone(), conv_info) {
+                        let mut sink = SubScreenSink {
+                            app: &mut app,
+                            connector: &connector,
+                            voice_daemon: &voice_daemon,
+                            voice_session: &voice_session,
+                            narration_tx: &narration_tx,
+                            disconnect: &mut disconnect,
+                        };
+                        match personality_selector::run(
+                            terminal,
+                            conn.client(),
+                            conv_id,
+                            current,
+                            &mut signal_rx,
+                            &mut sink,
+                        )
+                        .await
+                        {
+                            Ok(outcome) => saved_outcome = Some(outcome),
+                            Err(e) => {
+                                sink.app.status_message = format!("Personality picker error: {e}")
+                            }
+                        }
+                    }
+                    // Apply the result AFTER the sink's borrow of `app` ends.
+                    if let Some(personality_selector::Outcome::Saved(stored)) = saved_outcome {
+                        let cleared = stored == Default::default();
+                        app.set_open_conversation_personality(stored);
+                        app.status_message = if cleared {
+                            "Personality cleared (using global)".into()
+                        } else {
+                            "Personality saved for this conversation".into()
+                        };
+                    }
                 }
             }
             apply_sub_screen_disconnect(
@@ -485,159 +607,6 @@ async fn run(
             );
             // Force a redraw on the next iteration so the chat reappears
             // immediately instead of waiting for the next event.
-            continue;
-        }
-
-        if app.connections_requested {
-            app.connections_requested = false;
-            let mut disconnect: Option<String> = None;
-            if let Some(conn) = connector.clone() {
-                let mut sink = SubScreenSink {
-                    app: &mut app,
-                    connector: &connector,
-                    voice_daemon: &voice_daemon,
-                    voice_session: &voice_session,
-                    narration_tx: &narration_tx,
-                    disconnect: &mut disconnect,
-                };
-                if let Err(e) =
-                    connections::run(terminal, conn.client(), &mut signal_rx, &mut sink).await
-                {
-                    sink.app.status_message = format!("Connections error: {e}");
-                }
-            }
-            apply_sub_screen_disconnect(
-                &mut app,
-                &mut connector,
-                &mut signal_rx,
-                &mut reconnect,
-                disconnect,
-            );
-            continue;
-        }
-
-        if app.purposes_requested {
-            app.purposes_requested = false;
-            let mut disconnect: Option<String> = None;
-            if let Some(conn) = connector.clone() {
-                let mut sink = SubScreenSink {
-                    app: &mut app,
-                    connector: &connector,
-                    voice_daemon: &voice_daemon,
-                    voice_session: &voice_session,
-                    narration_tx: &narration_tx,
-                    disconnect: &mut disconnect,
-                };
-                if let Err(e) =
-                    purposes::run(terminal, conn.client(), &mut signal_rx, &mut sink).await
-                {
-                    sink.app.status_message = format!("Purposes error: {e}");
-                }
-            }
-            apply_sub_screen_disconnect(
-                &mut app,
-                &mut connector,
-                &mut signal_rx,
-                &mut reconnect,
-                disconnect,
-            );
-            continue;
-        }
-
-        if app.model_picker_requested {
-            app.model_picker_requested = false;
-            let mut disconnect: Option<String> = None;
-            let mut picked_outcome = None;
-            if let Some(conn) = connector.clone() {
-                let current = app
-                    .current_conversation()
-                    .and_then(|c| c.model_selection.clone());
-                let mut sink = SubScreenSink {
-                    app: &mut app,
-                    connector: &connector,
-                    voice_daemon: &voice_daemon,
-                    voice_session: &voice_session,
-                    narration_tx: &narration_tx,
-                    disconnect: &mut disconnect,
-                };
-                match model_selector::run(
-                    terminal,
-                    conn.client(),
-                    current,
-                    &mut signal_rx,
-                    &mut sink,
-                )
-                .await
-                {
-                    Ok(outcome) => picked_outcome = Some(outcome),
-                    Err(e) => sink.app.status_message = format!("Model picker error: {e}"),
-                }
-            }
-            // Apply the selection AFTER the sink's borrow of `app` ends.
-            if let Some(model_selector::Outcome::Selected(picked)) = picked_outcome {
-                let label = format!("{} · {}", picked.connection_id, picked.model_id);
-                app.apply_model_override(picked);
-                app.status_message = format!("Model: {label} (applies to next message)");
-            }
-            apply_sub_screen_disconnect(
-                &mut app,
-                &mut connector,
-                &mut signal_rx,
-                &mut reconnect,
-                disconnect,
-            );
-            continue;
-        }
-
-        if app.personality_picker_requested {
-            app.personality_picker_requested = false;
-            let mut disconnect: Option<String> = None;
-            let mut saved_outcome = None;
-            // Only reachable with a loaded conversation (handle_action gates on
-            // `current_conversation`), but re-check so the borrow stays clean.
-            let conv_info = app
-                .current_conversation()
-                .map(|conv| (conv.id.clone(), conv.conversation_personality));
-            if let (Some(conn), Some((conv_id, current))) = (connector.clone(), conv_info) {
-                let mut sink = SubScreenSink {
-                    app: &mut app,
-                    connector: &connector,
-                    voice_daemon: &voice_daemon,
-                    voice_session: &voice_session,
-                    narration_tx: &narration_tx,
-                    disconnect: &mut disconnect,
-                };
-                match personality_selector::run(
-                    terminal,
-                    conn.client(),
-                    conv_id,
-                    current,
-                    &mut signal_rx,
-                    &mut sink,
-                )
-                .await
-                {
-                    Ok(outcome) => saved_outcome = Some(outcome),
-                    Err(e) => sink.app.status_message = format!("Personality picker error: {e}"),
-                }
-            }
-            // Apply the result AFTER the sink's borrow of `app` ends.
-            if let Some(personality_selector::Outcome::Saved(stored)) = saved_outcome {
-                let cleared = stored == Default::default();
-                app.set_open_conversation_personality(stored);
-                app.status_message = if cleared {
-                    "Personality cleared (using global)".into()
-                } else {
-                    "Personality saved for this conversation".into()
-                };
-            }
-            apply_sub_screen_disconnect(
-                &mut app,
-                &mut connector,
-                &mut signal_rx,
-                &mut reconnect,
-                disconnect,
-            );
             continue;
         }
 
@@ -1606,28 +1575,28 @@ async fn handle_action(
         }
         Action::OpenKnowledgeBase => {
             if client.is_some() {
-                app.kb_requested = true;
+                app.request_screen(ScreenRequest::KnowledgeBase);
             } else {
                 app.status_message = "Not connected — knowledge base unavailable".into();
             }
         }
         Action::OpenConnections => {
             if client.is_some() {
-                app.connections_requested = true;
+                app.request_screen(ScreenRequest::Connections);
             } else {
                 app.status_message = "Not connected — connections manager unavailable".into();
             }
         }
         Action::OpenPurposes => {
             if client.is_some() {
-                app.purposes_requested = true;
+                app.request_screen(ScreenRequest::Purposes);
             } else {
                 app.status_message = "Not connected — purposes manager unavailable".into();
             }
         }
         Action::OpenModelPicker => {
             if client.is_some() {
-                app.model_picker_requested = true;
+                app.request_screen(ScreenRequest::ModelPicker);
             } else {
                 app.status_message = "Not connected — model picker unavailable".into();
             }
@@ -1639,7 +1608,7 @@ async fn handle_action(
                 app.status_message =
                     "Open a conversation first (Enter) — personality is per-conversation".into();
             } else {
-                app.personality_picker_requested = true;
+                app.request_screen(ScreenRequest::PersonalityPicker);
             }
         }
         Action::ToggleTasksPane => {

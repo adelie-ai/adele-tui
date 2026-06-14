@@ -108,6 +108,19 @@ pub enum InputMode {
     Renaming,
 }
 
+/// A modal sub-screen the user has asked the run loop to open. Each maps to one
+/// `*::run` driver invocation in the loop's single dispatch point. Replaces the
+/// old independent `*_requested` bools so the request is mutually exclusive by
+/// construction (CC-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenRequest {
+    KnowledgeBase,
+    Connections,
+    Purposes,
+    ModelPicker,
+    PersonalityPicker,
+}
+
 /// The `Adele:` voice-output level for a conversation. Decides reply narration
 /// (with `You`), the `say_this` aside gate, and the send-time
 /// `system_refinement`. Defaults to `Disabled`.
@@ -175,19 +188,12 @@ pub struct App {
     /// drains it on the next iteration (once the modal has closed and the
     /// sidebar is visible again) by pushing a conversation-list refetch.
     pub pending_conversation_refresh: bool,
-    /// Set when the user asks to open the knowledge base. The chat loop
-    /// hands the screen to `kb::run` and resets this flag when KB exits.
-    pub kb_requested: bool,
-    /// Set when the user asks to open the LLM-provider connections manager.
-    /// Mirrors `kb_requested`'s screen-handoff pattern.
-    pub connections_requested: bool,
-    /// Set when the user asks to open the purposes manager.
-    pub purposes_requested: bool,
-    /// Set when the user asks to open the per-conversation model picker.
-    pub model_picker_requested: bool,
-    /// Set when the user asks to open the per-conversation personality picker.
-    /// Mirrors `model_picker_requested`'s screen-handoff pattern.
-    pub personality_picker_requested: bool,
+    /// The modal sub-screen the user has asked to open, serviced (and cleared)
+    /// by the run loop on its next iteration. Replaces the old set of independent
+    /// `*_requested` bools (CC-3): only ONE screen can be pending at a time, so a
+    /// fresh request can't silently race a not-yet-serviced one, and the run loop
+    /// dispatches them from a single point instead of five near-identical guards.
+    pub pending_screen: Option<ScreenRequest>,
     /// One-shot override staged by the model picker. Applied to the next
     /// `SendPrompt` and then cleared — the daemon persists it as the
     /// conversation's `last_model_selection`, so subsequent prompts pick
@@ -239,11 +245,7 @@ impl App {
             show_sidebar: true,
             switch_requested: false,
             pending_conversation_refresh: false,
-            kb_requested: false,
-            connections_requested: false,
-            purposes_requested: false,
-            model_picker_requested: false,
-            personality_picker_requested: false,
+            pending_screen: None,
             pending_model_override: None,
             tasks: TaskPane::new(),
             pending_task_cancel: None,
@@ -255,6 +257,19 @@ impl App {
     /// event loop), so the action only ever opens it.
     pub fn toggle_help(&mut self) {
         self.show_help = !self.show_help;
+    }
+
+    /// Ask the run loop to open `screen` as a modal on its next iteration.
+    /// Mutually exclusive: a newer request supersedes any not-yet-serviced one
+    /// (the loop services at most one modal per turn, then redraws).
+    pub fn request_screen(&mut self, screen: ScreenRequest) {
+        self.pending_screen = Some(screen);
+    }
+
+    /// Take (and clear) the pending modal-screen request, if any. The run loop
+    /// calls this once per iteration to drive its single modal-dispatch point.
+    pub fn take_pending_screen(&mut self) -> Option<ScreenRequest> {
+        self.pending_screen.take()
     }
 
     // --- Per-conversation You/Adele voice controls (adele-tui#77) ---
@@ -2316,6 +2331,35 @@ mod tests {
     #[test]
     fn switch_requested_default_false() {
         assert!(!App::new().switch_requested);
+    }
+
+    #[test]
+    fn pending_screen_request_round_trips_and_is_taken_once() {
+        let mut app = App::new();
+        assert_eq!(app.take_pending_screen(), None, "none pending by default");
+
+        app.request_screen(ScreenRequest::KnowledgeBase);
+        assert_eq!(
+            app.take_pending_screen(),
+            Some(ScreenRequest::KnowledgeBase)
+        );
+        assert_eq!(
+            app.take_pending_screen(),
+            None,
+            "taking clears it so the loop services it exactly once"
+        );
+    }
+
+    #[test]
+    fn requesting_a_screen_supersedes_an_unserviced_one() {
+        // The invariant the `ScreenRequest` enum buys over the old set of
+        // independent `*_requested` bools: only ONE screen can be pending, so a
+        // second request can't leave two queued to open in arbitrary order.
+        let mut app = App::new();
+        app.request_screen(ScreenRequest::Connections);
+        app.request_screen(ScreenRequest::Purposes);
+        assert_eq!(app.take_pending_screen(), Some(ScreenRequest::Purposes));
+        assert_eq!(app.take_pending_screen(), None);
     }
 
     #[test]
