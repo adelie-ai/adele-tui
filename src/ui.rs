@@ -366,7 +366,7 @@ fn push_assistant_markdown(lines: &mut Vec<Line<'static>>, content: &str, style:
 fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let mut lines: Vec<Line> = Vec::new();
 
-    if let Some(conv) = &app.current_conversation {
+    if let Some(conv) = app.current_conversation() {
         for msg in &conv.messages {
             // Roles fall into a few buckets: user/assistant render normally
             // (assistant via markdown); tool/system/empty-assistant render
@@ -426,13 +426,11 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     }
 
     let chat_title = app
-        .current_conversation
-        .as_ref()
+        .current_conversation()
         .map(|conv| conv.title.as_str())
         .unwrap_or("Chat");
     let model_suffix = app
-        .current_conversation
-        .as_ref()
+        .current_conversation()
         .and_then(|conv| conv.model_selection.as_ref())
         .map(|sel| format!("  ·  {} · {}", sel.connection_id, sel.model_id))
         .unwrap_or_default();
@@ -674,7 +672,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "1".into(),
             title: "Test".into(),
             messages: vec![
@@ -714,7 +712,7 @@ mod tests {
         // the chat title only when the open conversation's level is not Disabled,
         // and reflects the current level label.
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "c1".into(),
             title: "ChatProbe".into(),
             messages: vec![],
@@ -747,7 +745,7 @@ mod tests {
         // the chat title only while the open conversation's You is Enabled, and
         // is distinct from the Adele cue.
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "c1".into(),
             title: "ChatProbe".into(),
             messages: vec![],
@@ -1006,7 +1004,7 @@ mod tests {
     fn app_with_debug_messages(show_debug: bool) -> App {
         let mut app = App::new();
         app.show_debug = show_debug;
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "1".into(),
             title: "Test".into(),
             messages: vec![
@@ -1077,7 +1075,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "1".into(),
             title: "Test".into(),
             messages: vec![],
@@ -1138,7 +1136,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "1".into(),
             title: "Test".into(),
             messages: vec![ChatMessage {

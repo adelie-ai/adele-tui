@@ -550,8 +550,7 @@ async fn run(
             let mut picked_outcome = None;
             if let Some(conn) = connector.clone() {
                 let current = app
-                    .current_conversation
-                    .as_ref()
+                    .current_conversation()
                     .and_then(|c| c.model_selection.clone());
                 let mut sink = SubScreenSink {
                     app: &mut app,
@@ -597,8 +596,7 @@ async fn run(
             // Only reachable with a loaded conversation (handle_action gates on
             // `current_conversation`), but re-check so the borrow stays clean.
             let conv_info = app
-                .current_conversation
-                .as_ref()
+                .current_conversation()
                 .map(|conv| (conv.id.clone(), conv.conversation_personality));
             if let (Some(conn), Some((conv_id, current))) = (connector.clone(), conv_info) {
                 let mut sink = SubScreenSink {
@@ -625,10 +623,9 @@ async fn run(
             }
             // Apply the result AFTER the sink's borrow of `app` ends.
             if let Some(personality_selector::Outcome::Saved(stored)) = saved_outcome {
-                if let Some(c) = app.current_conversation.as_mut() {
-                    c.conversation_personality = Some(stored);
-                }
-                app.status_message = if stored == Default::default() {
+                let cleared = stored == Default::default();
+                app.set_open_conversation_personality(stored);
+                app.status_message = if cleared {
                     "Personality cleared (using global)".into()
                 } else {
                     "Personality saved for this conversation".into()
@@ -675,8 +672,7 @@ async fn run(
                             // when the daemon is absent.
                             if voice_daemon.is_available().await {
                                 let conv = app
-                                    .current_conversation
-                                    .as_ref()
+                                    .current_conversation()
                                     .map(|c| c.id.clone());
                                 // Barge-in: stop any in-progress narration before
                                 // we start listening, so the mic doesn't capture
@@ -782,9 +778,7 @@ async fn run(
                         // exists daemon-side) and reselect it by ID — the
                         // sidebar selection is positional and the refreshed
                         // list may have reordered.
-                        if let Some(open_id) =
-                            app.current_conversation.as_ref().map(|c| c.id.clone())
-                        {
+                        if let Some(open_id) = app.current_conversation().map(|c| c.id.clone()) {
                             app.select_conversation_by_id(&open_id);
                             match conn.client().get_conversation(&open_id).await {
                                 Ok(detail) => app.load_conversation(detail),
@@ -1440,7 +1434,7 @@ async fn handle_action(
             }
         }
         Action::EnterEditMode => {
-            if app.current_conversation.is_some() {
+            if app.current_conversation().is_some() {
                 app.enter_editing_mode();
             } else {
                 app.status_message = "Open a conversation first (Enter) or create one (n)".into();
@@ -1641,7 +1635,7 @@ async fn handle_action(
         Action::OpenPersonalityPicker => {
             if client.is_none() {
                 app.status_message = "Not connected — personality picker unavailable".into();
-            } else if app.current_conversation.is_none() {
+            } else if app.current_conversation().is_none() {
                 app.status_message =
                     "Open a conversation first (Enter) — personality is per-conversation".into();
             } else {
@@ -2077,8 +2071,7 @@ async fn init_background_tasks(
 /// open and empty otherwise. The command is set-replace, so an empty list tells
 /// the daemon to stop fanning any conversation's turn events to this connection.
 fn open_conversation_ids(app: &App) -> Vec<String> {
-    app.current_conversation
-        .as_ref()
+    app.current_conversation()
         .map(|c| vec![c.id.clone()])
         .unwrap_or_default()
 }
@@ -2337,7 +2330,7 @@ mod tests {
     #[test]
     fn open_conversation_ids_is_empty_with_nothing_open() {
         let app = App::new();
-        assert!(app.current_conversation.is_none());
+        assert!(app.current_conversation().is_none());
         // Set-replace semantics: an empty set tells the daemon to stop fanning
         // any conversation's turn events here (e.g. the initial connect, before
         // anything is opened).

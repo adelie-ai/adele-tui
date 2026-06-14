@@ -121,14 +121,14 @@ pub use adele_voice_client_common::AdeleOutput;
 
 pub struct App {
     pub selected_conversation: Option<usize>,
-    pub current_conversation: Option<ConversationDetail>,
     pub textarea: TextArea<'static>,
-    // The in-flight streaming state (buffer, pending request/conversation id,
-    // external-turn flag, ack sentinel, narration gate) now lives in the shared
-    // `core` (CC-3): the reducer owns the state machine and the view reads it
-    // back through `streaming_buffer()` / `streaming_is_active_for_view()` /
-    // `is_streaming()`. `App` keeps only the rendered transcript
-    // (`current_conversation`) and mirrors core's streaming *effects* onto it.
+    // The conversation list, the open conversation's transcript, and the
+    // in-flight streaming state (buffer, pending request/conversation id,
+    // external-turn flag, ack sentinel, narration gate) all now live in the
+    // shared `core` (CC-3): the reducer owns those state machines and the view
+    // reads them back through `conversations()` / `current_conversation()` /
+    // `streaming_buffer()` / `streaming_is_active_for_view()` / `is_streaming()`.
+    // `App` keeps only TUI view state (selection, scroll, mode, status lines).
     pub mode: InputMode,
     pub status_message: String,
     /// Whether the daemon connection is currently live. The run loop projects
@@ -223,7 +223,6 @@ impl App {
     pub fn new() -> Self {
         Self {
             selected_conversation: None,
-            current_conversation: None,
             textarea: new_textarea(),
             mode: InputMode::Normal,
             status_message: "Connected".to_string(),
@@ -277,7 +276,8 @@ impl App {
     /// Whether `You:` is Enabled for the currently-open conversation. `false`
     /// when no conversation is open.
     pub fn current_voice_in(&self) -> bool {
-        self.current_conversation
+        self.core
+            .current_conversation
             .as_ref()
             .is_some_and(|c| self.voice_in_for(&c.id))
     }
@@ -285,7 +285,7 @@ impl App {
     /// Flip `You:` for the currently-open conversation and return the new state
     /// (used by the `Ctrl+V` keybind). `None` when no conversation is open.
     pub fn toggle_current_voice_in(&mut self) -> Option<bool> {
-        let conv_id = self.current_conversation.as_ref()?.id.clone();
+        let conv_id = self.core.current_conversation.as_ref()?.id.clone();
         let next = !self.core.voice_in_for(&conv_id);
         self.set_voice_in(&conv_id, next);
         Some(next)
@@ -310,7 +310,8 @@ impl App {
     /// The `Adele:` level for the currently-open conversation. `Disabled` when
     /// no conversation is open.
     pub fn current_adele_output(&self) -> AdeleOutput {
-        self.current_conversation
+        self.core
+            .current_conversation
             .as_ref()
             .map(|c| self.adele_output_for(&c.id))
             .unwrap_or_default()
@@ -331,7 +332,7 @@ impl App {
     /// (`Disabled → OnDemand → Always → Disabled`) and return the new level
     /// (used by the `Ctrl+S` keybind). `None` when no conversation is open.
     pub fn cycle_current_adele_output(&mut self) -> Option<AdeleOutput> {
-        let conv_id = self.current_conversation.as_ref()?.id.clone();
+        let conv_id = self.core.current_conversation.as_ref()?.id.clone();
         let next = self.core.adele_output_for(&conv_id).next();
         self.set_adele_output(&conv_id, next);
         Some(next)
@@ -359,7 +360,7 @@ impl App {
     /// a stale/other conversation never bleeds into the visible chat. Returns
     /// whether the note was shown.
     pub fn push_speech_disabled_note(&mut self, conversation_id: &str, text: &str) -> bool {
-        let Some(conv) = self.current_conversation.as_mut() else {
+        let Some(conv) = self.core.current_conversation.as_mut() else {
             return false;
         };
         if conv.id != conversation_id {
@@ -427,7 +428,7 @@ impl App {
         &mut self,
         override_selection: desktop_assistant_api_model::SendPromptOverride,
     ) {
-        if let Some(conv) = self.current_conversation.as_mut() {
+        if let Some(conv) = self.core.current_conversation.as_mut() {
             conv.model_selection = Some(
                 desktop_assistant_api_model::ConversationModelSelectionView {
                     connection_id: override_selection.connection_id.clone(),
@@ -551,6 +552,7 @@ impl App {
     /// retyping. The caller sets the status message with the send error.
     pub fn restore_failed_submission(&mut self, conversation_id: &str, prompt: &str) {
         if let Some(conv) = self
+            .core
             .current_conversation
             .as_mut()
             .filter(|c| c.id == conversation_id)
@@ -571,7 +573,7 @@ impl App {
         if content.is_empty() {
             return None;
         }
-        let conv = self.current_conversation.as_mut()?;
+        let conv = self.core.current_conversation.as_mut()?;
         conv.messages.push(ChatMessage {
             // Optimistic local echo of our own send; the daemon assigns the real
             // message id (#1) when it persists the turn. Dedupe of the echoed-back
@@ -702,8 +704,11 @@ impl App {
     ///
     /// View-effects are applied here because the TUI redraws from state every
     /// frame: a streamed chunk is already on screen once it lands in
-    /// `core.streaming_buffer()`, so [`Effect::ReceiveChunk`] is a no-op; only
-    /// the transcript-finalizing and status effects need a write.
+    /// `core.streaming_buffer()`, so [`Effect::ReceiveChunk`] is a no-op — and
+    /// since the reducer now owns the open transcript and the conversation list
+    /// (CC-3 slice 4), the transcript-finalizing and `ClearChat` effects are
+    /// no-ops too. Only the TUI-only view state (status lines, context-usage
+    /// readout, positional selection) still needs a write here.
     pub fn apply_core(&mut self, msg: UiMessage) -> Vec<Effect> {
         let effects = self.core.apply(msg);
         effects
@@ -720,18 +725,13 @@ impl App {
             // so the chunk is already visible — nothing to do. (Scroll follows
             // only at the bottom, TUI-10, which needs no write either.)
             Effect::ReceiveChunk(_) => None,
-            // Finalize the streamed reply into the open conversation. The reducer
-            // only emits this when the originating conversation is the one in view
-            // (TUI-4), so it always targets the right transcript.
-            Effect::CompleteStreaming(full) => {
-                self.append_message("assistant", full);
-                None
-            }
-            // Render the user bubble for an adopted external turn (#1 live sync).
-            Effect::AddUserMessage(content) => {
-                self.append_message("user", content);
-                None
-            }
+            // The reducer now owns the open conversation's transcript
+            // (`core.current_conversation`, CC-3 slice 4) and pushes the finalized
+            // reply / adopted external user bubble into it itself — guarded so it
+            // only ever writes when the originating conversation is the one in view
+            // (TUI-4). The view re-reads that transcript each frame, so these
+            // effects carry no view-level work.
+            Effect::CompleteStreaming(_) | Effect::AddUserMessage(_) => None,
             Effect::SetChatStatus(message) => {
                 self.set_assistant_status(message);
                 None
@@ -760,11 +760,10 @@ impl App {
             // is a no-op here — the auto-load/create that gtk's executor performs
             // is deliberately omitted (CC-3: behavior-preserving).
             Effect::EnsureActiveConversation => None,
-            // Clear the open chat (the active conversation was deleted).
-            Effect::ClearChat => {
-                self.current_conversation = None;
-                None
-            }
+            // The active conversation was deleted. The reducer already cleared
+            // `core.current_conversation` (and its id) before emitting this, so the
+            // view — which reads that field — needs no further write (CC-3 slice 4).
+            Effect::ClearChat => None,
             // The TUI has no side pane (the scratchpad + per-conversation task
             // list live in the gtk/kde clients), so these are inert here.
             Effect::SidePaneSetScratchpad(_)
@@ -774,20 +773,6 @@ impl App {
             // the open-conversation RPC effects) need handles the view doesn't
             // hold; bubble them up to `main`'s executor.
             other => Some(other),
-        }
-    }
-
-    /// Append a finalized message of `role` to the open conversation's transcript
-    /// (no-op when none is open). Mirrors the streaming effects the reducer emits;
-    /// the daemon assigns the authoritative id (#1), re-fetched on the next open,
-    /// so the local copy carries an empty id (streaming dedupe is by request_id).
-    fn append_message(&mut self, role: &str, content: String) {
-        if let Some(conv) = self.current_conversation.as_mut() {
-            conv.messages.push(ChatMessage {
-                id: String::new(),
-                role: role.to_string(),
-                content,
-            });
         }
     }
 
@@ -862,6 +847,16 @@ impl App {
         &self.core.conversations
     }
 
+    /// The open conversation's detail — transcript, title, and model selection —
+    /// owned by the shared core (CC-3 slice 4). The reducer maintains it: it
+    /// finalizes streamed replies into it, adopts external turns, and clears it
+    /// when the active conversation is deleted (`App::load_conversation` seeds it
+    /// on open). The view + controller read it back through here. `None` when no
+    /// conversation is open.
+    pub fn current_conversation(&self) -> Option<&ConversationDetail> {
+        self.core.current_conversation.as_ref()
+    }
+
     pub fn set_conversations(&mut self, conversations: Vec<ConversationSummary>) {
         // The shared core owns the list (CC-3 slice 4): store it there directly.
         // The reducer's conversation arms read `core.conversations` (e.g. to
@@ -879,14 +874,18 @@ impl App {
     }
 
     pub fn load_conversation(&mut self, detail: ConversationDetail) {
-        let switching =
-            self.current_conversation.as_ref().map(|c| c.id.as_str()) != Some(detail.id.as_str());
-        // Dual-write the open-conversation id into the shared core so its
-        // streaming originating-conversation checks (TUI-4 / GTK-2) judge against
-        // the conversation actually in view. `App` still owns the rendered
-        // transcript; only the id `core` needs for routing is mirrored (CC-3).
+        let switching = self
+            .core
+            .current_conversation
+            .as_ref()
+            .map(|c| c.id.as_str())
+            != Some(detail.id.as_str());
+        // Seed the shared core's open conversation (CC-3 slice 4): it owns both the
+        // rendered transcript (the reducer finalizes streamed replies into it) and
+        // the id its streaming originating-conversation checks (TUI-4 / GTK-2)
+        // judge against, so the stream events route to the conversation in view.
         self.core.current_conversation_id = Some(detail.id.clone());
-        self.current_conversation = Some(detail);
+        self.core.current_conversation = Some(detail);
         // Drop a stale context-fill reading when the visible conversation
         // changes; the next turn re-establishes it (#341).
         if switching {
@@ -909,10 +908,24 @@ impl App {
     /// Refresh the open conversation's cached title if it is the one named (the
     /// chat header reads it). No-op when a different conversation is open.
     fn set_open_conversation_title(&mut self, conversation_id: &str, title: &str) {
-        if let Some(current) = self.current_conversation.as_mut()
+        if let Some(current) = self.core.current_conversation.as_mut()
             && current.id == conversation_id
         {
             current.title = title.to_string();
+        }
+    }
+
+    /// Optimistically update the open conversation's per-conversation personality
+    /// after the picker saves it, so the change shows without a re-fetch. The
+    /// picker owns the screen while open, so the open conversation is still the
+    /// one it was launched for; mirrors [`Self::apply_model_override`]. No-op when
+    /// no conversation is open.
+    pub fn set_open_conversation_personality(
+        &mut self,
+        personality: desktop_assistant_api_model::ConversationPersonalityView,
+    ) {
+        if let Some(conv) = self.core.current_conversation.as_mut() {
+            conv.conversation_personality = Some(personality);
         }
     }
 
@@ -1336,7 +1349,7 @@ mod tests {
     #[test]
     fn submit_prompt_sends_unwrapped_text_after_display_wrap() {
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "c1".into(),
             title: "t".into(),
             messages: vec![],
@@ -1375,7 +1388,7 @@ mod tests {
     #[test]
     fn submit_prompt_preserves_explicit_user_newlines() {
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "c1".into(),
             title: "t".into(),
             messages: vec![],
@@ -1418,7 +1431,7 @@ mod tests {
     #[test]
     fn submit_prompt_with_empty_input_returns_none() {
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "1".into(),
             title: "Test".into(),
             messages: vec![],
@@ -1431,7 +1444,7 @@ mod tests {
     #[test]
     fn submit_prompt_appends_user_message_and_clears_input() {
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "conv1".into(),
             title: "Test".into(),
             messages: vec![],
@@ -1447,7 +1460,7 @@ mod tests {
         );
         assert_eq!(app.textarea_content(), "");
 
-        let msgs = &app.current_conversation.as_ref().unwrap().messages;
+        let msgs = &app.current_conversation().unwrap().messages;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[0].content, "What is Rust?");
@@ -1478,7 +1491,7 @@ mod tests {
         // Acceptance (TUI-3): a 3-line paste yields ONE submitted prompt with
         // the newlines intact, not three partial prompts.
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "c1".into(),
             title: "Test".into(),
             messages: vec![],
@@ -1492,7 +1505,7 @@ mod tests {
             result,
             Some(("c1".to_string(), "first\nsecond\nthird".to_string()))
         );
-        let msgs = &app.current_conversation.as_ref().unwrap().messages;
+        let msgs = &app.current_conversation().unwrap().messages;
         assert_eq!(msgs.len(), 1, "exactly one user message appended");
     }
 
@@ -1549,11 +1562,7 @@ mod tests {
             "composer text must be preserved"
         );
         assert!(
-            app.current_conversation
-                .as_ref()
-                .unwrap()
-                .messages
-                .is_empty(),
+            app.current_conversation().unwrap().messages.is_empty(),
             "transcript must not gain a user message"
         );
         assert!(
@@ -1581,13 +1590,7 @@ mod tests {
 
         assert!(result.is_none(), "second send must be blocked mid-stream");
         assert_eq!(app.textarea_content(), "second question");
-        assert!(
-            app.current_conversation
-                .as_ref()
-                .unwrap()
-                .messages
-                .is_empty()
-        );
+        assert!(app.current_conversation().unwrap().messages.is_empty());
         assert!(!app.status_message.is_empty());
     }
 
@@ -1609,7 +1612,7 @@ mod tests {
         let result = app.prepare_submission(true);
         assert_eq!(result, Some(("c1".to_string(), "hello".to_string())));
         assert_eq!(app.textarea_content(), "");
-        assert_eq!(app.current_conversation.as_ref().unwrap().messages.len(), 1);
+        assert_eq!(app.current_conversation().unwrap().messages.len(), 1);
     }
 
     #[test]
@@ -1622,11 +1625,7 @@ mod tests {
         app.restore_failed_submission(&conv_id, &prompt);
 
         assert!(
-            app.current_conversation
-                .as_ref()
-                .unwrap()
-                .messages
-                .is_empty(),
+            app.current_conversation().unwrap().messages.is_empty(),
             "optimistic user message must be rolled back"
         );
         assert_eq!(app.textarea_content(), "doomed prompt");
@@ -1656,7 +1655,7 @@ mod tests {
         app.restore_failed_submission(&conv_id, &prompt);
 
         assert_eq!(
-            app.current_conversation.as_ref().unwrap().messages.len(),
+            app.current_conversation().unwrap().messages.len(),
             1,
             "the other conversation's transcript must be untouched"
         );
@@ -1669,19 +1668,13 @@ mod tests {
         // optimistic append; only an exact matching tail is rolled back.
         let mut app = app_ready_to_send("c1", "prompt");
         let (conv_id, prompt) = app.prepare_submission(true).unwrap();
-        app.current_conversation
-            .as_mut()
-            .unwrap()
-            .messages
-            .push(ChatMessage {
-                id: String::new(),
-                role: "assistant".into(),
-                content: "(speech mode disabled) aside".into(),
-            });
+        // A non-matching message lands after the optimistic user append — exactly
+        // how an Adele-disabled `say_this` aside reaches the transcript.
+        app.push_speech_disabled_note("c1", "aside");
 
         app.restore_failed_submission(&conv_id, &prompt);
 
-        let msgs = &app.current_conversation.as_ref().unwrap().messages;
+        let msgs = &app.current_conversation().unwrap().messages;
         assert_eq!(msgs.len(), 2, "non-matching tail must not be popped");
         assert_eq!(app.textarea_content(), "prompt");
     }
@@ -1736,7 +1729,7 @@ mod tests {
 
         assert!(!app.is_streaming(), "the slot clears on completion");
         assert_eq!(app.streaming_buffer(), "", "the live partial is gone");
-        let msgs = &app.current_conversation.as_ref().unwrap().messages;
+        let msgs = &app.current_conversation().unwrap().messages;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "assistant");
         assert_eq!(msgs[0].content, "Hello world!");
@@ -1766,11 +1759,7 @@ mod tests {
             "a backgrounded completion emits no controller effect (no narration)"
         );
         assert!(
-            app.current_conversation
-                .as_ref()
-                .unwrap()
-                .messages
-                .is_empty(),
+            app.current_conversation().unwrap().messages.is_empty(),
             "the reply must not bleed into the switched-to conversation"
         );
         assert!(!app.is_streaming(), "the slot still clears");
@@ -1908,7 +1897,7 @@ mod tests {
             "rendering the bubble needs no controller effect"
         );
 
-        let msgs = &app.current_conversation.as_ref().unwrap().messages;
+        let msgs = &app.current_conversation().unwrap().messages;
         assert_eq!(msgs.len(), 1, "the external user message must be rendered");
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[0].content, "what's the weather?");
@@ -2004,7 +1993,7 @@ mod tests {
         // The send was accepted but no token has arrived yet — show an immediate
         // "thinking" cue so there's no dead air after pressing Enter.
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "c1".into(),
             title: "Test".into(),
             messages: vec![],
@@ -2119,7 +2108,7 @@ mod tests {
         assert_eq!(app.conversations().len(), 2);
         assert_eq!(app.conversations()[0].title, "First (renamed elsewhere)");
         // ...but the open conversation + its transcript are byte-for-byte intact.
-        let open = app.current_conversation.as_ref().expect("still open");
+        let open = app.current_conversation().expect("still open");
         assert_eq!(open.id, "2");
         assert_eq!(open.messages.len(), 2);
         assert_eq!(open.messages[1].content, "hi there");
@@ -2152,7 +2141,7 @@ mod tests {
         assert_eq!(deleted, Some("2".to_string()));
         assert_eq!(app.conversations().len(), 2);
         assert!(
-            app.current_conversation.is_none(),
+            app.current_conversation().is_none(),
             "deleting the active conversation clears the open chat"
         );
         assert_eq!(app.selected_conversation, Some(1)); // stays at 1 (now "Third")
@@ -2196,10 +2185,7 @@ mod tests {
         let row = app.conversations().iter().find(|c| c.id == "2").unwrap();
         assert_eq!(row.title, "Renamed Second");
         // ...and the open chat's cached title (the header reads it) is refreshed.
-        assert_eq!(
-            app.current_conversation.as_ref().unwrap().title,
-            "Renamed Second"
-        );
+        assert_eq!(app.current_conversation().unwrap().title, "Renamed Second");
     }
 
     #[test]
@@ -2315,7 +2301,7 @@ mod tests {
     #[test]
     fn apply_rename_updates_sidebar_and_current() {
         let mut app = app_with_conversations();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "2".into(),
             title: "Second".into(),
             messages: vec![],
@@ -2324,7 +2310,7 @@ mod tests {
         });
         app.apply_rename("2", "Renamed");
         assert_eq!(app.conversations()[1].title, "Renamed");
-        assert_eq!(app.current_conversation.as_ref().unwrap().title, "Renamed");
+        assert_eq!(app.current_conversation().unwrap().title, "Renamed");
     }
 
     #[test]
@@ -2335,7 +2321,7 @@ mod tests {
     #[test]
     fn apply_model_override_updates_current_conversation_and_stages_pending() {
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "c1".into(),
             title: "Chat".into(),
             messages: vec![],
@@ -2350,8 +2336,7 @@ mod tests {
         app.apply_model_override(ovr.clone());
         assert!(app.pending_model_override.is_some());
         let sel = app
-            .current_conversation
-            .as_ref()
+            .current_conversation()
             .unwrap()
             .model_selection
             .as_ref()
@@ -2430,7 +2415,7 @@ mod tests {
     #[test]
     fn submit_prompt_resets_scroll() {
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        app.load_conversation(ConversationDetail {
             id: "c1".into(),
             title: "Test".into(),
             messages: vec![],
@@ -2761,11 +2746,7 @@ mod tests {
             "a backgrounded turn must not be narrated into the open chat: {controller:?}"
         );
         assert!(
-            app.current_conversation
-                .as_ref()
-                .unwrap()
-                .messages
-                .is_empty(),
+            app.current_conversation().unwrap().messages.is_empty(),
             "and it must not append to the open (c2) transcript"
         );
         // The gate predicate itself is unchanged and still origin-keyed.
@@ -2777,7 +2758,7 @@ mod tests {
     fn push_speech_disabled_note_appends_inline_to_open_conversation() {
         let mut app = app_with_open_conversation("c1");
         assert!(app.push_speech_disabled_note("c1", "the kettle is on"));
-        let msgs = &app.current_conversation.as_ref().unwrap().messages;
+        let msgs = &app.current_conversation().unwrap().messages;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "assistant");
         assert_eq!(msgs[0].content, "(speech mode disabled) the kettle is on");
@@ -2789,13 +2770,7 @@ mod tests {
         // must NOT bleed text into the visible transcript.
         let mut app = app_with_open_conversation("c1");
         assert!(!app.push_speech_disabled_note("c2", "wrong conversation"));
-        assert!(
-            app.current_conversation
-                .as_ref()
-                .unwrap()
-                .messages
-                .is_empty()
-        );
+        assert!(app.current_conversation().unwrap().messages.is_empty());
     }
 
     #[test]
