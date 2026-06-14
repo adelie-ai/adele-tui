@@ -34,7 +34,12 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
+use crate::in_flight::InFlight;
 use crate::screen::Screen;
+
+/// Result of the off-loop `list_available_models` RPC (modal-freeze fix): the
+/// model list, or a user-facing error string.
+type ModelsResult = Result<Vec<ModelListing>, String>;
 
 const COLOR_BORDER: Color = Color::Rgb(82, 104, 173);
 const COLOR_TITLE: Color = Color::Rgb(166, 182, 255);
@@ -75,6 +80,9 @@ struct State {
 struct ModelSelectorScreen<'a> {
     state: State,
     client: &'a TransportClient,
+    /// In-flight `list_available_models` RPC, polled off the draw loop by
+    /// `poll_pending` so the picker never freezes during a (re)load.
+    pending: InFlight<'a, ModelsResult>,
 }
 
 impl Screen for ModelSelectorScreen<'_> {
@@ -84,12 +92,25 @@ impl Screen for ModelSelectorScreen<'_> {
         draw(frame, &self.state);
     }
 
-    async fn handle_key(&mut self, key: KeyEvent) {
-        handle_key(&mut self.state, key, self.client).await;
+    fn handle_key(&mut self, key: KeyEvent) -> impl std::future::Future<Output = ()> {
+        // Synchronous: a refresh enqueues an off-loop RPC into `pending` instead
+        // of awaiting it here, so the key handler never blocks the draw/input loop.
+        handle_key(&mut self.state, key, self.client, &mut self.pending);
+        std::future::ready(())
     }
 
     fn take_outcome(&mut self) -> Option<Outcome> {
         self.state.outcome.take()
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    async fn poll_pending(&mut self) {
+        if let Some(result) = self.pending.next().await {
+            apply_models_result(&mut self.state, result);
+        }
     }
 }
 
@@ -111,22 +132,29 @@ pub async fn run(
             outcome: None,
         },
         client,
+        pending: InFlight::new(),
     };
 
-    refresh(&mut screen.state, client, false).await;
-    seed_selection(&mut screen.state);
+    // Kick the initial load off-loop too, so the "Loading models…" line shows and
+    // the picker stays responsive while it lands (seeding happens on arrival).
+    refresh(&mut screen.state, &mut screen.pending, client, false);
 
     crate::screen::run_screen(terminal, &mut screen, signal_rx, sink).await
 }
 
-async fn handle_key(state: &mut State, key: KeyEvent, client: &TransportClient) {
+fn handle_key<'a>(
+    state: &mut State,
+    key: KeyEvent,
+    client: &'a TransportClient,
+    pending: &mut InFlight<'a, ModelsResult>,
+) {
     match (key.code, key.modifiers) {
         (KeyCode::Esc | KeyCode::Char('q'), m) if m.is_empty() => {
             state.outcome = Some(Outcome::Cancelled);
         }
         (KeyCode::Char('j') | KeyCode::Down, m) if m.is_empty() => advance(state, 1),
         (KeyCode::Char('k') | KeyCode::Up, m) if m.is_empty() => advance(state, -1),
-        (KeyCode::Char('r'), KeyModifiers::NONE) => refresh(state, client, true).await,
+        (KeyCode::Char('r'), KeyModifiers::NONE) => refresh(state, pending, client, true),
         (KeyCode::Enter, m) if m.is_empty() => {
             if let Some(model) = state.models.get(state.selected) {
                 state.outcome = Some(Outcome::Selected(SendPromptOverride {
@@ -158,30 +186,44 @@ fn advance(state: &mut State, delta: i32) {
     state.selected = idx as usize;
 }
 
-async fn refresh(state: &mut State, client: &TransportClient, refresh_cache: bool) {
-    let Some(commands) = client.as_commands() else {
-        state.error = Some(
-            "Model selection isn't available over D-Bus — switch transport with --transport ws or the local socket"
-                .into(),
-        );
-        state.busy = None;
-        return;
-    };
+/// Enqueue a model-list refresh as an off-loop RPC (modal-freeze fix). Sets the
+/// `busy` line and returns immediately; the result is applied by
+/// `apply_models_result` once `poll_pending` resolves it.
+fn refresh<'a>(
+    state: &mut State,
+    pending: &mut InFlight<'a, ModelsResult>,
+    client: &'a TransportClient,
+    refresh_cache: bool,
+) {
     state.busy = Some(if refresh_cache {
         "Refreshing models from daemon...".into()
     } else {
         "Loading models...".into()
     });
-    match commands.list_available_models(None, refresh_cache).await {
+    pending.push(async move {
+        match client.as_commands() {
+            Some(commands) => commands
+                .list_available_models(None, refresh_cache)
+                .await
+                .map_err(|e| format!("Failed to load models: {e}")),
+            None => Err(
+                "Model selection isn't available over D-Bus — switch transport with --transport ws or the local socket"
+                    .into(),
+            ),
+        }
+    });
+}
+
+/// Apply a resolved model-list RPC to the picker state.
+fn apply_models_result(state: &mut State, result: ModelsResult) {
+    state.busy = None;
+    match result {
         Ok(models) => {
             state.models = models;
-            state.busy = None;
+            state.error = None;
             seed_selection(state);
         }
-        Err(e) => {
-            state.error = Some(format!("Failed to load models: {e}"));
-            state.busy = None;
-        }
+        Err(e) => state.error = Some(e),
     }
 }
 
