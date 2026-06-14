@@ -44,16 +44,7 @@ use ratatui::{
 
 use crate::screen::Screen;
 
-const COLOR_BORDER: Color = Color::Rgb(82, 104, 173);
-const COLOR_BORDER_ACTIVE: Color = Color::Rgb(120, 183, 109);
-const COLOR_TITLE: Color = Color::Rgb(166, 182, 255);
-const COLOR_HINT_KEY: Color = Color::Rgb(216, 223, 236);
-const COLOR_HINT_DESC: Color = Color::Rgb(143, 153, 174);
-const COLOR_HINT_SEP: Color = Color::Rgb(82, 90, 110);
-const COLOR_LIST_HIGHLIGHT: Color = Color::Rgb(72, 102, 180);
-const COLOR_LIST_HIGHLIGHT_FG: Color = Color::Rgb(245, 248, 255);
-const COLOR_ERROR: Color = Color::Rgb(232, 130, 130);
-const COLOR_INHERIT: Color = Color::Rgb(140, 156, 196);
+use crate::theme::theme;
 
 /// The four purposes in display order.
 const PURPOSES: &[PurposeKindApi] = &[
@@ -593,12 +584,12 @@ fn draw_header(f: &mut Frame, area: Rect) {
         Span::styled(
             "Purposes",
             Style::default()
-                .fg(COLOR_TITLE)
+                .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             "  —  Esc to return to chat",
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         ),
     ]);
     f.render_widget(Paragraph::new(line), area);
@@ -626,7 +617,7 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
                             "(inherit primary)"
                         },
                         Style::default()
-                            .fg(COLOR_INHERIT)
+                            .fg(theme().debug_system)
                             .add_modifier(Modifier::ITALIC),
                     ));
                 }
@@ -642,12 +633,12 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
                         cfg.model.clone()
                     };
                     spans.push(Span::styled(connection_text, Style::default()));
-                    spans.push(Span::styled(" · ", Style::default().fg(COLOR_HINT_SEP)));
+                    spans.push(Span::styled(" · ", Style::default().fg(theme().hint_sep)));
                     spans.push(Span::styled(model_text, Style::default()));
                     if let Some(eff) = cfg.effort {
                         spans.push(Span::styled(
                             format!("  ({})", effort_label(Some(eff))),
-                            Style::default().fg(COLOR_HINT_DESC),
+                            Style::default().fg(theme().text_dim),
                         ));
                     }
                 }
@@ -660,18 +651,18 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BORDER))
+                .border_style(Style::default().fg(theme().border))
                 .title(Line::from(Span::styled(
                     "Purpose · Connection · Model · Effort",
                     Style::default()
-                        .fg(COLOR_TITLE)
+                        .fg(theme().title)
                         .add_modifier(Modifier::BOLD),
                 ))),
         )
         .highlight_style(
             Style::default()
-                .bg(COLOR_LIST_HIGHLIGHT)
-                .fg(COLOR_LIST_HIGHLIGHT_FG)
+                .bg(theme().list_highlight)
+                .fg(theme().list_highlight_fg)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ");
@@ -685,11 +676,11 @@ fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
     let title = format!("Edit purpose: {}", purpose_label(state.edit.purpose));
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_BORDER))
+        .border_style(Style::default().fg(theme().border))
         .title(Line::from(Span::styled(
             title,
             Style::default()
-                .fg(COLOR_TITLE)
+                .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(area);
@@ -711,10 +702,10 @@ fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
     let label_for = |s: &str, focused: bool| {
         let style = if focused {
             Style::default()
-                .fg(COLOR_BORDER_ACTIVE)
+                .fg(theme().border_active)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(COLOR_HINT_DESC)
+            Style::default().fg(theme().text_dim)
         };
         Paragraph::new(Span::styled(s.to_string(), style))
     };
@@ -758,14 +749,14 @@ fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
 fn draw_status(f: &mut Frame, state: &State, area: Rect) {
     if let Some(busy) = &state.busy {
         let style = Style::default()
-            .fg(Color::Rgb(178, 220, 245))
+            .fg(theme().assistant_indicator)
             .add_modifier(Modifier::ITALIC);
         f.render_widget(
             Paragraph::new(Span::styled(format!(" ● {busy}"), style)),
             area,
         );
     } else if let Some(err) = &state.error {
-        let style = Style::default().fg(COLOR_ERROR);
+        let style = Style::default().fg(theme().error);
         f.render_widget(
             Paragraph::new(Span::styled(format!(" • {err}"), style)),
             area,
@@ -786,18 +777,18 @@ fn draw_hints(f: &mut Frame, state: &State, area: Rect) {
     let mut spans: Vec<Span> = Vec::new();
     for (idx, (key, desc)) in hints.iter().enumerate() {
         if idx > 0 {
-            spans.push(Span::styled("  ·  ", Style::default().fg(COLOR_HINT_SEP)));
+            spans.push(Span::styled("  ·  ", Style::default().fg(theme().hint_sep)));
         }
         spans.push(Span::styled(
             (*key).to_string(),
             Style::default()
-                .fg(COLOR_HINT_KEY)
+                .fg(theme().hint_key)
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             (*desc).to_string(),
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);

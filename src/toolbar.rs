@@ -5,15 +5,13 @@
 //! from the right.
 
 use ratatui::{
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::Span,
 };
 
 use crate::app::InputMode;
 
-const COLOR_HINT_KEY: Color = Color::Rgb(216, 223, 236);
-const COLOR_HINT_DESC: Color = Color::Rgb(143, 153, 174);
-const COLOR_HINT_SEP: Color = Color::Rgb(82, 90, 110);
+use crate::theme::theme;
 
 const HINTS_NORMAL: &[(&str, &str)] = &[
     ("n", "new"),
@@ -72,18 +70,18 @@ pub fn render_hints(mode: &InputMode, max_width: u16) -> (Vec<Span<'static>>, u1
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(chosen.len() * 4);
     for (idx, (key, desc)) in chosen.iter().enumerate() {
         if idx > 0 {
-            spans.push(Span::styled("  ·  ", Style::default().fg(COLOR_HINT_SEP)));
+            spans.push(Span::styled("  ·  ", Style::default().fg(theme().hint_sep)));
         }
         spans.push(Span::styled(
             (*key).to_string(),
             Style::default()
-                .fg(COLOR_HINT_KEY)
+                .fg(theme().hint_key)
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(" ", Style::default()));
         spans.push(Span::styled(
             (*desc).to_string(),
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         ));
     }
     (spans, width)
