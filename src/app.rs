@@ -10,7 +10,7 @@ use crate::tasks::TaskPane;
 // slice (CC-3). First slice: per-conversation voice state lives in `core`;
 // `App`'s voice methods are thin wrappers that read core's accessors and route
 // writes through `core.apply(...)`.
-use client_ui_common::{UiMessage, WindowState};
+use client_ui_common::{Effect, UiMessage, WindowState};
 
 /// Context-window fill view + colour bucket (#341), shared via client-ui-common;
 /// re-exported so existing crate::app::ContextUsageView paths in ui.rs/main.rs resolve.
@@ -124,19 +124,12 @@ pub struct App {
     pub selected_conversation: Option<usize>,
     pub current_conversation: Option<ConversationDetail>,
     pub textarea: TextArea<'static>,
-    pub streaming_buffer: String,
-    pub pending_request_id: Option<String>,
-    /// The conversation the in-flight stream was sent to (TUI-4). `Some` iff
-    /// `pending_request_id` is `Some`. Completion appends to — and narration
-    /// gates on — THIS conversation, not whichever one is open at the time.
-    pub streaming_conversation_id: Option<String>,
-    /// `true` when the in-flight turn was NOT initiated by this client — adopted
-    /// from a `UserMessageAdded` for a turn started elsewhere (a voice turn, or
-    /// another client on the same account) so its reply streams live (#1).
-    /// Suppresses tui's own reply narration for it: the originator (e.g. the
-    /// voice daemon) already speaks the reply, so narrating again would
-    /// double-speak. Reset whenever the in-flight slot is (re)set or cleared.
-    pub streaming_is_external: bool,
+    // The in-flight streaming state (buffer, pending request/conversation id,
+    // external-turn flag, ack sentinel, narration gate) now lives in the shared
+    // `core` (CC-3): the reducer owns the state machine and the view reads it
+    // back through `streaming_buffer()` / `streaming_is_active_for_view()` /
+    // `is_streaming()`. `App` keeps only the rendered transcript
+    // (`current_conversation`) and mirrors core's streaming *effects* onto it.
     pub mode: InputMode,
     pub status_message: String,
     /// Whether the daemon connection is currently live. The run loop projects
@@ -212,29 +205,28 @@ pub struct App {
     /// say "cancelling t-1..." while we wait.
     pub pending_task_cancel: Option<TaskId>,
     /// The shared, view-agnostic model+controller (client-ui-common). `App` is
-    /// migrating its chat-core state onto it slice by slice (CC-3). Currently it
-    /// owns the per-conversation voice state (`You:` input enablement and
-    /// `Adele:` output level, adele-tui#77 / adele-gtk#80) — both default to
-    /// Disabled for an absent conversation and never bleed across conversations.
-    /// `App`'s voice methods read core's accessors and route writes through
-    /// `core.apply(...)`. The remaining `core` fields are not yet authoritative
-    /// for the TUI and stay at their defaults until later slices adopt them.
+    /// migrating its chat-core state onto it slice by slice (CC-3). It owns the
+    /// per-conversation voice state (`You:` input enablement and `Adele:` output
+    /// level, adele-tui#77 / adele-gtk#80) and the **in-flight streaming state**
+    /// — the buffer, the pending request/conversation ids, the external-turn
+    /// flag, the ack sentinel, and the reply-narration gate. Daemon stream events
+    /// route through `core.apply(...)` (see [`App::apply_core`]); `App` mirrors
+    /// the resulting view-effects onto its own rendered transcript and surfaces
+    /// `core`'s streaming state to the view via `streaming_buffer()` /
+    /// `streaming_is_active_for_view()` / `is_streaming()`. The open
+    /// conversation's id is dual-written into `core` on load so its
+    /// originating-conversation checks (TUI-4 / GTK-2) judge against the
+    /// conversation actually in view.
     core: WindowState,
 }
 
 impl App {
-    const PENDING_STREAM_REQUEST_ID: &str = "__pending_stream_request_id__";
-
     pub fn new() -> Self {
         Self {
             conversations: Vec::new(),
             selected_conversation: None,
             current_conversation: None,
             textarea: new_textarea(),
-            streaming_buffer: String::new(),
-            pending_request_id: None,
-            streaming_conversation_id: None,
-            streaming_is_external: false,
             mode: InputMode::Normal,
             status_message: "Connected".to_string(),
             connected: true,
@@ -465,17 +457,6 @@ impl App {
         }
     }
 
-    /// Record the latest context-window fill (#341). The daemon owns the
-    /// numbers; we only store and render. `conversation_id` lets us drop a
-    /// reading for a conversation that is not the one currently open (e.g. a
-    /// background turn), so the indicator always reflects the visible chat.
-    pub fn set_context_usage(&mut self, conversation_id: &str, usage: ContextUsageView) {
-        let open = self.current_conversation.as_ref().map(|c| c.id.as_str());
-        if open == Some(conversation_id) {
-            self.context_usage = Some(usage);
-        }
-    }
-
     pub fn quit(&mut self) {
         self.should_quit = true;
     }
@@ -556,7 +537,7 @@ impl App {
                 "Not connected — message not sent (your text is preserved)".into();
             return None;
         }
-        if self.pending_request_id.is_some() {
+        if self.is_streaming() {
             self.status_message =
                 "A reply is still streaming — wait for it to finish (your text is preserved)"
                     .into();
@@ -706,61 +687,135 @@ impl App {
         self.mode = InputMode::Normal;
     }
 
-    // --- Streaming ---
+    // --- Streaming (delegated to the shared core, CC-3) ---
     //
-    // The stream knows its conversation (TUI-4): `start_streaming` records the
-    // conversation the prompt was sent to, and completion/rendering/narration
-    // all target THAT conversation rather than whichever one is open when the
-    // event arrives.
+    // The stream knows its conversation (TUI-4 / GTK-2): the reducer records the
+    // conversation a prompt was sent to and keys chunk rendering, completion, and
+    // reply narration off THAT conversation, not whichever one is open when an
+    // event arrives. `App` holds none of that state — it feeds daemon stream
+    // events into `core.apply` via `apply_core` and mirrors the resulting
+    // view-effects onto its own transcript.
 
-    pub fn start_streaming(&mut self, request_id: String, conversation_id: String) {
-        self.pending_request_id = Some(request_id);
-        self.streaming_conversation_id = Some(conversation_id);
-        self.streaming_buffer.clear();
-        // A turn entering the slot via the normal send path is this client's
-        // own; only `user_message_added` flips this true for an adopted turn.
-        self.streaming_is_external = false;
-    }
-
-    pub fn start_streaming_without_request_id(&mut self, conversation_id: String) {
-        self.start_streaming(Self::PENDING_STREAM_REQUEST_ID.to_string(), conversation_id);
-    }
-
-    /// Apply the result of a `send_prompt` ack from the daemon, recording the
-    /// conversation the prompt targeted (TUI-4).
+    /// Feed a daemon-derived [`UiMessage`] into the shared core, apply the
+    /// *view-level* effects to `App`'s own state in place, and return the
+    /// *controller-level* effects the view can't perform itself (today:
+    /// [`Effect::Speak`] narration and [`Effect::FetchScratchpad`], which need
+    /// handles `App` doesn't hold). The caller (`main`'s signal loop) runs those.
     ///
-    /// The wire value is either a `task_id` (post-desktop-assistant #114
-    /// `SendMessageAck`) or an empty string (legacy `Ack`). Neither is the
-    /// chunk-stream `request_id` — that is server-generated and arrives
-    /// embedded in the first `AssistantDelta`. We therefore ignore the
-    /// ack payload and seed the sentinel; the first chunk claims it via
-    /// `stream_matches_or_claims_request_id`. See issue #52.
-    pub fn apply_prompt_ack(&mut self, _task_id: String, conversation_id: String) {
-        self.start_streaming_without_request_id(conversation_id);
+    /// View-effects are applied here because the TUI redraws from state every
+    /// frame: a streamed chunk is already on screen once it lands in
+    /// `core.streaming_buffer()`, so [`Effect::ReceiveChunk`] is a no-op; only
+    /// the transcript-finalizing and status effects need a write.
+    pub fn apply_core(&mut self, msg: UiMessage) -> Vec<Effect> {
+        let effects = self.core.apply(msg);
+        effects
+            .into_iter()
+            .filter_map(|effect| self.run_view_effect(effect))
+            .collect()
+    }
+
+    /// Apply one effect's view-level part to `App`, returning `Some(effect)` for
+    /// the controller-level effects the caller must still run (narration, RPCs).
+    fn run_view_effect(&mut self, effect: Effect) -> Option<Effect> {
+        match effect {
+            // The transcript view re-reads `core.streaming_buffer()` each frame,
+            // so the chunk is already visible — nothing to do. (Scroll follows
+            // only at the bottom, TUI-10, which needs no write either.)
+            Effect::ReceiveChunk(_) => None,
+            // Finalize the streamed reply into the open conversation. The reducer
+            // only emits this when the originating conversation is the one in view
+            // (TUI-4), so it always targets the right transcript.
+            Effect::CompleteStreaming(full) => {
+                self.append_message("assistant", full);
+                None
+            }
+            // Render the user bubble for an adopted external turn (#1 live sync).
+            Effect::AddUserMessage(content) => {
+                self.append_message("user", content);
+                None
+            }
+            Effect::SetChatStatus(message) => {
+                self.set_assistant_status(message);
+                None
+            }
+            Effect::ClearChatStatus => {
+                self.assistant_status = None;
+                None
+            }
+            Effect::SetContextUsage(usage) => {
+                self.context_usage = usage;
+                None
+            }
+            Effect::SetStatusText(text) => {
+                self.status_message = text;
+                None
+            }
+            // Controller-level effects (narration, scratchpad, and — in later
+            // CC-3 slices — the conversation/model/task/RPC effects) need handles
+            // the view doesn't hold; bubble them up to `main`'s executor.
+            other => Some(other),
+        }
+    }
+
+    /// Append a finalized message of `role` to the open conversation's transcript
+    /// (no-op when none is open). Mirrors the streaming effects the reducer emits;
+    /// the daemon assigns the authoritative id (#1), re-fetched on the next open,
+    /// so the local copy carries an empty id (streaming dedupe is by request_id).
+    fn append_message(&mut self, role: &str, content: String) {
+        if let Some(conv) = self.current_conversation.as_mut() {
+            conv.messages.push(ChatMessage {
+                id: String::new(),
+                role: role.to_string(),
+                content,
+            });
+        }
+    }
+
+    /// The live streaming partial for the open conversation, read back from the
+    /// shared core. Empty when nothing is buffering, or when the in-flight stream
+    /// belongs to a backgrounded conversation.
+    pub fn streaming_buffer(&self) -> &str {
+        self.core.streaming_buffer()
+    }
+
+    /// Whether the in-flight stream (if any) belongs to the open conversation
+    /// (TUI-4) — the render guard the transcript view consults before painting
+    /// the live partial.
+    pub fn streaming_is_active_for_view(&self) -> bool {
+        self.core.streaming_is_active_for_view()
+    }
+
+    /// Whether a streamed reply is currently in flight. The submit path gates on
+    /// this so a second prompt can't be sent mid-stream (TUI-7).
+    pub fn is_streaming(&self) -> bool {
+        self.core.is_streaming()
+    }
+
+    /// Record a `send_prompt` ack: register the in-flight turn (and its
+    /// originating conversation, TUI-4) in the shared core. The wire value is a
+    /// `task_id` (post-desktop-assistant#114 `SendMessageAck`) or an empty string
+    /// (legacy `Ack`) — neither is the chunk-stream `request_id` (server-generated,
+    /// arriving in the first `AssistantDelta`), so the reducer seeds a sentinel the
+    /// first stream event claims (#52). `PromptSent` emits no effects.
+    pub fn apply_prompt_ack(&mut self, task_id: String, conversation_id: String) {
+        let _ = self.core.apply(UiMessage::PromptSent {
+            task_id,
+            conversation_id,
+        });
         // Immediate feedback in the gap between Enter and the first streamed
         // token. The daemon's own `Status` events (e.g. "Searching…") overwrite
-        // this, and completion/error clears it (see `set_assistant_status`).
+        // this, and completion/error clears it.
         self.set_assistant_status("Adele is thinking…");
     }
 
-    /// Whether the in-flight stream belongs to the open conversation (TUI-4).
-    /// Gates rendering of the live streaming buffer so a backgrounded turn's
-    /// chunks never paint into a conversation the user switched to.
-    pub fn streaming_is_for_current(&self) -> bool {
-        self.pending_request_id.is_some()
-            && self.streaming_conversation_id.as_deref()
-                == self.current_conversation.as_ref().map(|c| c.id.as_str())
-    }
-
-    /// Reset all in-flight streaming state (TUI-8). Called on `Disconnected`:
-    /// the stream is dead, so the frozen `▌` buffer must not linger and the
-    /// ack sentinel must not mis-claim the first stream after reconnecting.
+    /// Drop all in-flight streaming state on a connection teardown (TUI-8): the
+    /// stream died with the link, so the frozen `▌` buffer must not linger and the
+    /// ack sentinel must not mis-claim the first post-reconnect stream. Delegates
+    /// to the core (which owns the streaming state); also clears the TUI-only
+    /// transient assistant-status line.
     pub fn clear_streaming_state(&mut self) {
-        self.pending_request_id = None;
-        self.streaming_conversation_id = None;
-        self.streaming_buffer.clear();
+        self.core.reset_streaming_state();
         self.assistant_status = None;
-        self.streaming_is_external = false;
     }
 
     /// Move the sidebar selection to the conversation with `id`, returning
@@ -773,120 +828,6 @@ impl App {
                 true
             }
             None => false,
-        }
-    }
-
-    fn stream_matches_or_claims_request_id(&mut self, request_id: &str) -> bool {
-        match self.pending_request_id.as_deref() {
-            Some(Self::PENDING_STREAM_REQUEST_ID) => {
-                self.pending_request_id = Some(request_id.to_string());
-                true
-            }
-            Some(current) => current == request_id,
-            None => false,
-        }
-    }
-
-    pub fn receive_chunk(&mut self, request_id: &str, chunk: &str) {
-        if !self.stream_matches_or_claims_request_id(request_id) {
-            return;
-        }
-        self.streaming_buffer.push_str(chunk);
-        // Follow-only-at-bottom (TUI-10): the transcript renders anchored to
-        // the bottom, so `scroll_offset == 0` keeps following new chunks by
-        // itself. A non-zero offset means the user scrolled up to read —
-        // never yank them back down (and a backgrounded stream's chunks must
-        // never touch the OPEN conversation's scroll at all, TUI-4).
-    }
-
-    /// Finish the in-flight stream. Returns the ORIGINATING conversation id
-    /// when the event matched the pending stream (TUI-4) — the caller gates
-    /// narration on that conversation — or `None` when the event was unrelated.
-    /// The reply is appended to the transcript only when the originating
-    /// conversation is the open one; otherwise the daemon already persisted it
-    /// and it appears when that conversation is next opened.
-    pub fn complete_streaming(&mut self, request_id: &str, full_response: &str) -> Option<String> {
-        if !self.stream_matches_or_claims_request_id(request_id) {
-            return None;
-        }
-        let origin = self.streaming_conversation_id.take();
-        if let Some(conv) = self
-            .current_conversation
-            .as_mut()
-            .filter(|c| origin.as_deref() == Some(c.id.as_str()))
-        {
-            conv.messages.push(ChatMessage {
-                // Local copy of the just-streamed reply; the daemon already
-                // persisted the authoritative message (with its #1 id), which is
-                // re-fetched on the next open. Streaming dedupe is by request_id,
-                // so an empty id here is correct.
-                id: String::new(),
-                role: "assistant".to_string(),
-                content: full_response.to_string(),
-            });
-        }
-        self.streaming_buffer.clear();
-        self.pending_request_id = None;
-        self.assistant_status = None;
-        self.streaming_is_external = false;
-        origin
-    }
-
-    pub fn streaming_error(&mut self, request_id: &str, error: &str) {
-        if !self.stream_matches_or_claims_request_id(request_id) {
-            return;
-        }
-        self.status_message = format!("Error: {error}");
-        self.streaming_buffer.clear();
-        self.pending_request_id = None;
-        self.streaming_conversation_id = None;
-        self.assistant_status = None;
-        self.streaming_is_external = false;
-    }
-
-    /// Handle a `UserMessageAdded` (#1): the daemon announces a user message and
-    /// the turn it begins. For a turn this client did NOT initiate (a voice turn,
-    /// or another client on the same account) showing in the open conversation,
-    /// render the user bubble and adopt the turn so its reply streams live;
-    /// dedupe this client's own send (already shown optimistically).
-    pub fn user_message_added(&mut self, conversation_id: &str, request_id: &str, content: &str) {
-        // Case 1 — our own send, echoed back. `prepare_submission` already
-        // appended the user message and `apply_prompt_ack` pinned the sentinel
-        // (both run inline before any signal is processed). Claim the real
-        // request_id off the sentinel — it precedes the first chunk — and render
-        // nothing more. This also resolves the stream's request_id earlier and
-        // more reliably than the claim-on-first-chunk fallback.
-        if self.pending_request_id.as_deref() == Some(Self::PENDING_STREAM_REQUEST_ID)
-            && self.streaming_conversation_id.as_deref() == Some(conversation_id)
-        {
-            self.pending_request_id = Some(request_id.to_string());
-            return;
-        }
-        // Case 2 — a turn this client did NOT initiate, for the conversation on
-        // screen, with no turn already occupying the single in-flight slot. Adopt
-        // it so the existing chunk/completion path streams the reply live, append
-        // the user message now, and mark it external so its reply is NOT narrated
-        // here (the originator already speaks it). A turn for a background
-        // conversation, or one arriving while our own turn is in flight, is left
-        // to the reload-on-switch path (the daemon persists it).
-        let is_displayed =
-            self.current_conversation.as_ref().map(|c| c.id.as_str()) == Some(conversation_id);
-        if self.pending_request_id.is_none() && is_displayed {
-            self.pending_request_id = Some(request_id.to_string());
-            self.streaming_conversation_id = Some(conversation_id.to_string());
-            self.streaming_buffer.clear();
-            self.streaming_is_external = true;
-            if let Some(conv) = self.current_conversation.as_mut() {
-                conv.messages.push(ChatMessage {
-                    // Adopted external user bubble (#1 live sync). The turn is
-                    // tracked by request_id, not message id, so an empty id is
-                    // correct; the persisted message (with its real id) is
-                    // re-fetched on the next open.
-                    id: String::new(),
-                    role: "user".to_string(),
-                    content: content.to_string(),
-                });
-            }
         }
     }
 
@@ -909,6 +850,11 @@ impl App {
     pub fn load_conversation(&mut self, detail: ConversationDetail) {
         let switching =
             self.current_conversation.as_ref().map(|c| c.id.as_str()) != Some(detail.id.as_str());
+        // Dual-write the open-conversation id into the shared core so its
+        // streaming originating-conversation checks (TUI-4 / GTK-2) judge against
+        // the conversation actually in view. `App` still owns the rendered
+        // transcript; only the id `core` needs for routing is mirrored (CC-3).
+        self.core.current_conversation_id = Some(detail.id.clone());
         self.current_conversation = Some(detail);
         // Drop a stale context-fill reading when the visible conversation
         // changes; the next turn re-establishes it (#341).
@@ -997,13 +943,16 @@ impl App {
         let id = self.conversations[idx].id.clone();
         self.conversations.remove(idx);
 
-        // Clear current conversation if it was the deleted one
+        // Clear current conversation if it was the deleted one (and mirror the
+        // clear into the shared core so its streaming active-checks don't keep
+        // pointing at a gone conversation, CC-3).
         if self
             .current_conversation
             .as_ref()
             .is_some_and(|c| c.id == id)
         {
             self.current_conversation = None;
+            self.core.current_conversation_id = None;
         }
 
         // Fix selection
@@ -1107,14 +1056,30 @@ mod tests {
     }
 
     #[test]
-    fn set_context_usage_only_applies_to_open_conversation() {
+    fn context_usage_signal_updates_the_indicator_only_for_the_open_conversation() {
+        // The reducer gates the `ContextUsage` signal on the open conversation
+        // (#341); apply_core wires the resulting `SetContextUsage` effect onto
+        // App's indicator. A background turn's reading must not paint.
         let mut app = App::new();
         app.load_conversation(detail("c1"));
-        // A reading for a different conversation (e.g. background turn) is dropped.
-        app.set_context_usage("c2", usage(10_000, 32_000, false));
-        assert_eq!(app.context_usage, None);
-        // A reading for the open conversation lands.
-        app.set_context_usage("c1", usage(10_000, 32_000, false));
+
+        app.apply_core(UiMessage::ContextUsage {
+            conversation_id: "c2".into(),
+            used_tokens: 10_000,
+            budget_tokens: 32_000,
+            compaction_active: false,
+        });
+        assert_eq!(
+            app.context_usage, None,
+            "a background reading must not paint"
+        );
+
+        app.apply_core(UiMessage::ContextUsage {
+            conversation_id: "c1".into(),
+            used_tokens: 10_000,
+            budget_tokens: 32_000,
+            compaction_active: false,
+        });
         assert_eq!(app.context_usage, Some(usage(10_000, 32_000, false)));
     }
 
@@ -1122,7 +1087,12 @@ mod tests {
     fn switching_conversation_clears_stale_context_usage() {
         let mut app = App::new();
         app.load_conversation(detail("c1"));
-        app.set_context_usage("c1", usage(10_000, 32_000, false));
+        app.apply_core(UiMessage::ContextUsage {
+            conversation_id: "c1".into(),
+            used_tokens: 10_000,
+            budget_tokens: 32_000,
+            compaction_active: false,
+        });
         assert!(app.context_usage.is_some());
         app.load_conversation(detail("c2"));
         assert_eq!(
@@ -1516,7 +1486,9 @@ mod tests {
 
     fn app_ready_to_send(conv_id: &str, prompt: &str) -> App {
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        // `load_conversation` (not a raw field write) so the open-conversation id
+        // is dual-written into core — the streaming gate/render checks key off it.
+        app.load_conversation(ConversationDetail {
             id: conv_id.into(),
             title: "Test".into(),
             messages: vec![],
@@ -1563,7 +1535,13 @@ mod tests {
         // send while a reply streams is refused with a status message and the
         // composer keeps its text.
         let mut app = app_ready_to_send("c1", "second question");
-        app.start_streaming("req-in-flight".into(), "c1".into());
+        // Drive a genuine in-flight stream through the core: ack arms the slot,
+        // the first chunk claims the real request id.
+        app.apply_prompt_ack("task".into(), "c1".into());
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "req-in-flight".into(),
+            chunk: "partial".into(),
+        });
         app.status_message.clear();
 
         let result = app.prepare_submission(true);
@@ -1585,7 +1563,8 @@ mod tests {
         // Unhappy path: the window between send and the first chunk uses the
         // pending sentinel; a send in that window must be blocked too.
         let mut app = app_ready_to_send("c1", "rapid second send");
-        app.start_streaming_without_request_id("c1".into());
+        // Ack received but no chunk yet: the slot holds the pending sentinel.
+        app.apply_prompt_ack("task".into(), "c1".into());
 
         assert!(app.prepare_submission(true).is_none());
         assert_eq!(app.textarea_content(), "rapid second send");
@@ -1686,21 +1665,73 @@ mod tests {
         }
     }
 
+    // These exercise the TUI's *integration* with the shared core — that
+    // `apply_core` applies the reducer's streaming effects onto `App`'s own
+    // transcript / buffer / status, and routes the `clear_streaming_state`
+    // teardown through core. The streaming *state machine itself* (request-id
+    // claiming, originating-conversation targeting, external-turn handling,
+    // error/disconnect finalization) is spec'd by client-ui-common's reducer
+    // tests; we don't re-test that logic here, only the wiring.
+
     #[test]
-    fn complete_after_switching_conversations_targets_the_originating_one() {
-        // Acceptance (TUI-4): a Complete arriving after the user switched
-        // conversations must NOT append to the newly opened conversation; it
-        // reports the ORIGINATING conversation id so narration gates there.
+    fn apply_core_finalizes_an_open_streams_reply_into_the_transcript() {
+        // The ack carries a task id; the chunks carry a DIFFERENT server request
+        // id (#52). They must still be accepted, buffer live, and finalize into
+        // the open conversation's transcript on completion.
         let mut app = App::new();
-        app.current_conversation = Some(detail("c1"));
+        app.load_conversation(detail("c1"));
+        app.apply_prompt_ack("task-abc".into(), "c1".into());
+
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "server-xyz".into(),
+            chunk: "Hello ".into(),
+        });
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "server-xyz".into(),
+            chunk: "world!".into(),
+        });
+        assert_eq!(
+            app.streaming_buffer(),
+            "Hello world!",
+            "the partial buffers live"
+        );
+
+        app.apply_core(UiMessage::StreamComplete {
+            request_id: "server-xyz".into(),
+            full_response: "Hello world!".into(),
+        });
+
+        assert!(!app.is_streaming(), "the slot clears on completion");
+        assert_eq!(app.streaming_buffer(), "", "the live partial is gone");
+        let msgs = &app.current_conversation.as_ref().unwrap().messages;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "assistant");
+        assert_eq!(msgs[0].content, "Hello world!");
+    }
+
+    #[test]
+    fn apply_core_does_not_bleed_a_backgrounded_completion_into_the_open_chat() {
+        // TUI-4: a Complete arriving after the user switched conversations must
+        // NOT append to the newly opened conversation, emits no narration, and
+        // still clears the slot.
+        let mut app = App::new();
+        app.load_conversation(detail("c1"));
         app.apply_prompt_ack("task-1".into(), "c1".into());
-        app.receive_chunk("req-1", "partial ");
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "req-1".into(),
+            chunk: "partial ".into(),
+        });
 
-        // User switches to c2 mid-stream.
-        app.load_conversation(detail("c2"));
+        app.load_conversation(detail("c2")); // switch away mid-stream
 
-        let origin = app.complete_streaming("req-1", "partial reply done");
-        assert_eq!(origin.as_deref(), Some("c1"), "origin must be reported");
+        let controller = app.apply_core(UiMessage::StreamComplete {
+            request_id: "req-1".into(),
+            full_response: "done".into(),
+        });
+        assert!(
+            controller.is_empty(),
+            "a backgrounded completion emits no controller effect (no narration)"
+        );
         assert!(
             app.current_conversation
                 .as_ref()
@@ -1709,83 +1740,51 @@ mod tests {
                 .is_empty(),
             "the reply must not bleed into the switched-to conversation"
         );
-        assert_eq!(app.pending_request_id, None, "stream state must clear");
-        assert_eq!(app.streaming_buffer, "");
+        assert!(!app.is_streaming(), "the slot still clears");
     }
 
     #[test]
-    fn complete_appends_when_user_switched_away_and_back() {
-        // Switching away and back re-opens the originating conversation; the
-        // completion then lands in its transcript.
+    fn backgrounded_stream_chunks_do_not_reset_the_open_conversations_scroll() {
+        // Scroll belongs to the OPEN conversation; a backgrounded stream's chunks
+        // must neither yank it nor paint into the open chat (TUI-4 / TUI-10).
         let mut app = App::new();
-        app.current_conversation = Some(detail("c1"));
+        app.load_conversation(detail("c1"));
         app.apply_prompt_ack("task-1".into(), "c1".into());
         app.load_conversation(detail("c2"));
-        app.load_conversation(detail("c1")); // back again (fresh fetch)
+        app.scroll_up(7);
 
-        let origin = app.complete_streaming("req-1", "the reply");
-        assert_eq!(origin.as_deref(), Some("c1"));
-        let msgs = &app.current_conversation.as_ref().unwrap().messages;
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content, "the reply");
-    }
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "req-1".into(),
+            chunk: "background chunk".into(),
+        });
 
-    #[test]
-    fn unmatched_complete_reports_no_origin() {
-        // An unrelated Complete (wrong request id) must not be narrated or
-        // appended anywhere — no origin is reported.
-        let mut app = App::new();
-        app.current_conversation = Some(detail("c1"));
-        app.start_streaming("req-1".into(), "c1".into());
-        assert_eq!(app.complete_streaming("other-req", "noise"), None);
-        assert!(app.pending_request_id.is_some(), "stream still pending");
-    }
-
-    #[test]
-    fn streaming_buffer_renders_only_into_the_originating_conversation() {
-        // The UI gate (TUI-4): mid-stream chunks must not paint into a
-        // conversation the user switched to.
-        let mut app = App::new();
-        app.current_conversation = Some(detail("c1"));
-        app.start_streaming("req-1".into(), "c1".into());
-        app.receive_chunk("req-1", "partial");
-        assert!(app.streaming_is_for_current());
-
-        app.load_conversation(detail("c2"));
+        assert_eq!(
+            app.scroll_offset, 7,
+            "scroll is untouched by a backgrounded chunk"
+        );
         assert!(
-            !app.streaming_is_for_current(),
-            "stream belongs to c1, not the open c2"
+            !app.streaming_is_active_for_view(),
+            "and it is not painted into the open chat"
         );
     }
 
     #[test]
-    fn chunks_for_a_backgrounded_stream_do_not_reset_scroll() {
-        // Scroll position belongs to the OPEN conversation; a backgrounded
-        // stream's chunks must not yank it.
-        let mut app = App::new();
-        app.current_conversation = Some(detail("c1"));
-        app.start_streaming("req-1".into(), "c1".into());
-        app.load_conversation(detail("c2"));
-        app.scroll_up(7);
-        app.receive_chunk("req-1", "background chunk");
-        assert_eq!(app.scroll_offset, 7);
-    }
-
-    #[test]
     fn clear_streaming_state_resets_everything_on_disconnect() {
-        // Acceptance (TUI-8): after a disconnect there is no frozen ▌ buffer
-        // and no stale pending id.
+        // Acceptance (TUI-8): after a disconnect there is no frozen ▌ buffer, no
+        // stale pending slot, and the transient assistant-status line is cleared.
         let mut app = App::new();
-        app.current_conversation = Some(detail("c1"));
+        app.load_conversation(detail("c1"));
         app.apply_prompt_ack("task-1".into(), "c1".into());
-        app.receive_chunk("req-1", "now-dead partial");
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "req-1".into(),
+            chunk: "now-dead partial".into(),
+        });
         app.set_assistant_status("Calling tool…");
 
         app.clear_streaming_state();
 
-        assert_eq!(app.pending_request_id, None);
-        assert_eq!(app.streaming_buffer, "");
-        assert!(app.streaming_conversation_id.is_none());
+        assert!(!app.is_streaming());
+        assert_eq!(app.streaming_buffer(), "");
         assert!(app.assistant_status.is_none());
     }
 
@@ -1794,13 +1793,16 @@ mod tests {
         // Unhappy path (TUI-8): a leftover ack sentinel from before the
         // disconnect must not claim the first post-reconnect stream.
         let mut app = App::new();
-        app.current_conversation = Some(detail("c1"));
+        app.load_conversation(detail("c1"));
         app.apply_prompt_ack("task-1".into(), "c1".into()); // sentinel armed
         app.clear_streaming_state();
 
-        app.receive_chunk("post-reconnect-req", "someone else's chunk");
-        assert_eq!(app.streaming_buffer, "", "chunk must be ignored");
-        assert_eq!(app.pending_request_id, None);
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "post-reconnect-req".into(),
+            chunk: "someone else's chunk".into(),
+        });
+        assert_eq!(app.streaming_buffer(), "", "chunk must be ignored");
+        assert!(!app.is_streaming());
     }
 
     #[test]
@@ -1819,216 +1821,148 @@ mod tests {
     }
 
     // --- Streaming tests ---
+    //
+    // These cover the TUI's wiring of the shared core's streaming effects. The
+    // happy-path lifecycle (claim → buffer → finalize) is exercised by
+    // `apply_core_finalizes_an_open_streams_reply_into_the_transcript` above; the
+    // reducer's state machine itself is spec'd in client-ui-common.
 
     #[test]
-    fn streaming_lifecycle() {
+    fn streaming_error_surfaces_in_the_status_line() {
+        // apply_core wires StreamError's `SetStatusText` onto App's status line
+        // and `ClearChatStatus` onto the transient assistant-status, and clears
+        // the slot + buffer.
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
-            id: "c1".into(),
-            title: "Test".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
+        app.load_conversation(detail("c1"));
+        app.apply_prompt_ack("task-1".into(), "c1".into());
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "req1".into(),
+            chunk: "half a thought".into(),
+        });
+        app.set_assistant_status("Calling tool…");
+
+        app.apply_core(UiMessage::StreamError {
+            request_id: "req1".into(),
+            error: "LLM timeout".into(),
         });
 
-        app.start_streaming("req1".into(), "c1".into());
-        assert_eq!(app.pending_request_id, Some("req1".to_string()));
-
-        app.receive_chunk("req1", "Hello ");
-        app.receive_chunk("req1", "world!");
-        assert_eq!(app.streaming_buffer, "Hello world!");
-
-        app.complete_streaming("req1", "Hello world!");
-        assert_eq!(app.streaming_buffer, "");
-        assert_eq!(app.pending_request_id, None);
-
-        let msgs = &app.current_conversation.as_ref().unwrap().messages;
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].role, "assistant");
-        assert_eq!(msgs[0].content, "Hello world!");
-    }
-
-    #[test]
-    fn wrong_request_id_ignored() {
-        let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
-            id: "c1".into(),
-            title: "Test".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-        });
-
-        app.start_streaming("req1".into(), "c1".into());
-        app.receive_chunk("wrong_id", "bad data");
-        assert_eq!(app.streaming_buffer, "");
-
-        app.complete_streaming("wrong_id", "bad");
-        assert!(app.pending_request_id.is_some()); // not cleared
-    }
-
-    #[test]
-    fn streaming_error_sets_status() {
-        let mut app = App::new();
-        app.start_streaming("req1".into(), "c1".into());
-        app.streaming_error("req1", "LLM timeout");
         assert_eq!(app.status_message, "Error: LLM timeout");
-        assert_eq!(app.pending_request_id, None);
-        assert_eq!(app.streaming_buffer, "");
+        assert!(
+            app.assistant_status.is_none(),
+            "the transient status clears"
+        );
+        assert!(!app.is_streaming());
+        assert_eq!(app.streaming_buffer(), "");
     }
 
     // --- Live external-turn rendering (#1) --------------------------------
 
-    /// A `UserMessageAdded` for the open conversation, with no turn in flight,
-    /// is a turn this client did not initiate (voice / another client). It
-    /// renders the user message and adopts the turn so the reply streams live.
     #[test]
-    fn external_user_message_in_open_conversation_renders_and_adopts() {
+    fn external_user_message_renders_and_adopts_into_the_open_conversation() {
+        // A `UserMessageAdded` for the open conversation with nothing in flight
+        // is an external turn (voice / another client): apply_core renders the
+        // user bubble (the `AddUserMessage` effect) and adopts the turn, so a
+        // following chunk for it streams live into the open chat.
         let mut app = app_with_open_conversation("c1");
-        app.user_message_added("c1", "voice-req", "what's the weather?");
+
+        let controller = app.apply_core(UiMessage::UserMessageAdded {
+            conversation_id: "c1".into(),
+            request_id: "voice-req".into(),
+            content: "what's the weather?".into(),
+        });
+        assert!(
+            controller.is_empty(),
+            "rendering the bubble needs no controller effect"
+        );
 
         let msgs = &app.current_conversation.as_ref().unwrap().messages;
         assert_eq!(msgs.len(), 1, "the external user message must be rendered");
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[0].content, "what's the weather?");
-        assert_eq!(
-            app.pending_request_id.as_deref(),
-            Some("voice-req"),
-            "the turn must be adopted so its reply streams live"
-        );
-        assert_eq!(app.streaming_conversation_id.as_deref(), Some("c1"));
-        assert!(
-            app.streaming_is_external,
-            "an adopted turn is external so tui does not also narrate it"
-        );
+
+        // Adopted: its reply now streams live into the open chat.
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "voice-req".into(),
+            chunk: "Sunny.".into(),
+        });
+        assert_eq!(app.streaming_buffer(), "Sunny.");
+        assert!(app.streaming_is_active_for_view());
     }
 
-    /// This client's own send is echoed back as `UserMessageAdded`. The user
-    /// message was already appended optimistically and the sentinel pinned, so
-    /// the echo renders nothing — it only claims the real request_id.
     #[test]
-    fn own_send_echo_dedupes_and_claims_request_id() {
-        let mut app = app_with_open_conversation("c1");
-        // Mirror the local send: optimistic append + sentinel via the ack.
-        app.current_conversation
-            .as_mut()
-            .unwrap()
-            .messages
-            .push(ChatMessage {
-                id: String::new(),
-                role: "user".to_string(),
-                content: "typed this".to_string(),
-            });
-        app.apply_prompt_ack(String::new(), "c1".to_string());
-
-        app.user_message_added("c1", "real-req", "typed this");
-
-        assert_eq!(
-            app.current_conversation.as_ref().unwrap().messages.len(),
-            1,
-            "our own send's echo must not double-append the user message"
-        );
-        assert_eq!(
-            app.pending_request_id.as_deref(),
-            Some("real-req"),
-            "the echo must claim the real request_id off the sentinel"
-        );
-        assert!(
-            !app.streaming_is_external,
-            "our own turn must NOT be flagged external (tui owns its narration)"
-        );
-    }
-
-    /// An adopted external turn is narrated by its originator — tui must not
-    /// also speak it even when the conversation's gate is open. Verifies the
-    /// flag main.rs captures (`was_external`) to suppress `enqueue_narration`.
-    #[test]
-    fn adopted_external_turn_suppresses_tui_narration() {
+    fn adopted_external_turn_is_not_narrated_by_this_client() {
+        // An adopted external turn is narrated by its originator (the voice
+        // daemon); even with the conversation's gate wide open (Adele=Always),
+        // completing it must emit NO `Speak` controller effect.
         let mut app = app_with_open_conversation("c1");
         app.set_adele_output("c1", AdeleOutput::Always);
         assert!(
             app.narrate_for("c1"),
-            "precondition: the gate alone would narrate (Adele=Always)"
+            "precondition: the gate alone would narrate"
         );
 
-        app.user_message_added("c1", "voice-req", "a question");
-        // main.rs captures this BEFORE complete_streaming resets it, then gates
-        // narration on `!was_external && narrate_for(origin)`.
-        let was_external = app.streaming_is_external;
-        let origin = app.complete_streaming("voice-req", "the spoken answer");
-
-        assert!(was_external, "external turn must suppress tui narration");
-        assert_eq!(origin.as_deref(), Some("c1"));
-        assert!(
-            !app.streaming_is_external,
-            "the external flag must reset at turn completion"
-        );
-    }
-
-    /// A `UserMessageAdded` for a conversation NOT on screen is left to the
-    /// reload-on-switch path — it must not touch the open transcript or the
-    /// in-flight slot.
-    #[test]
-    fn external_turn_for_background_conversation_is_ignored() {
-        let mut app = app_with_open_conversation("c1");
-        app.user_message_added("c2", "bg-req", "background");
-
-        assert!(
-            app.current_conversation
-                .as_ref()
-                .unwrap()
-                .messages
-                .is_empty(),
-            "a background turn must not render into the open transcript"
-        );
-        assert!(
-            app.pending_request_id.is_none(),
-            "a background turn must not be adopted into the in-flight slot"
-        );
-    }
-
-    /// While this client's own turn is in flight, a concurrent external turn is
-    /// NOT adopted — the single in-flight slot stays bound to our turn.
-    #[test]
-    fn external_turn_ignored_while_own_turn_in_flight() {
-        let mut app = app_with_open_conversation("c1");
-        app.start_streaming("mine".to_string(), "c1".to_string());
-
-        app.user_message_added("c1", "other", "concurrent");
-
-        assert_eq!(
-            app.pending_request_id.as_deref(),
-            Some("mine"),
-            "the in-flight turn's slot must be preserved"
-        );
-        assert!(
-            app.current_conversation
-                .as_ref()
-                .unwrap()
-                .messages
-                .is_empty(),
-            "must not append a second user message while a turn is in flight"
-        );
-    }
-
-    #[test]
-    fn assistant_status_set_and_cleared_on_complete() {
-        let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
-            id: "c1".into(),
-            title: "Test".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
+        app.apply_core(UiMessage::UserMessageAdded {
+            conversation_id: "c1".into(),
+            request_id: "voice-req".into(),
+            content: "a question".into(),
         });
-        app.start_streaming("req1".into(), "c1".into());
-        app.set_assistant_status("Searching knowledge base...");
+        let controller = app.apply_core(UiMessage::StreamComplete {
+            request_id: "voice-req".into(),
+            full_response: "the spoken answer".into(),
+        });
+
+        assert!(
+            !controller.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "an external turn must not be narrated here: {controller:?}"
+        );
+    }
+
+    #[test]
+    fn own_narrating_turn_completion_returns_a_speak_effect() {
+        // The flip side: this client's OWN turn, in a narrating conversation
+        // (Adele=Always), must bubble up a `Speak` controller effect on
+        // completion for `main` to enqueue.
+        let mut app = app_with_open_conversation("c1");
+        app.set_adele_output("c1", AdeleOutput::Always);
+        app.apply_prompt_ack("task-1".into(), "c1".into());
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "req1".into(),
+            chunk: "hi".into(),
+        });
+
+        let controller = app.apply_core(UiMessage::StreamComplete {
+            request_id: "req1".into(),
+            full_response: "the spoken answer".into(),
+        });
+
+        assert!(
+            controller
+                .iter()
+                .any(|e| matches!(e, Effect::Speak(text) if text == "the spoken answer")),
+            "an own narrating turn must bubble up a Speak effect: {controller:?}"
+        );
+    }
+
+    #[test]
+    fn assistant_status_set_and_cleared_through_apply_core() {
+        // A daemon `Status` event paints the transient indicator (SetChatStatus);
+        // completion clears it (ClearChatStatus) — both via apply_core.
+        let mut app = App::new();
+        app.load_conversation(detail("c1"));
+        app.apply_prompt_ack("task-1".into(), "c1".into());
+        app.apply_core(UiMessage::AssistantStatus {
+            request_id: "req1".into(),
+            message: "Searching knowledge base...".into(),
+        });
         assert_eq!(
             app.assistant_status.as_deref(),
             Some("Searching knowledge base...")
         );
 
-        app.complete_streaming("req1", "done");
+        app.apply_core(UiMessage::StreamComplete {
+            request_id: "req1".into(),
+            full_response: "done".into(),
+        });
         assert!(app.assistant_status.is_none());
     }
 
@@ -2049,15 +1983,6 @@ mod tests {
     }
 
     #[test]
-    fn assistant_status_cleared_on_error() {
-        let mut app = App::new();
-        app.start_streaming("req1".into(), "c1".into());
-        app.set_assistant_status("Calling tool...");
-        app.streaming_error("req1", "boom");
-        assert!(app.assistant_status.is_none());
-    }
-
-    #[test]
     fn assistant_status_empty_string_clears() {
         let mut app = App::new();
         app.set_assistant_status("something");
@@ -2065,81 +1990,11 @@ mod tests {
         assert!(app.assistant_status.is_none());
     }
 
-    #[test]
-    fn pending_stream_claims_first_request_id_from_chunk() {
-        let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
-            id: "c1".into(),
-            title: "Test".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-        });
-
-        app.start_streaming_without_request_id("c1".into());
-        app.receive_chunk("ws-req-1", "Hello ");
-        app.receive_chunk("ws-req-1", "world");
-        app.complete_streaming("ws-req-1", "Hello world");
-
-        assert_eq!(app.pending_request_id, None);
-        let msgs = &app.current_conversation.as_ref().unwrap().messages;
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content, "Hello world");
-    }
-
-    #[test]
-    fn pending_stream_rejects_unrelated_request_after_claim() {
-        let mut app = App::new();
-        app.start_streaming_without_request_id("c1".into());
-
-        app.receive_chunk("ws-req-1", "good");
-        app.receive_chunk("ws-req-2", "ignored");
-
-        assert_eq!(app.streaming_buffer, "good");
-        assert_eq!(app.pending_request_id, Some("ws-req-1".to_string()));
-    }
-
-    /// Regression test for issue #52.
-    ///
-    /// `WsClient::send_prompt` returns the daemon's `task_id`
-    /// (post-desktop-assistant #114 `SendMessageAck`). That value is
-    /// distinct from the chunk-stream `request_id` embedded in
-    /// `AssistantDelta` events — the latter is server-generated per
-    /// streaming response. Treating the ack value as the stream's
-    /// request_id makes every chunk get filtered out by
-    /// `stream_matches_or_claims_request_id`, so the assistant's
-    /// streaming reply never appears.
-    ///
-    /// After `apply_prompt_ack(task_id)` the next chunk — carrying the
-    /// real, different server request_id — must still be accepted.
-    #[test]
-    fn apply_prompt_ack_accepts_chunks_with_distinct_server_request_id() {
-        let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
-            id: "c1".into(),
-            title: "Test".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-        });
-
-        // Daemon ack carries a task_id (post-#114 wire protocol).
-        app.apply_prompt_ack("task-abc123".to_string(), "c1".to_string());
-
-        // Streaming chunks then arrive with a *different* server-generated
-        // request_id. They must be accepted, not filtered out.
-        app.receive_chunk("server-req-xyz789", "Hello ");
-        app.receive_chunk("server-req-xyz789", "world!");
-
-        assert_eq!(app.streaming_buffer, "Hello world!");
-
-        app.complete_streaming("server-req-xyz789", "Hello world!");
-        assert_eq!(app.pending_request_id, None);
-        let msgs = &app.current_conversation.as_ref().unwrap().messages;
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].role, "assistant");
-        assert_eq!(msgs[0].content, "Hello world!");
-    }
+    // The pending-sentinel claim, unrelated-request rejection, and the issue #52
+    // distinct-ack-vs-server-request-id regression are all spec'd by
+    // client-ui-common's reducer tests (and exercised end-to-end through the TUI
+    // by `apply_core_finalizes_an_open_streams_reply_into_the_transcript`, which
+    // uses a distinct ack task id and server request id).
 
     // --- Mode transition tests ---
 
@@ -2458,11 +2313,14 @@ mod tests {
     #[test]
     fn receive_chunk_at_bottom_keeps_following() {
         // TUI-10: when the user is at the bottom (offset 0), streaming keeps
-        // auto-following.
+        // auto-following — applying a chunk through the core never moves scroll.
         let mut app = App::new();
-        app.current_conversation = Some(detail("c1"));
-        app.start_streaming("req1".into(), "c1".into());
-        app.receive_chunk("req1", "data");
+        app.load_conversation(detail("c1"));
+        app.apply_prompt_ack("task1".into(), "c1".into());
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "req1".into(),
+            chunk: "data".into(),
+        });
         assert_eq!(app.scroll_offset, 0);
     }
 
@@ -2471,12 +2329,15 @@ mod tests {
         // Acceptance (TUI-10): the user can read scrollback during a long
         // reply — chunks must not yank the view back to the bottom.
         let mut app = App::new();
-        app.current_conversation = Some(detail("c1"));
-        app.start_streaming("req1".into(), "c1".into());
+        app.load_conversation(detail("c1"));
+        app.apply_prompt_ack("task1".into(), "c1".into());
         app.scroll_up(10);
-        app.receive_chunk("req1", "data");
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "req1".into(),
+            chunk: "data".into(),
+        });
         assert_eq!(app.scroll_offset, 10);
-        assert_eq!(app.streaming_buffer, "data", "chunk still buffered");
+        assert_eq!(app.streaming_buffer(), "data", "chunk still buffered");
     }
 
     #[test]
@@ -2621,7 +2482,8 @@ mod tests {
 
     fn app_with_open_conversation(id: &str) -> App {
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        // Via `load_conversation` so core's open-conversation id is dual-written.
+        app.load_conversation(ConversationDetail {
             id: id.into(),
             title: "Chat".into(),
             messages: vec![],
@@ -2784,19 +2646,43 @@ mod tests {
     }
 
     #[test]
-    fn narration_gates_on_the_originating_conversation_not_the_open_one() {
-        // TUI-4: a backgrounded turn's reply is narrated per ITS
-        // conversation's settings, not the open conversation's. c1 narrates
-        // (Always), the open c2 is Disabled — the completion still reports c1
-        // and the c1 gate holds.
+    fn backgrounded_turn_completion_is_not_narrated_into_the_open_conversation() {
+        // TUI-4 / GTK-2 convergence: when the originating conversation (c1,
+        // Adele=Always) is backgrounded — the user switched to c2 mid-stream —
+        // its completion touches NOTHING in the open chat and emits no narration.
+        // The reply is persisted daemon-side and re-appears when c1 is reopened.
+        //
+        // This is a deliberate behavior change adopting the shared reducer's
+        // semantics: the pre-migration TUI narrated a backgrounded reply per its
+        // origin's gate even while another conversation was on screen.
         let mut app = app_with_open_conversation("c1");
         app.set_adele_output("c1", AdeleOutput::Always);
         app.apply_prompt_ack("task-1".into(), "c1".into());
-        app.load_conversation(detail("c2"));
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "req-1".into(),
+            chunk: "partial".into(),
+        });
+        app.load_conversation(detail("c2")); // switch away mid-stream
 
-        let origin = app.complete_streaming("req-1", "spoken reply");
-        assert_eq!(origin.as_deref(), Some("c1"));
-        assert!(app.narrate_for("c1"), "origin's gate holds");
+        let controller = app.apply_core(UiMessage::StreamComplete {
+            request_id: "req-1".into(),
+            full_response: "spoken reply".into(),
+        });
+
+        assert!(
+            !controller.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "a backgrounded turn must not be narrated into the open chat: {controller:?}"
+        );
+        assert!(
+            app.current_conversation
+                .as_ref()
+                .unwrap()
+                .messages
+                .is_empty(),
+            "and it must not append to the open (c2) transcript"
+        );
+        // The gate predicate itself is unchanged and still origin-keyed.
+        assert!(app.narrate_for("c1"), "origin's gate still holds");
         assert!(!app.narrate_for("c2"), "open conversation stays silent");
     }
 

@@ -48,6 +48,7 @@ use adele::{
     client_tools, connections, credentials, kb, model_selector, personality_selector, picker,
     purposes, screen, ui, voice,
 };
+use client_ui_common::{Effect, UiMessage};
 
 const DEFAULT_WS_URL: &str = desktop_assistant_client_common::config::DEFAULT_WS_URL;
 const DEFAULT_WS_SUBJECT: &str = desktop_assistant_client_common::config::DEFAULT_WS_SUBJECT;
@@ -1044,6 +1045,36 @@ enum SignalAction {
     RefreshConversations,
 }
 
+/// Run the controller-level effects [`App::apply_core`] bubbled up from a
+/// streaming signal — the ones the view can't perform itself. The streaming arms
+/// emit only [`Effect::Speak`] (reply narration, already gated by core's
+/// `StreamComplete`) and [`Effect::FetchScratchpad`] (a no-op here: the TUI has
+/// no scratchpad pane). The view-level effects were already applied inside
+/// `apply_core`, so they never reach this point; later CC-3 slices (conversation
+/// management) add the conversation/model/task effects and handle them here.
+fn run_stream_controller_effects(
+    effects: Vec<Effect>,
+    voice_daemon: &VoiceController,
+    voice_session: &Option<VoiceSession>,
+    narration_tx: &UnboundedSender<NarrationRequest>,
+) {
+    for effect in effects {
+        match effect {
+            Effect::Speak(text) => {
+                // Reaching here means core's narration gate passed; skip an empty
+                // reply so we don't enqueue silence.
+                if !text.trim().is_empty() {
+                    enqueue_narration(narration_tx, voice_daemon, voice_session, text);
+                }
+            }
+            // The TUI has no scratchpad pane (GTK/KDE only).
+            Effect::FetchScratchpad(_) => {}
+            // No other effect is produced by the streaming arms yet.
+            _ => {}
+        }
+    }
+}
+
 /// Apply one daemon [`SignalEvent`] to `App` (+ voice). Extracted from the main
 /// `select!` so it can be reused by the sub-screen driver (TUI-12): while a modal
 /// screen is open, [`screen::run_screen`] drains the signal stream through this
@@ -1063,63 +1094,75 @@ async fn handle_signal(
     signal: SignalEvent,
 ) -> SignalAction {
     match signal {
-        // A user message was committed and a turn started (#1). For our own send
-        // this dedupes (the bubble was drawn optimistically); for a turn started
-        // elsewhere (a voice turn) in the open conversation it renders the user
-        // bubble and adopts the turn so its reply streams live. All streaming
-        // events now carry `conversation_id` too, but the in-flight slot routes
-        // them by `request_id`, so it is dropped on those arms.
+        // The streaming events (#1) route through the shared core
+        // (`App::apply_core`): the reducer owns the in-flight state machine —
+        // request-id claiming, originating-conversation targeting (TUI-4), and
+        // the reply-narration gate — and emits effects. `apply_core` applies the
+        // view-level effects (transcript, chat status, context fill) onto `App`
+        // in place and returns the controller-level ones (narration) for
+        // `run_stream_controller_effects` to run. The events carry
+        // `conversation_id` too, but the in-flight slot routes the stream arms by
+        // `request_id`, so the reducer drops it there.
         SignalEvent::UserMessageAdded {
             conversation_id,
             request_id,
             content,
         } => {
-            app.user_message_added(&conversation_id, &request_id, &content);
+            let effects = app.apply_core(UiMessage::UserMessageAdded {
+                conversation_id,
+                request_id,
+                content,
+            });
+            run_stream_controller_effects(effects, voice_daemon, voice_session, narration_tx);
         }
         SignalEvent::Chunk {
             request_id, chunk, ..
         } => {
-            app.receive_chunk(&request_id, &chunk);
+            let effects = app.apply_core(UiMessage::StreamChunk { request_id, chunk });
+            run_stream_controller_effects(effects, voice_daemon, voice_session, narration_tx);
         }
         SignalEvent::Complete {
             request_id,
             full_response,
             ..
         } => {
-            // `complete_streaming` reports the ORIGINATING conversation (TUI-4) —
-            // the one the prompt was sent to, not whichever is open now — and the
-            // narration gate (adele-tui#77: `Adele == Always` OR `Adele ==
-            // OnDemand` AND `You == Enabled`) is evaluated against THAT
-            // conversation's settings. Routed daemon-first + chunked through the
-            // single narration queue (TUI-11) so it can't interleave with a
-            // `say_this` aside; the queue task speaks it so synth never blocks the
-            // UI. Gated entirely here so the cut-off holds: when the gate is false
-            // nothing is spoken on any path.
-            // An adopted external turn (a voice turn, or another client) is
-            // narrated by its originator — tui must not also speak it. Capture
-            // the flag before `complete_streaming` resets it.
-            let was_external = app.streaming_is_external;
-            let origin = app.complete_streaming(&request_id, &full_response);
-            if let Some(origin) = origin
-                && !was_external
-                && app.narrate_for(&origin)
-                && !full_response.trim().is_empty()
-            {
-                enqueue_narration(narration_tx, voice_daemon, voice_session, full_response);
-            }
+            // The whole narration gate — TUI-4 originating-conversation
+            // targeting, the adele-tui#77 `Adele`-level gate (`Always` OR
+            // `OnDemand` AND `You == Enabled`), external-turn suppression, and the
+            // `say_this` dedupe — now lives in core's `StreamComplete`, which
+            // emits a `Speak` effect when (and only when) the reply should be
+            // spoken. `run_stream_controller_effects` routes that through the
+            // single narration queue (TUI-11) so synth never blocks the UI and a
+            // `say_this` aside can't interleave.
+            let effects = app.apply_core(UiMessage::StreamComplete {
+                request_id,
+                full_response,
+            });
+            run_stream_controller_effects(effects, voice_daemon, voice_session, narration_tx);
         }
         SignalEvent::Error {
             request_id, error, ..
         } => {
-            app.streaming_error(&request_id, &error);
+            let effects = app.apply_core(UiMessage::StreamError {
+                request_id,
+                error: error.clone(),
+            });
+            run_stream_controller_effects(effects, voice_daemon, voice_session, narration_tx);
+            // The reducer surfaces "Error: …" in the status line only for the
+            // matching in-flight stream; set it unconditionally too so an error
+            // for an already-resolved request still reaches the user.
             app.status_message = format!("Error: {error}");
         }
         SignalEvent::Status {
-            request_id: _,
+            request_id,
             message,
             ..
         } => {
-            app.set_assistant_status(message);
+            let effects = app.apply_core(UiMessage::AssistantStatus {
+                request_id,
+                message,
+            });
+            run_stream_controller_effects(effects, voice_daemon, voice_session, narration_tx);
         }
         SignalEvent::ContextUsage {
             conversation_id,
@@ -1128,14 +1171,13 @@ async fn handle_signal(
             budget_tokens,
             compaction_active,
         } => {
-            app.set_context_usage(
-                &conversation_id,
-                adele::app::ContextUsageView {
-                    used_tokens,
-                    budget_tokens,
-                    compaction_active,
-                },
-            );
+            let effects = app.apply_core(UiMessage::ContextUsage {
+                conversation_id,
+                used_tokens,
+                budget_tokens,
+                compaction_active,
+            });
+            run_stream_controller_effects(effects, voice_daemon, voice_session, narration_tx);
         }
         SignalEvent::TitleChanged {
             conversation_id,

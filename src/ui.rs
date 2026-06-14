@@ -413,9 +413,9 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         // when the in-flight stream belongs to THIS conversation (TUI-4): a
         // backgrounded turn keeps buffering invisibly and re-appears when the
         // user switches back to its conversation.
-        if !app.streaming_buffer.is_empty() && app.streaming_is_for_current() {
+        if !app.streaming_buffer().is_empty() && app.streaming_is_active_for_view() {
             let style = Style::default().fg(theme().ok);
-            push_assistant_markdown(&mut lines, &app.streaming_buffer, style);
+            push_assistant_markdown(&mut lines, app.streaming_buffer(), style);
             // Cursor on last line
             if let Some(last) = lines.last_mut() {
                 last.spans.push(Span::styled("▌", style));
@@ -765,18 +765,25 @@ mod tests {
 
     #[test]
     fn draw_with_streaming_buffer_does_not_panic() {
+        use client_ui_common::UiMessage;
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
-        app.current_conversation = Some(ConversationDetail {
+        // `load_conversation` dual-writes the open-conversation id into core so
+        // the in-flight stream is active for the view; the chunk then buffers and
+        // paints through the same render guard production uses.
+        app.load_conversation(ConversationDetail {
             id: "1".into(),
             title: "Test".into(),
             messages: vec![],
             model_selection: None,
             conversation_personality: None,
         });
-        app.start_streaming("req1".into(), "1".into());
-        app.receive_chunk("req1", "Partial response...");
+        app.apply_prompt_ack("task1".into(), "1".into());
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "req1".into(),
+            chunk: "Partial response...".into(),
+        });
         terminal.draw(|f| draw(f, &mut app)).unwrap();
     }
 
