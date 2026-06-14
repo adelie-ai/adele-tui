@@ -12,6 +12,7 @@ dependencies = [
  "adele-voice-vad-silero",
  "anyhow",
  "clap",
+ "client-ui-common",
  "crossterm",
  "desktop-assistant-api-model",
  "desktop-assistant-client-common",
@@ -1154,6 +1155,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "client-ui-common"
+version = "0.1.0"
+dependencies = [
+ "adele-voice-client-common",
+ "desktop-assistant-api-model",
+ "desktop-assistant-client-common",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1487,7 +1499,6 @@ dependencies = [
 [[package]]
 name = "desktop-assistant-api-model"
 version = "0.1.0"
-source = "git+https://github.com/adelie-ai/desktop-assistant.git?branch=main#41ea81311efa2e028da571744fb2e9c580066ec6"
 dependencies = [
  "desktop-assistant-core",
  "serde",
@@ -1497,7 +1508,6 @@ dependencies = [
 [[package]]
 name = "desktop-assistant-auth-jwt"
 version = "0.1.0"
-source = "git+https://github.com/adelie-ai/desktop-assistant.git?branch=main#41ea81311efa2e028da571744fb2e9c580066ec6"
 dependencies = [
  "anyhow",
  "jsonwebtoken",
@@ -1508,7 +1518,6 @@ dependencies = [
 [[package]]
 name = "desktop-assistant-client-common"
 version = "0.1.0"
-source = "git+https://github.com/adelie-ai/desktop-assistant.git?branch=main#41ea81311efa2e028da571744fb2e9c580066ec6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1529,7 +1538,6 @@ dependencies = [
 [[package]]
 name = "desktop-assistant-core"
 version = "0.1.0"
-source = "git+https://github.com/adelie-ai/desktop-assistant.git?branch=main#41ea81311efa2e028da571744fb2e9c580066ec6"
 dependencies = [
  "async-trait",
  "backon",
@@ -1547,7 +1555,6 @@ dependencies = [
 [[package]]
 name = "desktop-assistant-frame-codec"
 version = "0.1.0"
-source = "git+https://github.com/adelie-ai/desktop-assistant.git?branch=main#41ea81311efa2e028da571744fb2e9c580066ec6"
 dependencies = [
  "tokio",
 ]

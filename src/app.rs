@@ -7,84 +7,9 @@ use ratatui_textarea::{CursorMove, DataCursor, TextArea};
 
 use crate::tasks::TaskPane;
 
-/// Context-window fill for the current conversation (desktop-assistant#341).
-/// Mirrors the daemon's `SignalEvent::ContextUsage` — token COUNTS only, no
-/// content. Drives the read-only status-bar indicator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ContextUsageView {
-    pub used_tokens: u64,
-    pub budget_tokens: u64,
-    pub compaction_active: bool,
-}
-
-/// Colour bucket for the context-fill indicator, decided by the daemon's
-/// proactive-compaction line (0.85 of budget). Green below 0.85, amber from
-/// 0.85 up to budget, red at/over budget (overflow).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContextFillLevel {
-    Green,
-    Amber,
-    Red,
-}
-
-/// The proactive-compaction ratio the daemon uses (`COMPACTION_TOKEN_RATIO`).
-/// Kept in sync deliberately — this is the colour-threshold contract, not a
-/// recomputation of the budget (the daemon owns the numbers).
-const COMPACTION_RATIO: f64 = 0.85;
-
-impl ContextUsageView {
-    /// Fraction of budget consumed (0.0..). May exceed 1.0 on overflow.
-    /// Returns 0.0 for a zero/unknown budget to avoid a divide-by-zero and
-    /// to render neutrally rather than imply false precision.
-    pub fn fraction(&self) -> f64 {
-        if self.budget_tokens == 0 {
-            0.0
-        } else {
-            self.used_tokens as f64 / self.budget_tokens as f64
-        }
-    }
-
-    pub fn level(&self) -> ContextFillLevel {
-        let f = self.fraction();
-        if f >= 1.0 {
-            ContextFillLevel::Red
-        } else if f >= COMPACTION_RATIO {
-            // Inclusive at exactly 0.85: the daemon's strict-`>` compaction
-            // gate means we are AT the line, the moment to warn (amber).
-            ContextFillLevel::Amber
-        } else {
-            ContextFillLevel::Green
-        }
-    }
-
-    /// Compact human readout, e.g. `12k / 32k (38%)`. A trailing `⟳` marks an
-    /// active compaction/windowing pass. Budgets below 10k show exact counts;
-    /// larger ones are abbreviated to `k` for width.
-    pub fn readout(&self) -> String {
-        let pct = (self.fraction() * 100.0).round() as u64;
-        let mut s = format!(
-            "{} / {} ({pct}%)",
-            abbrev_tokens(self.used_tokens),
-            abbrev_tokens(self.budget_tokens),
-        );
-        if self.compaction_active {
-            s.push_str(" ⟳");
-        }
-        s
-    }
-}
-
-/// Abbreviate a token count for the narrow status bar: `12000 -> "12k"`,
-/// `512 -> "512"`. One decimal under 10k-with-fraction is avoided to keep it
-/// terse; this is a glanceable instrument, not an accounting figure.
-fn abbrev_tokens(n: u64) -> String {
-    if n >= 1_000 {
-        format!("{}k", n / 1_000)
-    } else {
-        n.to_string()
-    }
-}
-
+/// Context-window fill view + colour bucket (#341), shared via client-ui-common;
+/// re-exported so existing crate::app::ContextUsageView paths in ui.rs/main.rs resolve.
+pub use client_ui_common::{ContextFillLevel, ContextUsageView};
 fn new_textarea() -> TextArea<'static> {
     let mut ta = TextArea::default();
     ta.set_cursor_line_style(Style::default());
