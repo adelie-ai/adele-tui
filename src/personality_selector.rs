@@ -33,7 +33,12 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
+use crate::in_flight::InFlight;
 use crate::screen::Screen;
+
+/// Result of the off-loop `set_conversation_personality` RPC (modal-freeze fix):
+/// the stored override, or a user-facing error string.
+type SaveResult = Result<ConversationPersonalityView, String>;
 
 const COLOR_BORDER: Color = Color::Rgb(82, 104, 173);
 const COLOR_TITLE: Color = Color::Rgb(166, 182, 255);
@@ -158,6 +163,9 @@ struct State {
 struct PersonalityScreen<'a> {
     state: State,
     client: &'a TransportClient,
+    /// In-flight `set_conversation_personality` RPC, polled off the draw loop by
+    /// `poll_pending` so the picker never freezes while saving.
+    pending: InFlight<'a, SaveResult>,
 }
 
 impl Screen for PersonalityScreen<'_> {
@@ -167,12 +175,25 @@ impl Screen for PersonalityScreen<'_> {
         draw(frame, &self.state);
     }
 
-    async fn handle_key(&mut self, key: KeyEvent) {
-        handle_key(&mut self.state, key, self.client).await;
+    fn handle_key(&mut self, key: KeyEvent) -> impl std::future::Future<Output = ()> {
+        // Synchronous: a save enqueues an off-loop RPC into `pending` instead of
+        // awaiting it here, so the key handler never blocks the draw/input loop.
+        handle_key(&mut self.state, key, self.client, &mut self.pending);
+        std::future::ready(())
     }
 
     fn take_outcome(&mut self) -> Option<Outcome> {
         self.state.outcome.take()
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    async fn poll_pending(&mut self) {
+        if let Some(result) = self.pending.next().await {
+            apply_save_result(&mut self.state, result);
+        }
     }
 }
 
@@ -194,12 +215,18 @@ pub async fn run(
             outcome: None,
         },
         client,
+        pending: InFlight::new(),
     };
 
     crate::screen::run_screen(terminal, &mut screen, signal_rx, sink).await
 }
 
-async fn handle_key(state: &mut State, key: KeyEvent, client: &TransportClient) {
+fn handle_key<'a>(
+    state: &mut State,
+    key: KeyEvent,
+    client: &'a TransportClient,
+    pending: &mut InFlight<'a, SaveResult>,
+) {
     match (key.code, key.modifiers) {
         (KeyCode::Esc | KeyCode::Char('q'), m) if m.is_empty() => {
             state.outcome = Some(Outcome::Cancelled);
@@ -208,7 +235,7 @@ async fn handle_key(state: &mut State, key: KeyEvent, client: &TransportClient) 
         (KeyCode::Char('k') | KeyCode::Up, m) if m.is_empty() => advance(state, -1),
         (KeyCode::Char('l') | KeyCode::Right, m) if m.is_empty() => cycle_selected(state, true),
         (KeyCode::Char('h') | KeyCode::Left, m) if m.is_empty() => cycle_selected(state, false),
-        (KeyCode::Enter, m) if m.is_empty() => save(state, client).await,
+        (KeyCode::Enter, m) if m.is_empty() => save(state, pending, client),
         _ => {}
     }
 }
@@ -239,28 +266,39 @@ fn cycle_selected(state: &mut State, forward: bool) {
     (t.set)(&mut state.draft, next);
 }
 
-async fn save(state: &mut State, client: &TransportClient) {
-    let Some(commands) = client.as_commands() else {
-        state.error = Some(
-            "Personality selection isn't available over D-Bus — switch transport with --transport ws or the local socket"
-                .into(),
-        );
-        return;
-    };
+/// Enqueue a personality save as an off-loop RPC (modal-freeze fix). Sets the
+/// `busy` line and returns immediately; the result is applied by
+/// `apply_save_result` once `poll_pending` resolves it.
+fn save<'a>(
+    state: &mut State,
+    pending: &mut InFlight<'a, SaveResult>,
+    client: &'a TransportClient,
+) {
     state.busy = Some("Saving personality...".into());
     state.error = None;
-    match commands
-        .set_conversation_personality(&state.conversation_id, state.draft)
-        .await
-    {
-        Ok(stored) => {
-            state.busy = None;
-            state.outcome = Some(Outcome::Saved(stored));
+    let conversation_id = state.conversation_id.clone();
+    let draft = state.draft;
+    pending.push(async move {
+        match client.as_commands() {
+            Some(commands) => commands
+                .set_conversation_personality(&conversation_id, draft)
+                .await
+                .map_err(|e| format!("Failed to save personality: {e}")),
+            None => Err(
+                "Personality selection isn't available over D-Bus — switch transport with --transport ws or the local socket"
+                    .into(),
+            ),
         }
-        Err(e) => {
-            state.busy = None;
-            state.error = Some(format!("Failed to save personality: {e}"));
-        }
+    });
+}
+
+/// Apply a resolved personality-save RPC to the picker state. On success this
+/// sets the `Saved` outcome, which closes the screen on the next loop turn.
+fn apply_save_result(state: &mut State, result: SaveResult) {
+    state.busy = None;
+    match result {
+        Ok(stored) => state.outcome = Some(Outcome::Saved(stored)),
+        Err(e) => state.error = Some(e),
     }
 }
 
