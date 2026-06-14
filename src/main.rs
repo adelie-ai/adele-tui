@@ -144,9 +144,13 @@ impl From<CliArgs> for ConnectionConfig {
             ws_login_password: None,
             ws_subject,
             socket_path,
-            // Mint the socket-handshake JWT locally (#101/#316), not over the
-            // deprecated D-Bus path (see `Profile::to_connection_config`).
-            minter_socket: desktop_assistant_client_common::minter::default_minter_socket_path(),
+            // Mint the UDS handshake JWT locally (#101/#316), not over the
+            // deprecated D-Bus path. UDS-only — see `Profile::to_connection_config`.
+            minter_socket: if matches!(transport_mode, TransportMode::Uds) {
+                desktop_assistant_client_common::minter::default_minter_socket_path()
+            } else {
+                None
+            },
             ..Default::default()
         }
     }
