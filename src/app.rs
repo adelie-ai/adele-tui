@@ -1,11 +1,16 @@
-use std::collections::HashMap;
-
 use desktop_assistant_api_model::TaskId;
 pub use desktop_assistant_client_common::{ChatMessage, ConversationDetail, ConversationSummary};
 use ratatui::style::Style;
 use ratatui_textarea::{CursorMove, DataCursor, TextArea};
 
 use crate::tasks::TaskPane;
+
+// The shared, view-agnostic model+controller (client-ui-common). `App` embeds a
+// `WindowState` as `core` and is migrating its chat-core state onto it slice by
+// slice (CC-3). First slice: per-conversation voice state lives in `core`;
+// `App`'s voice methods are thin wrappers that read core's accessors and route
+// writes through `core.apply(...)`.
+use client_ui_common::{UiMessage, WindowState};
 
 /// Context-window fill view + colour bucket (#341), shared via client-ui-common;
 /// re-exported so existing crate::app::ContextUsageView paths in ui.rs/main.rs resolve.
@@ -199,21 +204,15 @@ pub struct App {
     /// actually closes the loop; this is purely so the status bar can
     /// say "cancelling t-1..." while we wait.
     pub pending_task_cancel: Option<TaskId>,
-    /// Per-conversation `You:` (voice input) state (adele-tui#77, mirroring
-    /// adele-gtk#80). Keyed by conversation id; a conversation absent from the
-    /// map is **Disabled** (type only). When `true` (Enabled), a push-to-talk
-    /// control is available and — combined with `Adele == OnDemand` — gates
-    /// reply narration. Toggled in-app with `Ctrl+V`. Per-conversation, so
-    /// enabling it in one conversation never affects another.
-    voice_in: HashMap<String, bool>,
-    /// Per-conversation `Adele:` (voice output) level (adele-tui#77, mirroring
-    /// adele-gtk#80). Keyed by conversation id; a conversation absent from the
-    /// map is `Disabled` (never speaks). Set by the user (`Ctrl+S` cycles it) or
-    /// the model (`request_voice` → OnDemand, `stop_voice` → Disabled). Decides
-    /// reply narration (with `You`), the `say_this` aside gate, and the send-time
-    /// `system_refinement`. Replaces phase-1/2's `speech_enabled` (read-aloud ==
-    /// Always) and `voice_mode` (== OnDemand) toggles.
-    adele_output: HashMap<String, AdeleOutput>,
+    /// The shared, view-agnostic model+controller (client-ui-common). `App` is
+    /// migrating its chat-core state onto it slice by slice (CC-3). Currently it
+    /// owns the per-conversation voice state (`You:` input enablement and
+    /// `Adele:` output level, adele-tui#77 / adele-gtk#80) — both default to
+    /// Disabled for an absent conversation and never bleed across conversations.
+    /// `App`'s voice methods read core's accessors and route writes through
+    /// `core.apply(...)`. The remaining `core` fields are not yet authoritative
+    /// for the TUI and stay at their defaults until later slices adopt them.
+    core: WindowState,
 }
 
 impl App {
@@ -251,8 +250,7 @@ impl App {
             pending_model_override: None,
             tasks: TaskPane::new(),
             pending_task_cancel: None,
-            voice_in: HashMap::new(),
-            adele_output: HashMap::new(),
+            core: WindowState::default(),
         }
     }
 
@@ -275,7 +273,7 @@ impl App {
     /// Whether `You:` (voice input) is Enabled for `conversation_id`. A
     /// conversation absent from the map is Disabled (the default).
     pub fn voice_in_for(&self, conversation_id: &str) -> bool {
-        self.voice_in.get(conversation_id).copied().unwrap_or(false)
+        self.core.voice_in_for(conversation_id)
     }
 
     /// Whether `You:` is Enabled for the currently-open conversation. `false`
@@ -290,18 +288,25 @@ impl App {
     /// (used by the `Ctrl+V` keybind). `None` when no conversation is open.
     pub fn toggle_current_voice_in(&mut self) -> Option<bool> {
         let conv_id = self.current_conversation.as_ref()?.id.clone();
-        let next = !self.voice_in_for(&conv_id);
-        self.voice_in.insert(conv_id, next);
+        let next = !self.core.voice_in_for(&conv_id);
+        self.set_voice_in(&conv_id, next);
         Some(next)
+    }
+
+    /// Set `You:` (voice input) for an explicit `conversation_id`.
+    /// Per-conversation: only the named conversation is affected. Mirrors
+    /// [`Self::set_adele_output`]; routes the write through `core.apply`.
+    pub fn set_voice_in(&mut self, conversation_id: &str, enabled: bool) {
+        self.core.apply(UiMessage::SetVoiceIn {
+            conversation_id: conversation_id.to_string(),
+            enabled,
+        });
     }
 
     /// The `Adele:` (voice output) level for `conversation_id`. `Disabled` when
     /// the conversation was never set (the default).
     pub fn adele_output_for(&self, conversation_id: &str) -> AdeleOutput {
-        self.adele_output
-            .get(conversation_id)
-            .copied()
-            .unwrap_or_default()
+        self.core.adele_output_for(conversation_id)
     }
 
     /// The `Adele:` level for the currently-open conversation. `Disabled` when
@@ -318,7 +323,10 @@ impl App {
     /// their own conversation). Per-conversation: only the named conversation is
     /// affected.
     pub fn set_adele_output(&mut self, conversation_id: &str, level: AdeleOutput) {
-        self.adele_output.insert(conversation_id.to_string(), level);
+        self.core.apply(UiMessage::SetAdeleOutput {
+            conversation_id: conversation_id.to_string(),
+            level,
+        });
     }
 
     /// Cycle `Adele:` for the currently-open conversation
@@ -326,8 +334,8 @@ impl App {
     /// (used by the `Ctrl+S` keybind). `None` when no conversation is open.
     pub fn cycle_current_adele_output(&mut self) -> Option<AdeleOutput> {
         let conv_id = self.current_conversation.as_ref()?.id.clone();
-        let next = self.adele_output_for(&conv_id).next();
-        self.adele_output.insert(conv_id, next);
+        let next = self.core.adele_output_for(&conv_id).next();
+        self.set_adele_output(&conv_id, next);
         Some(next)
     }
 
@@ -336,8 +344,7 @@ impl App {
     /// `You == Enabled`). `Disabled` never narrates. Delegates to the shared
     /// gate (desktop-assistant#274).
     pub fn narrate_for(&self, conversation_id: &str) -> bool {
-        self.adele_output_for(conversation_id)
-            .narrates_reply(self.voice_in_for(conversation_id))
+        self.core.narrate_for(conversation_id)
     }
 
     /// Whether a `say_this` aside is spoken for `conversation_id` (adele-tui#77):
@@ -345,7 +352,7 @@ impl App {
     /// downgrades the aside to inline text. Delegates to the shared gate
     /// (desktop-assistant#274).
     pub fn say_this_spoken_for(&self, conversation_id: &str) -> bool {
-        self.adele_output_for(conversation_id).speaks_aside()
+        self.core.say_this_spoken_for(conversation_id)
     }
 
     /// Render a `say_this` call whose aside is NOT spoken (Adele == Disabled) as
@@ -2687,7 +2694,7 @@ mod tests {
         // Always reads every reply aloud whether or not You is Enabled.
         for you in [false, true] {
             let mut app = app_with_open_conversation("c1");
-            app.voice_in.insert("c1".to_string(), you);
+            app.set_voice_in("c1", you);
             app.set_adele_output("c1", AdeleOutput::Always);
             assert!(app.narrate_for("c1"), "Always must narrate (You={you})");
             assert!(
@@ -2704,7 +2711,7 @@ mod tests {
         app.set_adele_output("c1", AdeleOutput::OnDemand);
 
         // You Disabled → reply text-only, but say_this aside still spoken.
-        app.voice_in.insert("c1".to_string(), false);
+        app.set_voice_in("c1", false);
         assert!(
             !app.narrate_for("c1"),
             "OnDemand + You=Disabled: no narration"
@@ -2715,7 +2722,7 @@ mod tests {
         );
 
         // You Enabled → reply narrated.
-        app.voice_in.insert("c1".to_string(), true);
+        app.set_voice_in("c1", true);
         assert!(app.narrate_for("c1"), "OnDemand + You=Enabled narrates");
         assert!(app.say_this_spoken_for("c1"));
     }
@@ -2725,7 +2732,7 @@ mod tests {
         let mut app = app_with_open_conversation("c1");
         app.set_adele_output("c1", AdeleOutput::Disabled);
         for you in [false, true] {
-            app.voice_in.insert("c1".to_string(), you);
+            app.set_voice_in("c1", you);
             assert!(
                 !app.narrate_for("c1"),
                 "Disabled never narrates (You={you})"
@@ -2741,7 +2748,7 @@ mod tests {
     fn set_voice_in_targets_an_explicit_conversation() {
         // The model's tools / the streaming path carry their own conversation id.
         let mut app = app_with_open_conversation("c1");
-        app.voice_in.insert("c2".to_string(), true);
+        app.set_voice_in("c2", true);
         assert!(app.voice_in_for("c2"));
         assert!(!app.voice_in_for("c1")); // open conversation untouched
     }
