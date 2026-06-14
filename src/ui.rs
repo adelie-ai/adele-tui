@@ -802,6 +802,38 @@ mod tests {
     }
 
     #[test]
+    fn draw_input_border_recolors_to_warn_only_when_disconnected() {
+        // The disconnect cue is two-channel: the text tag (asserted above, the
+        // NO_COLOR-safe channel) *and* a warn-recolored input border. `warn` is
+        // unique among the palette's border colors, so a warn-colored border
+        // glyph appears iff the link is down — letting us assert the recolor
+        // directly rather than only the tag.
+        fn input_border_has_warn(app: &mut App) -> bool {
+            let backend = TestBackend::new(80, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| draw(f, app)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            buf.content.iter().any(|c| {
+                matches!(c.symbol(), "┌" | "┐" | "└" | "┘" | "│" | "─") && c.fg == theme().warn
+            })
+        }
+
+        let mut offline = App::new();
+        offline.connected = false;
+        assert!(
+            input_border_has_warn(&mut offline),
+            "a disconnected input border must be warn-colored"
+        );
+
+        let mut online = App::new();
+        // App::new() defaults connected = true.
+        assert!(
+            !input_border_has_warn(&mut online),
+            "no border should be warn-colored while connected"
+        );
+    }
+
+    #[test]
     fn draw_small_terminal_does_not_panic() {
         let backend = TestBackend::new(20, 8);
         let mut terminal = Terminal::new(backend).unwrap();

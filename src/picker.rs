@@ -1187,4 +1187,85 @@ mod tests {
         assert_eq!(state.store.profiles.len(), 1);
         assert_eq!(state.mode, Mode::DeleteConfirm);
     }
+
+    #[test]
+    fn delete_confirm_enter_confirms() {
+        // Enter is a second confirm binding alongside `y`; guard it so a
+        // refactor of the match arm can't silently drop it.
+        let p = Profile::new(
+            "Solo".into(),
+            TransportMode::Ws,
+            "ws://x".into(),
+            "s".into(),
+        );
+        let mut state = make_state(vec![p]);
+        state.mode = Mode::DeleteConfirm;
+        handle_delete_key(&mut state, key(KeyCode::Enter));
+        assert!(state.store.profiles.is_empty());
+    }
+
+    #[test]
+    fn delete_confirm_uppercase_y_confirms() {
+        // The confirm matrix is case-insensitive (`y`/`Y`).
+        let p = Profile::new(
+            "Solo".into(),
+            TransportMode::Ws,
+            "ws://x".into(),
+            "s".into(),
+        );
+        let mut state = make_state(vec![p]);
+        state.mode = Mode::DeleteConfirm;
+        handle_delete_key(&mut state, key(KeyCode::Char('Y')));
+        assert!(state.store.profiles.is_empty());
+    }
+
+    #[test]
+    fn delete_confirm_uppercase_n_cancels() {
+        // The cancel matrix is case-insensitive (`n`/`N`).
+        let p = Profile::new(
+            "Solo".into(),
+            TransportMode::Ws,
+            "ws://x".into(),
+            "s".into(),
+        );
+        let mut state = make_state(vec![p]);
+        state.mode = Mode::DeleteConfirm;
+        handle_delete_key(&mut state, key(KeyCode::Char('N')));
+        assert_eq!(state.store.profiles.len(), 1);
+        assert_eq!(state.mode, Mode::List);
+    }
+
+    #[test]
+    fn delete_confirm_with_multiple_profiles_returns_to_list_and_clamps_selection() {
+        // Deleting the last-selected of several profiles must keep the picker in
+        // the list (not fall back to the new-profile form) and clamp `selected`
+        // so it still points at a live row.
+        let alpha = Profile::new(
+            "Alpha".into(),
+            TransportMode::Ws,
+            "ws://a".into(),
+            "s".into(),
+        );
+        let beta = Profile::new(
+            "Beta".into(),
+            TransportMode::Ws,
+            "ws://b".into(),
+            "s".into(),
+        );
+        let mut state = make_state(vec![alpha, beta]);
+        state.selected = 1; // Beta, the last row
+        state.mode = Mode::DeleteConfirm;
+        handle_delete_key(&mut state, key(KeyCode::Char('y')));
+        assert_eq!(state.store.profiles.len(), 1);
+        assert_eq!(
+            state.store.profiles[0].name, "Alpha",
+            "the unselected profile survives"
+        );
+        assert_eq!(
+            state.mode,
+            Mode::List,
+            "stays in the list while profiles remain"
+        );
+        assert_eq!(state.selected, 0, "selection clamps to a valid row");
+    }
 }
