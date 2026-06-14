@@ -28,7 +28,7 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
@@ -40,16 +40,7 @@ use crate::screen::Screen;
 /// the stored override, or a user-facing error string.
 type SaveResult = Result<ConversationPersonalityView, String>;
 
-const COLOR_BORDER: Color = Color::Rgb(82, 104, 173);
-const COLOR_TITLE: Color = Color::Rgb(166, 182, 255);
-const COLOR_HINT_KEY: Color = Color::Rgb(216, 223, 236);
-const COLOR_HINT_DESC: Color = Color::Rgb(143, 153, 174);
-const COLOR_HINT_SEP: Color = Color::Rgb(82, 90, 110);
-const COLOR_LIST_HIGHLIGHT: Color = Color::Rgb(72, 102, 180);
-const COLOR_LIST_HIGHLIGHT_FG: Color = Color::Rgb(245, 248, 255);
-const COLOR_ERROR: Color = Color::Rgb(232, 130, 130);
-const COLOR_GLOBAL: Color = Color::Rgb(143, 153, 174);
-const COLOR_PINNED: Color = Color::Rgb(255, 207, 119);
+use crate::theme::theme;
 
 /// The seven traits in their canonical wire order. Each entry pairs a display
 /// label with getters/setters into a [`ConversationPersonalityView`], so the
@@ -343,12 +334,12 @@ fn draw_header(f: &mut Frame, area: Rect) {
         Line::from(Span::styled(
             "Personality for this conversation",
             Style::default()
-                .fg(COLOR_TITLE)
+                .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             "Global inherits your default; any level pins it here.",
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         )),
     ];
     f.render_widget(Paragraph::new(lines), area);
@@ -361,10 +352,10 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
         .map(|t| {
             let level = (t.get)(&state.draft);
             let value_style = if level.is_none() {
-                Style::default().fg(COLOR_GLOBAL)
+                Style::default().fg(theme().text_dim)
             } else {
                 Style::default()
-                    .fg(COLOR_PINNED)
+                    .fg(theme().pinned)
                     .add_modifier(Modifier::BOLD)
             };
             let spans = vec![
@@ -373,9 +364,9 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("   ", Style::default()),
-                Span::styled("◂ ", Style::default().fg(COLOR_HINT_SEP)),
+                Span::styled("◂ ", Style::default().fg(theme().hint_sep)),
                 Span::styled(format!("{:^9}", level_label(level)), value_style),
-                Span::styled(" ▸", Style::default().fg(COLOR_HINT_SEP)),
+                Span::styled(" ▸", Style::default().fg(theme().hint_sep)),
             ];
             ListItem::new(Line::from(spans))
         })
@@ -385,18 +376,18 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BORDER))
+                .border_style(Style::default().fg(theme().border))
                 .title(Line::from(Span::styled(
                     "Traits",
                     Style::default()
-                        .fg(COLOR_TITLE)
+                        .fg(theme().title)
                         .add_modifier(Modifier::BOLD),
                 ))),
         )
         .highlight_style(
             Style::default()
-                .bg(COLOR_LIST_HIGHLIGHT)
-                .fg(COLOR_LIST_HIGHLIGHT_FG)
+                .bg(theme().list_highlight)
+                .fg(theme().list_highlight_fg)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ");
@@ -409,14 +400,14 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
 fn draw_status(f: &mut Frame, state: &State, area: Rect) {
     if let Some(busy) = &state.busy {
         let style = Style::default()
-            .fg(Color::Rgb(178, 220, 245))
+            .fg(theme().assistant_indicator)
             .add_modifier(Modifier::ITALIC);
         f.render_widget(
             Paragraph::new(Span::styled(format!(" ● {busy}"), style)),
             area,
         );
     } else if let Some(err) = &state.error {
-        let style = Style::default().fg(COLOR_ERROR);
+        let style = Style::default().fg(theme().error);
         f.render_widget(
             Paragraph::new(Span::styled(format!(" • {err}"), style)),
             area,
@@ -434,18 +425,18 @@ fn draw_hints(f: &mut Frame, area: Rect) {
     let mut spans: Vec<Span> = Vec::new();
     for (idx, (key, desc)) in hints.iter().enumerate() {
         if idx > 0 {
-            spans.push(Span::styled("  ·  ", Style::default().fg(COLOR_HINT_SEP)));
+            spans.push(Span::styled("  ·  ", Style::default().fg(theme().hint_sep)));
         }
         spans.push(Span::styled(
             (*key).to_string(),
             Style::default()
-                .fg(COLOR_HINT_KEY)
+                .fg(theme().hint_key)
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             (*desc).to_string(),
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);

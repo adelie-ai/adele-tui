@@ -21,12 +21,7 @@ use syntect::{
     util::LinesWithEndings,
 };
 
-const COLOR_HEADING: Color = Color::Rgb(166, 182, 255);
-const COLOR_CODE_FG: Color = Color::Rgb(244, 228, 188);
-const COLOR_CODE_BG: Color = Color::Rgb(40, 44, 56);
-const COLOR_LINK: Color = Color::Rgb(132, 204, 232);
-const COLOR_BLOCKQUOTE: Color = Color::Rgb(170, 178, 196);
-const COLOR_TABLE_BORDER: Color = Color::Rgb(82, 90, 110);
+use crate::theme::theme;
 
 /// Theme used for code-block syntax highlighting. `base16-ocean.dark` reads
 /// well on the dark TUI background and ships with syntect by default.
@@ -64,7 +59,7 @@ fn syntax_for_lang<'a>(syntaxes: &'a SyntaxSet, lang: Option<&str>) -> Option<&'
 
 fn synstyle_to_ratatui(style: SynStyle) -> Style {
     let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
-    let mut out = Style::default().fg(fg).bg(COLOR_CODE_BG);
+    let mut out = Style::default().fg(fg).bg(theme().code_bg);
     if style.font_style.contains(FontStyle::BOLD) {
         out = out.add_modifier(Modifier::BOLD);
     }
@@ -166,7 +161,7 @@ impl Renderer {
                 self.flush_line();
                 self.lines.push(Line::from(Span::styled(
                     "─".repeat(40),
-                    Style::default().fg(COLOR_TABLE_BORDER),
+                    Style::default().fg(theme().hint_sep),
                 )));
             }
             Event::TaskListMarker(checked) => {
@@ -357,7 +352,7 @@ impl Renderer {
     }
 
     fn push_inline_code(&mut self, code: &str) {
-        let style = Style::default().fg(COLOR_CODE_FG).bg(COLOR_CODE_BG);
+        let style = Style::default().fg(theme().code_fg).bg(theme().code_bg);
         self.in_code_span = true;
         self.current.push(Span::styled(format!("`{code}`"), style));
         self.in_code_span = false;
@@ -369,7 +364,9 @@ impl Renderer {
             self.current.push(Span::styled(text, style));
             self.current.push(Span::styled(
                 format!(" ({target})"),
-                Style::default().fg(COLOR_LINK).add_modifier(Modifier::DIM),
+                Style::default()
+                    .fg(theme().link)
+                    .add_modifier(Modifier::DIM),
             ));
         } else if self.table.as_ref().is_some_and(|t| t.in_cell) {
             // Cell text is collected into the current cell, not the line buffer.
@@ -388,13 +385,13 @@ impl Renderer {
                 HeadingLevel::H1 => Modifier::BOLD | Modifier::UNDERLINED,
                 _ => Modifier::BOLD,
             };
-            style = style.fg(COLOR_HEADING).add_modifier(extra);
+            style = style.fg(theme().title).add_modifier(extra);
         }
         if self.blockquote_depth > 0 {
-            style = style.fg(COLOR_BLOCKQUOTE).add_modifier(Modifier::ITALIC);
+            style = style.fg(theme().blockquote).add_modifier(Modifier::ITALIC);
         }
         if self.link_target.is_some() {
-            style = style.fg(COLOR_LINK).add_modifier(Modifier::UNDERLINED);
+            style = style.fg(theme().link).add_modifier(Modifier::UNDERLINED);
         }
         if !self.modifier.is_empty() {
             style = style.add_modifier(self.modifier);
@@ -404,7 +401,7 @@ impl Renderer {
 
     fn start_blockquote_line(&mut self) {
         self.current
-            .push(Span::styled("│ ", Style::default().fg(COLOR_BLOCKQUOTE)));
+            .push(Span::styled("│ ", Style::default().fg(theme().blockquote)));
     }
 
     fn flush_line(&mut self) {
@@ -444,11 +441,11 @@ impl Renderer {
                     let trimmed_line = raw_line.trim_end_matches('\n');
                     let mut spans: Vec<Span<'static>> = Vec::with_capacity(regions.len() + 2);
                     // Leading gutter so the bg covers a small left margin.
-                    spans.push(Span::styled(" ", Style::default().bg(COLOR_CODE_BG)));
+                    spans.push(Span::styled(" ", Style::default().bg(theme().code_bg)));
                     if regions.is_empty() {
                         spans.push(Span::styled(
                             trimmed_line.to_string(),
-                            Style::default().fg(COLOR_CODE_FG).bg(COLOR_CODE_BG),
+                            Style::default().fg(theme().code_fg).bg(theme().code_bg),
                         ));
                     } else {
                         for (style, segment) in regions {
@@ -461,13 +458,13 @@ impl Renderer {
                             spans.push(Span::styled(text, synstyle_to_ratatui(style)));
                         }
                     }
-                    spans.push(Span::styled(" ", Style::default().bg(COLOR_CODE_BG)));
+                    spans.push(Span::styled(" ", Style::default().bg(theme().code_bg)));
                     self.lines.push(Line::from(spans));
                 }
             }
             None => {
                 // Unknown language — fall back to the muted plain code style.
-                let style = Style::default().fg(COLOR_CODE_FG).bg(COLOR_CODE_BG);
+                let style = Style::default().fg(theme().code_fg).bg(theme().code_bg);
                 for raw_line in source.split('\n') {
                     self.lines
                         .push(Line::from(Span::styled(format!(" {raw_line} "), style)));
@@ -503,7 +500,7 @@ impl Renderer {
             }
         }
 
-        let border = Style::default().fg(COLOR_TABLE_BORDER);
+        let border = Style::default().fg(theme().hint_sep);
         for (row_idx, row) in t.rows.iter().enumerate() {
             let mut spans: Vec<Span<'static>> = Vec::new();
             for (col_idx, cell) in row.iter().enumerate() {
@@ -600,7 +597,7 @@ mod tests {
         let any_code_styled = lines
             .iter()
             .flat_map(|l| l.spans.iter())
-            .any(|s| s.style.bg == Some(COLOR_CODE_BG) && s.content.contains("let x = 1;"));
+            .any(|s| s.style.bg == Some(theme().code_bg) && s.content.contains("let x = 1;"));
         assert!(
             any_code_styled,
             "expected a span with code bg on the code line"
@@ -674,7 +671,7 @@ mod tests {
         let fgs: std::collections::HashSet<_> = lines
             .iter()
             .flat_map(|l| l.spans.iter())
-            .filter(|s| s.style.bg == Some(COLOR_CODE_BG) && !s.content.trim().is_empty())
+            .filter(|s| s.style.bg == Some(theme().code_bg) && !s.content.trim().is_empty())
             .filter_map(|s| s.style.fg)
             .collect();
         // Highlighted rust should produce more than one distinct fg color
@@ -692,7 +689,7 @@ mod tests {
         let plain_span = lines
             .iter()
             .flat_map(|l| l.spans.iter())
-            .any(|s| s.style.bg == Some(COLOR_CODE_BG) && s.content.contains("literal content"));
+            .any(|s| s.style.bg == Some(theme().code_bg) && s.content.contains("literal content"));
         assert!(plain_span);
     }
 
@@ -702,7 +699,7 @@ mod tests {
         let src = "```\nplain block content\n```\n";
         let lines = render_test(src);
         let plain_span = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
-            s.style.bg == Some(COLOR_CODE_BG) && s.content.contains("plain block content")
+            s.style.bg == Some(theme().code_bg) && s.content.contains("plain block content")
         });
         assert!(plain_span);
     }

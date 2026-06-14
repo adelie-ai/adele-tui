@@ -7,42 +7,24 @@ use ratatui::{
 };
 
 use crate::app::{AdeleOutput, App, InputMode};
+use crate::theme::theme;
 
 const INPUT_VISIBLE_LINES: u16 = 4;
 const INPUT_TOTAL_HEIGHT: u16 = INPUT_VISIBLE_LINES + 2; // +2 for borders
-const COLOR_PANEL_BORDER: Color = Color::Rgb(82, 104, 173);
-const COLOR_LIST_BORDER: Color = Color::Rgb(62, 125, 146);
-const COLOR_INPUT_BORDER_IDLE: Color = Color::Rgb(109, 122, 143);
-const COLOR_INPUT_BORDER_EDIT: Color = Color::Rgb(120, 183, 109);
-const COLOR_LIST_HIGHLIGHT: Color = Color::Rgb(72, 102, 180);
-const COLOR_LIST_HIGHLIGHT_FG: Color = Color::Rgb(245, 248, 255);
-const COLOR_USER_PREFIX: Color = Color::Rgb(255, 189, 89);
-const COLOR_ASSISTANT_PREFIX: Color = Color::Rgb(92, 206, 154);
-const COLOR_ASSISTANT_STREAMING: Color = Color::Rgb(132, 218, 193);
-const COLOR_STATUS_DIM: Color = Color::Rgb(143, 153, 174);
-// Context-fill indicator colours (#341): green well under the 0.85
-// compaction line, amber approaching it, red at/over budget.
-const COLOR_CTX_GREEN: Color = Color::Rgb(122, 200, 132);
-const COLOR_CTX_AMBER: Color = Color::Rgb(232, 184, 96);
-const COLOR_CTX_RED: Color = Color::Rgb(232, 106, 106);
-const COLOR_COUNT_DIM: Color = Color::Rgb(124, 132, 148);
-const COLOR_DEBUG_TOOL: Color = Color::Rgb(178, 138, 220);
-const COLOR_DEBUG_SYSTEM: Color = Color::Rgb(140, 156, 196);
-const COLOR_ASSISTANT_INDICATOR: Color = Color::Rgb(178, 220, 245);
 
 fn mode_chip_style(mode: &InputMode) -> Style {
     match mode {
         InputMode::Normal => Style::default()
             .fg(Color::Black)
-            .bg(Color::Rgb(122, 163, 255))
+            .bg(theme().run)
             .add_modifier(Modifier::BOLD),
         InputMode::Editing => Style::default()
             .fg(Color::Black)
-            .bg(Color::Rgb(120, 214, 118))
+            .bg(theme().mode_edit_bg)
             .add_modifier(Modifier::BOLD),
         InputMode::Renaming => Style::default()
             .fg(Color::Black)
-            .bg(Color::Rgb(255, 189, 89))
+            .bg(theme().user_prefix)
             .add_modifier(Modifier::BOLD),
     }
 }
@@ -92,16 +74,16 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         lines.push(Line::from(Span::styled(
             *section,
             Style::default()
-                .fg(Color::Rgb(166, 182, 255))
+                .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
         )));
         for (key, desc) in *binds {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("  {key:<22}"),
-                    Style::default().fg(Color::Rgb(216, 223, 236)),
+                    Style::default().fg(theme().hint_key),
                 ),
-                Span::styled(*desc, Style::default().fg(Color::Rgb(143, 153, 174))),
+                Span::styled(*desc, Style::default().fg(theme().text_dim)),
             ]));
         }
         lines.push(Line::from(""));
@@ -109,7 +91,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
     lines.push(Line::from(Span::styled(
         "Inside modal screens (KB / connections / purposes), Ctrl+S = save.",
         Style::default()
-            .fg(Color::Rgb(143, 153, 174))
+            .fg(theme().text_dim)
             .add_modifier(Modifier::ITALIC),
     )));
 
@@ -119,11 +101,11 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(82, 104, 173)))
+        .border_style(Style::default().fg(theme().border))
         .title(Line::from(Span::styled(
             " Keys — press any key to close ",
             Style::default()
-                .fg(Color::Rgb(166, 182, 255))
+                .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
         )));
     let para = Paragraph::new(lines)
@@ -153,11 +135,11 @@ fn draw_rename_popup(f: &mut Frame, app: &mut App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(255, 189, 89)))
+        .border_style(Style::default().fg(theme().user_prefix))
         .title(Line::from(Span::styled(
             "Rename (Enter save, Esc cancel)",
             Style::default()
-                .fg(Color::Rgb(255, 220, 160))
+                .fg(theme().rename_title)
                 .add_modifier(Modifier::BOLD),
         )));
 
@@ -184,7 +166,7 @@ fn draw_conversation_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect)
             ));
             spans.push(Span::styled(
                 format!(" ({})", c.message_count),
-                Style::default().fg(COLOR_COUNT_DIM),
+                Style::default().fg(theme().count_dim),
             ));
             ListItem::new(Line::from(spans))
         })
@@ -200,18 +182,18 @@ fn draw_conversation_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_LIST_BORDER))
+                .border_style(Style::default().fg(theme().list_border))
                 .title(Line::from(Span::styled(
                     title,
                     Style::default()
-                        .fg(Color::Rgb(136, 214, 240))
+                        .fg(theme().list_title)
                         .add_modifier(Modifier::BOLD),
                 ))),
         )
         .highlight_style(
             Style::default()
-                .bg(COLOR_LIST_HIGHLIGHT)
-                .fg(COLOR_LIST_HIGHLIGHT_FG)
+                .bg(theme().list_highlight)
+                .fg(theme().list_highlight_fg)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ");
@@ -253,13 +235,13 @@ fn draw_assistant_status(f: &mut Frame, app: &App, area: ratatui::layout::Rect) 
         Span::styled(
             "● ",
             Style::default()
-                .fg(COLOR_ASSISTANT_INDICATOR)
+                .fg(theme().assistant_indicator)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             message,
             Style::default()
-                .fg(COLOR_ASSISTANT_INDICATOR)
+                .fg(theme().assistant_indicator)
                 .add_modifier(Modifier::ITALIC),
         ),
     ]));
@@ -366,32 +348,32 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             // only when the debug view is enabled.
             match msg.role.as_str() {
                 "user" => {
-                    let style = Style::default().fg(COLOR_USER_PREFIX);
+                    let style = Style::default().fg(theme().user_prefix);
                     push_user_message(&mut lines, &msg.content, style);
                     lines.push(Line::from(""));
                 }
                 "assistant" if !msg.content.trim().is_empty() => {
-                    let style = Style::default().fg(COLOR_ASSISTANT_PREFIX);
+                    let style = Style::default().fg(theme().assistant_prefix);
                     push_assistant_markdown(&mut lines, &msg.content, style);
                     lines.push(Line::from(""));
                 }
                 "tool" if app.show_debug => {
                     let style = Style::default()
-                        .fg(COLOR_DEBUG_TOOL)
+                        .fg(theme().debug_tool)
                         .add_modifier(Modifier::DIM | Modifier::ITALIC);
                     push_prefixed_message(&mut lines, "tool: ", &msg.content, style);
                     lines.push(Line::from(""));
                 }
                 "system" if app.show_debug => {
                     let style = Style::default()
-                        .fg(COLOR_DEBUG_SYSTEM)
+                        .fg(theme().debug_system)
                         .add_modifier(Modifier::DIM | Modifier::ITALIC);
                     push_prefixed_message(&mut lines, "system: ", &msg.content, style);
                     lines.push(Line::from(""));
                 }
                 "assistant" if app.show_debug => {
                     let style = Style::default()
-                        .fg(COLOR_ASSISTANT_PREFIX)
+                        .fg(theme().assistant_prefix)
                         .add_modifier(Modifier::DIM | Modifier::ITALIC);
                     push_prefixed_message(&mut lines, "Adele (empty): ", &msg.content, style);
                     lines.push(Line::from(""));
@@ -407,7 +389,7 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         // backgrounded turn keeps buffering invisibly and re-appears when the
         // user switches back to its conversation.
         if !app.streaming_buffer.is_empty() && app.streaming_is_for_current() {
-            let style = Style::default().fg(COLOR_ASSISTANT_STREAMING);
+            let style = Style::default().fg(theme().ok);
             push_assistant_markdown(&mut lines, &app.streaming_buffer, style);
             // Cursor on last line
             if let Some(last) = lines.last_mut() {
@@ -454,11 +436,11 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_PANEL_BORDER))
+        .border_style(Style::default().fg(theme().border))
         .title(Line::from(Span::styled(
             title,
             Style::default()
-                .fg(Color::Rgb(166, 182, 255))
+                .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
         )));
     let inner_width = block.inner(area).width;
@@ -485,12 +467,12 @@ fn draw_input(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let mut display = app.wrapped_display_textarea(wrap_width);
 
     let (title, border_color) = match app.mode {
-        InputMode::Normal => ("Input (press 'i' to edit)", COLOR_INPUT_BORDER_IDLE),
+        InputMode::Normal => ("Input (press 'i' to edit)", theme().input_border_idle),
         InputMode::Editing => (
             "Input (Esc cancel, Enter send, Shift+Enter/Ctrl+J newline)",
-            COLOR_INPUT_BORDER_EDIT,
+            theme().border_active,
         ),
-        InputMode::Renaming => ("Input", COLOR_INPUT_BORDER_IDLE),
+        InputMode::Renaming => ("Input", theme().input_border_idle),
     };
 
     display.set_block(
@@ -499,7 +481,7 @@ fn draw_input(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             .border_style(Style::default().fg(border_color))
             .title(Line::from(Span::styled(
                 title,
-                Style::default().fg(Color::Rgb(216, 223, 236)),
+                Style::default().fg(theme().hint_key),
             ))),
     );
 
@@ -538,7 +520,7 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         return;
     }
     let mut spans: Vec<Span> = Vec::with_capacity(4);
-    spans.push(Span::styled(" • ", Style::default().fg(COLOR_STATUS_DIM)));
+    spans.push(Span::styled(" • ", Style::default().fg(theme().text_dim)));
     spans.push(Span::styled(
         app.status_message.as_str(),
         Style::default().fg(Color::White),
@@ -548,7 +530,7 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         spans.push(Span::styled(
             badge,
             Style::default()
-                .fg(Color::Rgb(122, 163, 255))
+                .fg(theme().run)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -560,10 +542,12 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 /// Pure so the colour-threshold contract is unit-testable without a frame.
 fn context_usage_span(usage: crate::app::ContextUsageView) -> (String, Color) {
     use crate::app::ContextFillLevel;
+    // Context-fill indicator colours (#341): green well under the 0.85
+    // compaction line, amber approaching it, red at/over budget.
     let color = match usage.level() {
-        ContextFillLevel::Green => COLOR_CTX_GREEN,
-        ContextFillLevel::Amber => COLOR_CTX_AMBER,
-        ContextFillLevel::Red => COLOR_CTX_RED,
+        ContextFillLevel::Green => theme().ctx_green,
+        ContextFillLevel::Amber => theme().ctx_amber,
+        ContextFillLevel::Red => theme().ctx_red,
     };
     (usage.readout(), color)
 }
@@ -583,13 +567,13 @@ mod tests {
             compaction_active: false,
         };
         // Green below 0.85.
-        assert_eq!(context_usage_span(mk(12_000, 32_000)).1, COLOR_CTX_GREEN);
+        assert_eq!(context_usage_span(mk(12_000, 32_000)).1, theme().ctx_green);
         // Amber at exactly 0.85 (27_200) and between line and budget.
-        assert_eq!(context_usage_span(mk(27_200, 32_000)).1, COLOR_CTX_AMBER);
-        assert_eq!(context_usage_span(mk(30_000, 32_000)).1, COLOR_CTX_AMBER);
+        assert_eq!(context_usage_span(mk(27_200, 32_000)).1, theme().ctx_amber);
+        assert_eq!(context_usage_span(mk(30_000, 32_000)).1, theme().ctx_amber);
         // Red at/over budget.
-        assert_eq!(context_usage_span(mk(32_000, 32_000)).1, COLOR_CTX_RED);
-        assert_eq!(context_usage_span(mk(40_000, 32_000)).1, COLOR_CTX_RED);
+        assert_eq!(context_usage_span(mk(32_000, 32_000)).1, theme().ctx_red);
+        assert_eq!(context_usage_span(mk(40_000, 32_000)).1, theme().ctx_red);
         // Text carries the readout.
         assert_eq!(context_usage_span(mk(12_000, 32_000)).0, "12k / 32k (38%)");
     }

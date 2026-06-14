@@ -51,17 +51,7 @@ const LIST_LIMIT: u32 = 100;
 const SEARCH_LIMIT: u32 = 50;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 
-const COLOR_BORDER: Color = Color::Rgb(82, 104, 173);
-const COLOR_BORDER_ACTIVE: Color = Color::Rgb(120, 183, 109);
-const COLOR_TITLE: Color = Color::Rgb(166, 182, 255);
-const COLOR_HINT_KEY: Color = Color::Rgb(216, 223, 236);
-const COLOR_HINT_DESC: Color = Color::Rgb(143, 153, 174);
-const COLOR_HINT_SEP: Color = Color::Rgb(82, 90, 110);
-const COLOR_LIST_HIGHLIGHT: Color = Color::Rgb(72, 102, 180);
-const COLOR_LIST_HIGHLIGHT_FG: Color = Color::Rgb(245, 248, 255);
-const COLOR_ERROR: Color = Color::Rgb(232, 130, 130);
-const COLOR_DELETE_BORDER: Color = Color::Rgb(232, 130, 130);
-const COLOR_TIMESTAMP: Color = Color::Rgb(140, 156, 196);
+use crate::theme::theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -618,12 +608,12 @@ fn draw_header(f: &mut Frame, area: Rect) {
         Span::styled(
             "Knowledge base",
             Style::default()
-                .fg(COLOR_TITLE)
+                .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             "  —  Esc to return to chat",
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         ),
     ]);
     f.render_widget(Paragraph::new(line), area);
@@ -633,9 +623,9 @@ fn draw_search_bar(f: &mut Frame, state: &State, area: Rect) {
     let focused = matches!(state.mode, Mode::Search);
     let mut ta = state.search.clone();
     let border_color = if focused {
-        COLOR_BORDER_ACTIVE
+        theme().border_active
     } else {
-        COLOR_BORDER
+        theme().border
     };
     ta.set_block(
         Block::default()
@@ -647,7 +637,7 @@ fn draw_search_bar(f: &mut Frame, state: &State, area: Rect) {
                 } else {
                     "Search (press / to focus)"
                 },
-                Style::default().fg(COLOR_TITLE),
+                Style::default().fg(theme().title),
             ))),
     );
     f.render_widget(&ta, area);
@@ -657,7 +647,7 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
     let items: Vec<ListItem> = if state.entries.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "(no entries — press 'n' to create one)",
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         )))]
     } else {
         state
@@ -677,7 +667,7 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
                 if !entry.tags.is_empty() {
                     spans.push(Span::styled(
                         format!("  [{}]", entry.tags.join(", ")),
-                        Style::default().fg(COLOR_HINT_DESC),
+                        Style::default().fg(theme().text_dim),
                     ));
                 }
                 ListItem::new(Line::from(spans))
@@ -695,18 +685,18 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BORDER))
+                .border_style(Style::default().fg(theme().border))
                 .title(Line::from(Span::styled(
                     title,
                     Style::default()
-                        .fg(COLOR_TITLE)
+                        .fg(theme().title)
                         .add_modifier(Modifier::BOLD),
                 ))),
         )
         .highlight_style(
             Style::default()
-                .bg(COLOR_LIST_HIGHLIGHT)
-                .fg(COLOR_LIST_HIGHLIGHT_FG)
+                .bg(theme().list_highlight)
+                .fg(theme().list_highlight_fg)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ");
@@ -721,7 +711,7 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
 fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_BORDER))
+        .border_style(Style::default().fg(theme().border))
         .title(Line::from(Span::styled(
             if state.edit.editing_id.is_some() {
                 "Edit entry"
@@ -729,7 +719,7 @@ fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
                 "New entry"
             },
             Style::default()
-                .fg(COLOR_TITLE)
+                .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(area);
@@ -760,7 +750,7 @@ fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
     f.render_widget(
         Paragraph::new(Span::styled(
             header_text,
-            Style::default().fg(COLOR_TIMESTAMP),
+            Style::default().fg(theme().debug_system),
         )),
         rows[0],
     );
@@ -798,9 +788,9 @@ fn draw_text_field_with_label(
 ) {
     let mut ta = textarea.clone();
     let border_color = if focused {
-        COLOR_BORDER_ACTIVE
+        theme().border_active
     } else {
-        COLOR_BORDER
+        theme().border
     };
     ta.set_block(
         Block::default()
@@ -808,7 +798,7 @@ fn draw_text_field_with_label(
             .border_style(Style::default().fg(border_color))
             .title(Line::from(Span::styled(
                 title.to_string(),
-                Style::default().fg(COLOR_TITLE),
+                Style::default().fg(theme().title),
             ))),
     );
     f.render_widget(&ta, area);
@@ -817,10 +807,10 @@ fn draw_text_field_with_label(
 fn draw_field_label(f: &mut Frame, area: Rect, label: &str, focused: bool) {
     let style = if focused {
         Style::default()
-            .fg(COLOR_BORDER_ACTIVE)
+            .fg(theme().border_active)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(COLOR_HINT_DESC)
+        Style::default().fg(theme().text_dim)
     };
     f.render_widget(Paragraph::new(Span::styled(label.to_string(), style)), area);
 }
@@ -828,9 +818,9 @@ fn draw_field_label(f: &mut Frame, area: Rect, label: &str, focused: bool) {
 fn draw_text_field(f: &mut Frame, area: Rect, textarea: &TextArea<'static>, focused: bool) {
     let mut ta = textarea.clone();
     let border_color = if focused {
-        COLOR_BORDER_ACTIVE
+        theme().border_active
     } else {
-        COLOR_BORDER
+        theme().border
     };
     ta.set_block(
         Block::default()
@@ -843,14 +833,14 @@ fn draw_text_field(f: &mut Frame, area: Rect, textarea: &TextArea<'static>, focu
 fn draw_status(f: &mut Frame, state: &State, area: Rect) {
     if let Some(busy) = &state.busy {
         let style = Style::default()
-            .fg(Color::Rgb(178, 220, 245))
+            .fg(theme().assistant_indicator)
             .add_modifier(Modifier::ITALIC);
         f.render_widget(
             Paragraph::new(Span::styled(format!(" ● {busy}"), style)),
             area,
         );
     } else if let Some(err) = &state.error {
-        let style = Style::default().fg(COLOR_ERROR);
+        let style = Style::default().fg(theme().error);
         f.render_widget(
             Paragraph::new(Span::styled(format!(" • {err}"), style)),
             area,
@@ -876,18 +866,18 @@ fn draw_hints(f: &mut Frame, state: &State, area: Rect) {
     let mut spans: Vec<Span> = Vec::with_capacity(hints.len() * 4);
     for (idx, (key, desc)) in hints.iter().enumerate() {
         if idx > 0 {
-            spans.push(Span::styled("  ·  ", Style::default().fg(COLOR_HINT_SEP)));
+            spans.push(Span::styled("  ·  ", Style::default().fg(theme().hint_sep)));
         }
         spans.push(Span::styled(
             (*key).to_string(),
             Style::default()
-                .fg(COLOR_HINT_KEY)
+                .fg(theme().hint_key)
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             (*desc).to_string(),
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -919,11 +909,11 @@ fn draw_delete_overlay(f: &mut Frame, state: &State, area: Rect) {
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_DELETE_BORDER))
+        .border_style(Style::default().fg(theme().error))
         .title(Line::from(Span::styled(
             "Delete entry",
             Style::default()
-                .fg(Color::Rgb(255, 200, 200))
+                .fg(theme().error_text)
                 .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(popup);
@@ -935,7 +925,7 @@ fn draw_delete_overlay(f: &mut Frame, state: &State, area: Rect) {
         )),
         Line::from(Span::styled(
             "y/Enter = confirm · any other key = cancel",
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         )),
     ])
     .wrap(Wrap { trim: true });

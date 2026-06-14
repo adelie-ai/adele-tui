@@ -47,17 +47,7 @@ use ratatui_textarea::{CursorMove, TextArea};
 
 use crate::screen::Screen;
 
-const COLOR_BORDER: Color = Color::Rgb(82, 104, 173);
-const COLOR_BORDER_ACTIVE: Color = Color::Rgb(120, 183, 109);
-const COLOR_TITLE: Color = Color::Rgb(166, 182, 255);
-const COLOR_HINT_KEY: Color = Color::Rgb(216, 223, 236);
-const COLOR_HINT_DESC: Color = Color::Rgb(143, 153, 174);
-const COLOR_HINT_SEP: Color = Color::Rgb(82, 90, 110);
-const COLOR_LIST_HIGHLIGHT: Color = Color::Rgb(72, 102, 180);
-const COLOR_LIST_HIGHLIGHT_FG: Color = Color::Rgb(245, 248, 255);
-const COLOR_ERROR: Color = Color::Rgb(232, 130, 130);
-const COLOR_OK: Color = Color::Rgb(132, 218, 193);
-const COLOR_DELETE_BORDER: Color = Color::Rgb(232, 130, 130);
+use crate::theme::theme;
 
 /// Connector kinds the TUI can build forms for. Mirrors
 /// `ConnectionConfigView` variants.
@@ -655,12 +645,12 @@ fn draw_header(f: &mut Frame, area: Rect) {
         Span::styled(
             "LLM provider connections",
             Style::default()
-                .fg(COLOR_TITLE)
+                .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             "  —  Esc to return to chat",
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         ),
     ]);
     f.render_widget(Paragraph::new(line), area);
@@ -670,7 +660,7 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
     let items: Vec<ListItem> = if state.connections.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "(no connections — press 'a' to add one)",
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         )))]
     } else {
         state
@@ -678,9 +668,11 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
             .iter()
             .map(|c| {
                 let availability_text = match &c.availability {
-                    ConnectionAvailability::Ok => Span::styled("●", Style::default().fg(COLOR_OK)),
+                    ConnectionAvailability::Ok => {
+                        Span::styled("●", Style::default().fg(theme().ok))
+                    }
                     ConnectionAvailability::Unavailable { .. } => {
-                        Span::styled("●", Style::default().fg(COLOR_ERROR))
+                        Span::styled("●", Style::default().fg(theme().error))
                     }
                 };
                 let unavail_reason = match &c.availability {
@@ -693,20 +685,20 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
                     Span::styled(c.id.clone(), Style::default().add_modifier(Modifier::BOLD)),
                     Span::styled(
                         format!(" [{}]", c.connector_type),
-                        Style::default().fg(COLOR_HINT_DESC),
+                        Style::default().fg(theme().text_dim),
                     ),
                 ];
                 if c.display_label != format!("{} ({})", c.id, c.connector_type) {
                     spans.push(Span::styled(
                         format!("  ·  {}", c.display_label),
-                        Style::default().fg(COLOR_HINT_DESC),
+                        Style::default().fg(theme().text_dim),
                     ));
                 }
                 if let Some(reason) = unavail_reason {
                     spans.push(Span::styled(
                         format!("  ·  {reason}"),
                         Style::default()
-                            .fg(COLOR_ERROR)
+                            .fg(theme().error)
                             .add_modifier(Modifier::ITALIC),
                     ));
                 }
@@ -725,18 +717,18 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BORDER))
+                .border_style(Style::default().fg(theme().border))
                 .title(Line::from(Span::styled(
                     title,
                     Style::default()
-                        .fg(COLOR_TITLE)
+                        .fg(theme().title)
                         .add_modifier(Modifier::BOLD),
                 ))),
         )
         .highlight_style(
             Style::default()
-                .bg(COLOR_LIST_HIGHLIGHT)
-                .fg(COLOR_LIST_HIGHLIGHT_FG)
+                .bg(theme().list_highlight)
+                .fg(theme().list_highlight_fg)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ");
@@ -751,7 +743,7 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
 fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_BORDER))
+        .border_style(Style::default().fg(theme().border))
         .title(Line::from(Span::styled(
             if state.form.editing_id.is_some() {
                 "Edit connection"
@@ -759,7 +751,7 @@ fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
                 "New connection"
             },
             Style::default()
-                .fg(COLOR_TITLE)
+                .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(area);
@@ -829,9 +821,9 @@ fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
 
 fn draw_type_toggle(f: &mut Frame, area: Rect, state: &State, focused: bool) {
     let border_color = if focused {
-        COLOR_BORDER_ACTIVE
+        theme().border_active
     } else {
-        COLOR_BORDER
+        theme().border
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -844,10 +836,10 @@ fn draw_type_toggle(f: &mut Frame, area: Rect, state: &State, focused: bool) {
         let style = if active {
             Style::default()
                 .fg(Color::Black)
-                .bg(COLOR_BORDER_ACTIVE)
+                .bg(theme().border_active)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(COLOR_HINT_DESC)
+            Style::default().fg(theme().text_dim)
         };
         Span::styled(format!(" {} ", kind.label()), style)
     };
@@ -865,10 +857,10 @@ fn draw_type_toggle(f: &mut Frame, area: Rect, state: &State, focused: bool) {
 fn draw_field_label(f: &mut Frame, area: Rect, label: &str, focused: bool) {
     let style = if focused {
         Style::default()
-            .fg(COLOR_BORDER_ACTIVE)
+            .fg(theme().border_active)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(COLOR_HINT_DESC)
+        Style::default().fg(theme().text_dim)
     };
     f.render_widget(Paragraph::new(Span::styled(label.to_string(), style)), area);
 }
@@ -876,9 +868,9 @@ fn draw_field_label(f: &mut Frame, area: Rect, label: &str, focused: bool) {
 fn draw_text_field(f: &mut Frame, area: Rect, textarea: &TextArea<'static>, focused: bool) {
     let mut ta = textarea.clone();
     let border_color = if focused {
-        COLOR_BORDER_ACTIVE
+        theme().border_active
     } else {
-        COLOR_BORDER
+        theme().border
     };
     ta.set_block(
         Block::default()
@@ -905,11 +897,11 @@ fn draw_delete_overlay(f: &mut Frame, state: &State, area: Rect) {
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_DELETE_BORDER))
+        .border_style(Style::default().fg(theme().error))
         .title(Line::from(Span::styled(
             "Delete connection",
             Style::default()
-                .fg(Color::Rgb(255, 200, 200))
+                .fg(theme().error_text)
                 .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(popup);
@@ -921,7 +913,7 @@ fn draw_delete_overlay(f: &mut Frame, state: &State, area: Rect) {
         )),
         Line::from(Span::styled(
             "y/Enter = confirm · f = force (referencing purposes fall back) · any = cancel",
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         )),
     ])
     .wrap(Wrap { trim: true });
@@ -931,14 +923,14 @@ fn draw_delete_overlay(f: &mut Frame, state: &State, area: Rect) {
 fn draw_status(f: &mut Frame, state: &State, area: Rect) {
     if let Some(busy) = &state.busy {
         let style = Style::default()
-            .fg(Color::Rgb(178, 220, 245))
+            .fg(theme().assistant_indicator)
             .add_modifier(Modifier::ITALIC);
         f.render_widget(
             Paragraph::new(Span::styled(format!(" ● {busy}"), style)),
             area,
         );
     } else if let Some(err) = &state.error {
-        let style = Style::default().fg(COLOR_ERROR);
+        let style = Style::default().fg(theme().error);
         f.render_widget(
             Paragraph::new(Span::styled(format!(" • {err}"), style)),
             area,
@@ -961,18 +953,18 @@ fn draw_hints(f: &mut Frame, state: &State, area: Rect) {
     let mut spans: Vec<Span> = Vec::new();
     for (idx, (key, desc)) in hints.iter().enumerate() {
         if idx > 0 {
-            spans.push(Span::styled("  ·  ", Style::default().fg(COLOR_HINT_SEP)));
+            spans.push(Span::styled("  ·  ", Style::default().fg(theme().hint_sep)));
         }
         spans.push(Span::styled(
             (*key).to_string(),
             Style::default()
-                .fg(COLOR_HINT_KEY)
+                .fg(theme().hint_key)
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             (*desc).to_string(),
-            Style::default().fg(COLOR_HINT_DESC),
+            Style::default().fg(theme().text_dim),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
