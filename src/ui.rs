@@ -12,6 +12,30 @@ use crate::theme::theme;
 const INPUT_VISIBLE_LINES: u16 = 4;
 const INPUT_TOTAL_HEIGHT: u16 = INPUT_VISIBLE_LINES + 2; // +2 for borders
 
+/// Below this width the conversation sidebar auto-hides so the chat keeps a
+/// usable column count. This is a render-time decision only — the user's
+/// `show_sidebar` toggle is never mutated, so widening the terminal restores it.
+const SIDEBAR_MIN_WIDTH: u16 = 50;
+/// The message area never shrinks below this; the input box gives up rows first
+/// on a short terminal (so messages can't be squeezed to nothing).
+const MIN_MESSAGE_ROWS: u16 = 1;
+
+/// Whether to actually render the sidebar: the user opted in *and* the terminal
+/// is wide enough to spare the columns.
+fn sidebar_visible(show_sidebar: bool, width: u16) -> bool {
+    show_sidebar && width >= SIDEBAR_MIN_WIDTH
+}
+
+/// Height for the composer box in a chat pane `available_height` rows tall, with
+/// `status_height` rows of assistant-status line. The box wants
+/// `INPUT_TOTAL_HEIGHT` rows but collapses on a short terminal so the message
+/// area keeps at least `MIN_MESSAGE_ROWS` (toolbar + status bar are 1 row each).
+fn chat_input_height(available_height: u16, status_height: u16) -> u16 {
+    let fixed_chrome = status_height + 2; // toolbar + status bar
+    let spare = available_height.saturating_sub(fixed_chrome + MIN_MESSAGE_ROWS);
+    INPUT_TOTAL_HEIGHT.min(spare)
+}
+
 fn mode_chip_style(mode: &InputMode) -> Style {
     match mode {
         InputMode::Normal => Style::default()
@@ -39,7 +63,7 @@ fn split_display_lines(content: &str) -> Vec<String> {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    if app.show_sidebar {
+    if sidebar_visible(app.show_sidebar, f.area().width) {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
@@ -206,13 +230,14 @@ fn draw_conversation_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect)
 fn draw_chat_panel(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let show_status = app.assistant_status.is_some();
     let status_height: u16 = if show_status { 1 } else { 0 };
+    let input_height = chat_input_height(area.height, status_height);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(status_height),
-            Constraint::Length(INPUT_TOTAL_HEIGHT),
+            Constraint::Length(input_height),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
@@ -831,6 +856,84 @@ mod tests {
             !input_border_has_warn(&mut online),
             "no border should be warn-colored while connected"
         );
+    }
+
+    #[test]
+    fn sidebar_visible_requires_opt_in_and_width() {
+        assert!(sidebar_visible(true, 80));
+        assert!(sidebar_visible(true, SIDEBAR_MIN_WIDTH));
+        // One column under the threshold hides it even though the user opted in.
+        assert!(!sidebar_visible(true, SIDEBAR_MIN_WIDTH - 1));
+        // Opt-out always hides it, however wide the terminal.
+        assert!(!sidebar_visible(false, 200));
+    }
+
+    #[test]
+    fn chat_input_height_is_full_when_tall_and_shrinks_when_short() {
+        // Tall pane: the composer gets its full height, status line or not.
+        assert_eq!(chat_input_height(24, 0), INPUT_TOTAL_HEIGHT);
+        assert_eq!(chat_input_height(24, 1), INPUT_TOTAL_HEIGHT);
+        // Short pane (height 8, no status): chrome(2) + message(1) leaves 5.
+        assert_eq!(chat_input_height(8, 0), 5);
+        // Tiny pane: shrinks toward zero rather than starving the messages.
+        assert_eq!(chat_input_height(4, 0), 1);
+        assert_eq!(chat_input_height(3, 0), 0);
+    }
+
+    #[test]
+    fn chat_input_height_always_leaves_a_message_row_when_possible() {
+        // Whenever the pane is tall enough to hold the fixed chrome plus a
+        // message row, the composer must not consume that row.
+        for h in 0..40u16 {
+            for status in 0..=1u16 {
+                let consumed = chat_input_height(h, status) + status + 2;
+                if h >= status + 2 + MIN_MESSAGE_ROWS {
+                    assert!(
+                        h.saturating_sub(consumed) >= MIN_MESSAGE_ROWS,
+                        "h={h} status={status}: only {} rows left for messages",
+                        h.saturating_sub(consumed)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn draw_auto_hides_sidebar_on_a_narrow_terminal() {
+        // Wide terminal: the opted-in sidebar (its "Conversations" title) shows.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(); // show_sidebar defaults true
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let wide: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            wide.contains("Conversations"),
+            "sidebar should show on a wide terminal"
+        );
+
+        // Narrow terminal, same opted-in state: the sidebar is suppressed so the
+        // chat keeps the columns — and the user's toggle is left untouched.
+        let backend = TestBackend::new(40, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let narrow: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            !narrow.contains("Conversations"),
+            "sidebar should auto-hide on a narrow terminal"
+        );
+        assert!(app.show_sidebar, "the user's toggle must be left untouched");
     }
 
     #[test]
