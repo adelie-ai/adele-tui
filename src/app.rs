@@ -713,6 +713,10 @@ impl App {
     /// `stream_matches_or_claims_request_id`. See issue #52.
     pub fn apply_prompt_ack(&mut self, _task_id: String, conversation_id: String) {
         self.start_streaming_without_request_id(conversation_id);
+        // Immediate feedback in the gap between Enter and the first streamed
+        // token. The daemon's own `Status` events (e.g. "Searching…") overwrite
+        // this, and completion/error clears it (see `set_assistant_status`).
+        self.set_assistant_status("Adele is thinking…");
     }
 
     /// Whether the in-flight stream belongs to the open conversation (TUI-4).
@@ -2002,6 +2006,22 @@ mod tests {
 
         app.complete_streaming("req1", "done");
         assert!(app.assistant_status.is_none());
+    }
+
+    #[test]
+    fn prompt_ack_shows_thinking_status() {
+        // The send was accepted but no token has arrived yet — show an immediate
+        // "thinking" cue so there's no dead air after pressing Enter.
+        let mut app = App::new();
+        app.current_conversation = Some(ConversationDetail {
+            id: "c1".into(),
+            title: "Test".into(),
+            messages: vec![],
+            model_selection: None,
+            conversation_personality: None,
+        });
+        app.apply_prompt_ack("t-1".into(), "c1".into());
+        assert_eq!(app.assistant_status.as_deref(), Some("Adele is thinking…"));
     }
 
     #[test]
