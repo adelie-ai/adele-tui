@@ -1058,31 +1058,26 @@ enum SignalAction {
 }
 
 /// Run the controller-level effects [`App::apply_core`] bubbled up from a
-/// streaming signal — the ones the view can't perform itself. The streaming arms
-/// emit only [`Effect::Speak`] (reply narration, already gated by core's
-/// `StreamComplete`) and [`Effect::FetchScratchpad`] (a no-op here: the TUI has
-/// no scratchpad pane). The view-level effects were already applied inside
-/// `apply_core`, so they never reach this point; later CC-3 slices (conversation
-/// management) add the conversation/model/task effects and handle them here.
+/// streaming signal — the ones the view can't perform itself. Today the streaming
+/// arms bubble up only [`Effect::Speak`] (reply narration, already gated by
+/// core's `StreamComplete`); the view-level effects (including the side-pane
+/// no-ops) were already absorbed inside `apply_core`. Later CC-3 slices route the
+/// open-conversation RPC effects and handle them here.
 fn run_stream_controller_effects(
     effects: Vec<Effect>,
     voice_daemon: &VoiceController,
     voice_session: &Option<VoiceSession>,
     narration_tx: &UnboundedSender<NarrationRequest>,
 ) {
+    // Today the streaming arms bubble up only `Speak`; any other effect is
+    // ignored here (later CC-3 slices route the open-conversation RPC effects).
+    // Reaching the body means core's narration gate passed; skip an empty reply
+    // so we don't enqueue silence.
     for effect in effects {
-        match effect {
-            Effect::Speak(text) => {
-                // Reaching here means core's narration gate passed; skip an empty
-                // reply so we don't enqueue silence.
-                if !text.trim().is_empty() {
-                    enqueue_narration(narration_tx, voice_daemon, voice_session, text);
-                }
-            }
-            // The TUI has no scratchpad pane (GTK/KDE only).
-            Effect::FetchScratchpad(_) => {}
-            // No other effect is produced by the streaming arms yet.
-            _ => {}
+        if let Effect::Speak(text) = effect
+            && !text.trim().is_empty()
+        {
+            enqueue_narration(narration_tx, voice_daemon, voice_session, text);
         }
     }
 }

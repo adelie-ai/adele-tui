@@ -762,9 +762,19 @@ impl App {
             // is a no-op here — the auto-load/create that gtk's executor performs
             // is deliberately omitted (CC-3: behavior-preserving).
             Effect::EnsureActiveConversation => None,
-            // Controller-level effects (narration, scratchpad, and — in later
-            // CC-3 slices — the open-conversation RPC effects) need handles the
-            // view doesn't hold; bubble them up to `main`'s executor.
+            // Clear the open chat (the active conversation was deleted).
+            Effect::ClearChat => {
+                self.current_conversation = None;
+                None
+            }
+            // The TUI has no side pane (the scratchpad + per-conversation task
+            // list live in the gtk/kde clients), so these are inert here.
+            Effect::SidePaneSetScratchpad(_)
+            | Effect::RefreshSidePaneTasks
+            | Effect::FetchScratchpad(_) => None,
+            // Controller-level effects (narration, and — in later CC-3 slices —
+            // the open-conversation RPC effects) need handles the view doesn't
+            // hold; bubble them up to `main`'s executor.
             other => Some(other),
         }
     }
@@ -881,12 +891,21 @@ impl App {
         }
     }
 
+    /// Apply a live `TitleChanged` signal: the sidebar list rename flows through
+    /// the shared core (which owns the list and repaints it via `SetConversations`),
+    /// and the open chat's cached title is refreshed locally — the reducer owns
+    /// only the list, but the TUI's chat header reads `current_conversation.title`.
     pub fn update_conversation_title(&mut self, conversation_id: &str, title: &str) {
-        for conv in &mut self.conversations {
-            if conv.id == conversation_id {
-                conv.title = title.to_string();
-            }
-        }
+        let _ = self.apply_core(UiMessage::TitleChanged {
+            conversation_id: conversation_id.to_string(),
+            title: title.to_string(),
+        });
+        self.set_open_conversation_title(conversation_id, title);
+    }
+
+    /// Refresh the open conversation's cached title if it is the one named (the
+    /// chat header reads it). No-op when a different conversation is open.
+    fn set_open_conversation_title(&mut self, conversation_id: &str, title: &str) {
         if let Some(current) = self.current_conversation.as_mut()
             && current.id == conversation_id
         {
@@ -948,38 +967,30 @@ impl App {
         self.mode = InputMode::Normal;
     }
 
-    /// Apply a renamed title locally (call after the daemon confirms).
+    /// Apply a renamed title (call after the daemon confirms). Routes the sidebar
+    /// rename through the shared core and refreshes the open chat's cached title.
     pub fn apply_rename(&mut self, conversation_id: &str, title: &str) {
-        self.update_conversation_title(conversation_id, title);
+        let _ = self.apply_core(UiMessage::ConversationRenamed {
+            id: conversation_id.to_string(),
+            title: title.to_string(),
+        });
+        self.set_open_conversation_title(conversation_id, title);
     }
 
     pub fn delete_selected_conversation(&mut self) -> Option<String> {
-        let idx = self.selected_conversation?;
-        if idx >= self.conversations.len() {
-            return None;
-        }
-        let id = self.conversations[idx].id.clone();
-        self.conversations.remove(idx);
-
-        // Clear current conversation if it was the deleted one (and mirror the
-        // clear into the shared core so its streaming active-checks don't keep
-        // pointing at a gone conversation, CC-3).
-        if self
-            .current_conversation
-            .as_ref()
-            .is_some_and(|c| c.id == id)
-        {
-            self.current_conversation = None;
-            self.core.current_conversation_id = None;
-        }
-
-        // Fix selection
-        if self.conversations.is_empty() {
-            self.selected_conversation = None;
-        } else if idx >= self.conversations.len() {
-            self.selected_conversation = Some(self.conversations.len() - 1);
-        }
-
+        let id = self.selected_conversation_id()?.to_string();
+        // Route the removal through the shared core: the reducer drops the row,
+        // prunes the conversation's per-conversation voice state (GTK-9 — the TUI
+        // previously leaked it, growing the maps unbounded), and clears the open
+        // chat when the deleted conversation was the active one. The emitted
+        // effects are all view-effects (SetConversations re-clamps the positional
+        // selection; ClearChat blanks the chat; the side-pane + EnsureActive
+        // effects are TUI no-ops), so `apply_core` fully handles them.
+        let effects = self.apply_core(UiMessage::ConversationDeleted { id: id.clone() });
+        debug_assert!(
+            effects.is_empty(),
+            "ConversationDeleted must emit only view-effects: {effects:?}"
+        );
         Some(id)
     }
 }
@@ -2123,7 +2134,9 @@ mod tests {
     fn delete_selected_conversation() {
         let mut app = app_with_conversations();
         app.selected_conversation = Some(1);
-        app.current_conversation = Some(ConversationDetail {
+        // `load_conversation` (not a raw field write) so core's open-conversation
+        // id is set — the reducer's delete keys its "clear the open chat" on it.
+        app.load_conversation(ConversationDetail {
             id: "2".into(),
             title: "Second".into(),
             messages: vec![],
@@ -2134,8 +2147,55 @@ mod tests {
         let deleted = app.delete_selected_conversation();
         assert_eq!(deleted, Some("2".to_string()));
         assert_eq!(app.conversations.len(), 2);
-        assert!(app.current_conversation.is_none());
+        assert!(
+            app.current_conversation.is_none(),
+            "deleting the active conversation clears the open chat"
+        );
         assert_eq!(app.selected_conversation, Some(1)); // stays at 1 (now "Third")
+    }
+
+    #[test]
+    fn deleting_a_conversation_prunes_its_per_conversation_voice_state() {
+        // GTK-9 / bug fix: the pre-flip TUI delete left the per-conversation
+        // voice maps untouched, leaking state (and risking a later id-reuse
+        // inheriting a stale setting). Routing delete through the core prunes it.
+        let mut app = app_with_conversations();
+        app.set_adele_output("2", AdeleOutput::Always);
+        app.set_voice_in("2", true);
+        assert!(app.narrate_for("2"), "precondition: voice state is set");
+
+        app.selected_conversation = Some(1); // id "2"
+        app.delete_selected_conversation();
+
+        assert!(
+            !app.narrate_for("2"),
+            "voice state must be pruned on delete"
+        );
+        assert_eq!(app.adele_output_for("2"), AdeleOutput::Disabled);
+        assert!(!app.voice_in_for("2"));
+    }
+
+    #[test]
+    fn rename_routes_through_core_and_refreshes_the_open_title() {
+        let mut app = app_with_conversations();
+        app.load_conversation(ConversationDetail {
+            id: "2".into(),
+            title: "Second".into(),
+            messages: vec![],
+            model_selection: None,
+            conversation_personality: None,
+        });
+
+        app.apply_rename("2", "Renamed Second");
+
+        // The sidebar row is updated via the core-owned list...
+        let row = app.conversations.iter().find(|c| c.id == "2").unwrap();
+        assert_eq!(row.title, "Renamed Second");
+        // ...and the open chat's cached title (the header reads it) is refreshed.
+        assert_eq!(
+            app.current_conversation.as_ref().unwrap().title,
+            "Renamed Second"
+        );
     }
 
     #[test]
