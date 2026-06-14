@@ -92,6 +92,12 @@ impl Profile {
             ws_login_username: self.username.clone(),
             ws_login_password: password,
             socket_path: self.socket_path.clone(),
+            // Mint the socket-handshake JWT from the local `adelie-mint` minter
+            // (#101/#316) — the preferred, non-retiring source — rather than
+            // falling through to the deprecated D-Bus `generate_ws_jwt` path
+            // (which the cutover removed). Inert for the D-Bus transport, which
+            // authenticates by peer credentials and needs no token.
+            minter_socket: desktop_assistant_client_common::minter::default_minter_socket_path(),
             ..Default::default()
         }
     }
