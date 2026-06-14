@@ -412,27 +412,26 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .map(|sel| format!("  ·  {} · {}", sel.connection_id, sel.model_id))
         .unwrap_or_default();
     // Persistent cue for the two per-conversation voice controls (adele-tui#77),
-    // so the user can always see both states. `Adele:` (voice output, Ctrl+S
-    // cycles) shows only when not Disabled — the common default stays
-    // uncluttered; `You:` (voice input, Ctrl+V toggles) shows only when Enabled.
-    // A speaker glyph for Adele, a mic glyph for You so they read distinctly.
+    // so the user can always see both states. `Adele:` (voice output) shows only
+    // when not Disabled — the common default stays uncluttered; `You:` (voice
+    // input) shows only when Enabled. The keybindings (Ctrl+S / Ctrl+V) live in
+    // the `?`/F1 help overlay and the mode toolbar, so they aren't repeated in
+    // the title (declutter, CC-4); plain ASCII labels keep it width-safe (the
+    // former 🔊/🎙 glyphs risked double-width cells on some terminals).
     let adele_suffix = match app.current_adele_output() {
         AdeleOutput::Disabled => String::new(),
-        level => format!("  ·  🔊 Adele: {} (Ctrl+S)", level.label()),
+        level => format!("  ·  Adele: {}", level.label()),
     };
     let you_suffix = if app.current_voice_in() {
-        "  ·  🎙 You: Enabled (Ctrl+V)"
+        "  ·  You: on"
     } else {
         ""
     };
-    let title = if app.scroll_offset > 0 {
-        format!(
-            "{chat_title}{model_suffix}{adele_suffix}{you_suffix} \
-             (Ctrl+u/d scroll, Ctrl+e bottom)"
-        )
-    } else {
-        format!("{chat_title}{model_suffix}{adele_suffix}{you_suffix}")
-    };
+    // A bare up-arrow marks "scrolled up from the bottom"; the scroll keys
+    // themselves are in the help overlay / toolbar, so the old verbose
+    // "(Ctrl+u/d scroll, Ctrl+e bottom)" prose is gone (declutter, CC-4).
+    let scroll_marker = if app.scroll_offset > 0 { "  ↑" } else { "" };
+    let title = format!("{chat_title}{model_suffix}{adele_suffix}{you_suffix}{scroll_marker}");
 
     let block = Block::default()
         .borders(Borders::ALL)
