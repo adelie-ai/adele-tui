@@ -292,15 +292,14 @@ impl App {
     /// when no conversation is open.
     pub fn current_voice_in(&self) -> bool {
         self.core
-            .current_conversation
-            .as_ref()
+            .current_conversation()
             .is_some_and(|c| self.voice_in_for(&c.id))
     }
 
     /// Flip `You:` for the currently-open conversation and return the new state
     /// (used by the `Ctrl+V` keybind). `None` when no conversation is open.
     pub fn toggle_current_voice_in(&mut self) -> Option<bool> {
-        let conv_id = self.core.current_conversation.as_ref()?.id.clone();
+        let conv_id = self.core.current_conversation()?.id.clone();
         let next = !self.core.voice_in_for(&conv_id);
         self.set_voice_in(&conv_id, next);
         Some(next)
@@ -326,8 +325,7 @@ impl App {
     /// no conversation is open.
     pub fn current_adele_output(&self) -> AdeleOutput {
         self.core
-            .current_conversation
-            .as_ref()
+            .current_conversation()
             .map(|c| self.adele_output_for(&c.id))
             .unwrap_or_default()
     }
@@ -347,7 +345,7 @@ impl App {
     /// (`Disabled → OnDemand → Always → Disabled`) and return the new level
     /// (used by the `Ctrl+S` keybind). `None` when no conversation is open.
     pub fn cycle_current_adele_output(&mut self) -> Option<AdeleOutput> {
-        let conv_id = self.core.current_conversation.as_ref()?.id.clone();
+        let conv_id = self.core.current_conversation()?.id.clone();
         let next = self.core.adele_output_for(&conv_id).next();
         self.set_adele_output(&conv_id, next);
         Some(next)
@@ -375,7 +373,7 @@ impl App {
     /// a stale/other conversation never bleeds into the visible chat. Returns
     /// whether the note was shown.
     pub fn push_speech_disabled_note(&mut self, conversation_id: &str, text: &str) -> bool {
-        let Some(conv) = self.core.current_conversation.as_mut() else {
+        let Some(conv) = self.core.current_conversation_mut() else {
             return false;
         };
         if conv.id != conversation_id {
@@ -443,7 +441,7 @@ impl App {
         &mut self,
         override_selection: desktop_assistant_api_model::SendPromptOverride,
     ) {
-        if let Some(conv) = self.core.current_conversation.as_mut() {
+        if let Some(conv) = self.core.current_conversation_mut() {
             conv.model_selection = Some(
                 desktop_assistant_api_model::ConversationModelSelectionView {
                     connection_id: override_selection.connection_id.clone(),
@@ -812,7 +810,7 @@ impl App {
     /// on open). The view + controller read it back through here. `None` when no
     /// conversation is open.
     pub fn current_conversation(&self) -> Option<&ConversationDetail> {
-        self.core.current_conversation.as_ref()
+        self.core.current_conversation()
     }
 
     pub fn set_conversations(&mut self, conversations: Vec<ConversationSummary>) {
@@ -832,18 +830,13 @@ impl App {
     }
 
     pub fn load_conversation(&mut self, detail: ConversationDetail) {
-        let switching = self
-            .core
-            .current_conversation
-            .as_ref()
-            .map(|c| c.id.as_str())
-            != Some(detail.id.as_str());
+        let switching =
+            self.core.current_conversation().map(|c| c.id.as_str()) != Some(detail.id.as_str());
         // Seed the shared core's open conversation (CC-3 slice 4): it owns both the
         // rendered transcript (the reducer finalizes streamed replies into it) and
         // the id its streaming originating-conversation checks (TUI-4 / GTK-2)
         // judge against, so the stream events route to the conversation in view.
-        self.core.current_conversation_id = Some(detail.id.clone());
-        self.core.current_conversation = Some(detail);
+        self.core.open_conversation(detail);
         // Drop a stale context-fill reading when the visible conversation
         // changes; the next turn re-establishes it (#341).
         if switching {
@@ -866,7 +859,7 @@ impl App {
     /// Refresh the open conversation's cached title if it is the one named (the
     /// chat header reads it). No-op when a different conversation is open.
     fn set_open_conversation_title(&mut self, conversation_id: &str, title: &str) {
-        if let Some(current) = self.core.current_conversation.as_mut()
+        if let Some(current) = self.core.current_conversation_mut()
             && current.id == conversation_id
         {
             current.title = title.to_string();
@@ -882,7 +875,7 @@ impl App {
         &mut self,
         personality: desktop_assistant_api_model::ConversationPersonalityView,
     ) {
-        if let Some(conv) = self.core.current_conversation.as_mut() {
+        if let Some(conv) = self.core.current_conversation_mut() {
             conv.conversation_personality = Some(personality);
         }
     }
