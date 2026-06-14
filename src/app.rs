@@ -750,9 +750,21 @@ impl App {
                 self.status_message = text;
                 None
             }
+            // Repaint the sidebar list. `set_conversations` re-clamps the
+            // positional selection and keeps core's list in sync.
+            Effect::SetConversations(convs) => {
+                self.set_conversations(convs);
+                None
+            }
+            // The TUI does not auto-open a conversation (unlike gtk): the sidebar
+            // selection is already clamped by `SetConversations`, and the open
+            // conversation is whatever the user last opened. So "ensure active"
+            // is a no-op here — the auto-load/create that gtk's executor performs
+            // is deliberately omitted (CC-3: behavior-preserving).
+            Effect::EnsureActiveConversation => None,
             // Controller-level effects (narration, scratchpad, and — in later
-            // CC-3 slices — the conversation/model/task/RPC effects) need handles
-            // the view doesn't hold; bubble them up to `main`'s executor.
+            // CC-3 slices — the open-conversation RPC effects) need handles the
+            // view doesn't hold; bubble them up to `main`'s executor.
             other => Some(other),
         }
     }
@@ -834,8 +846,14 @@ impl App {
     // --- Conversation management ---
 
     pub fn set_conversations(&mut self, conversations: Vec<ConversationSummary>) {
+        // Mirror the list into the shared core so it stays authoritative for the
+        // sidebar (CC-3): the reducer's conversation arms read `core.conversations`
+        // (e.g. to decide reconnect reload vs. fresh load). Paths that don't route
+        // through `core.apply` (connect-time load, create/delete) funnel here, so
+        // this single dual-write keeps core in sync regardless of the caller.
+        self.core.conversations = conversations.clone();
         self.conversations = conversations;
-        // Fix selection if out of bounds
+        // Fix selection if out of bounds (positional selection is TUI view state).
         if let Some(sel) = self.selected_conversation
             && sel >= self.conversations.len()
         {
@@ -2035,10 +2053,11 @@ mod tests {
 
     #[test]
     fn list_refetch_replaces_sidebar_without_disturbing_open_conversation() {
-        // A `SignalEvent::ConversationListChanged` (#1) refetches the whole
-        // conversation list via `set_conversations`. That must repaint the
-        // sidebar but leave the OPEN conversation and its transcript intact —
-        // even when the change elsewhere renamed and removed rows.
+        // A `ConversationListChanged` / archive refetch (#1) routes through the
+        // reducer's `ConversationListRefetched`: apply_core repaints the sidebar
+        // (SetConversations) and re-syncs selection (EnsureActiveConversation, a
+        // TUI no-op) — emitting only view-effects — while the OPEN conversation
+        // and its transcript stay intact, even when rows were renamed/removed.
         let mut app = app_with_conversations();
         app.selected_conversation = Some(1);
         app.load_conversation(ConversationDetail {
@@ -2060,9 +2079,9 @@ mod tests {
             conversation_personality: None,
         });
 
-        // Simulate the refetched list: "1" was renamed and "3" was deleted
-        // elsewhere; "2" (the open one) survives.
-        app.set_conversations(vec![
+        // Refetched list: "1" was renamed and "3" was deleted elsewhere; "2"
+        // (the open one) survives.
+        let effects = app.apply_core(UiMessage::ConversationListRefetched(vec![
             ConversationSummary {
                 id: "1".into(),
                 title: "First (renamed elsewhere)".into(),
@@ -2075,9 +2094,13 @@ mod tests {
                 message_count: 2,
                 archived: false,
             },
-        ]);
+        ]));
+        assert!(
+            effects.is_empty(),
+            "a list refetch must emit only view-effects: {effects:?}"
+        );
 
-        // Sidebar reflects the new list...
+        // Sidebar reflects the new list (and core stays authoritative for it)...
         assert_eq!(app.conversations.len(), 2);
         assert_eq!(app.conversations[0].title, "First (renamed elsewhere)");
         // ...but the open conversation + its transcript are byte-for-byte intact.

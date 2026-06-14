@@ -1003,7 +1003,19 @@ fn apply_rpc_outcome(app: &mut App, outcome: RpcOutcome) -> bool {
         },
         RpcOutcome::ConversationsRefreshed { list, on_success } => match list {
             Ok(convs) => {
-                app.set_conversations(convs);
+                // The list-only refresh (a show-archived/(un)archive toggle, or a
+                // `ConversationListChanged` refetch) flows through the reducer's
+                // `ConversationListRefetched`, which repaints the sidebar
+                // (`SetConversations`) and re-syncs the selection
+                // (`EnsureActiveConversation` — a no-op in the TUI). The open
+                // conversation + its chat are deliberately left untouched. These
+                // are all view-effects, so `apply_core` fully handles them and
+                // returns nothing for the loop to run.
+                let effects = app.apply_core(UiMessage::ConversationListRefetched(convs));
+                debug_assert!(
+                    effects.is_empty(),
+                    "ConversationListRefetched must emit only view-effects: {effects:?}"
+                );
                 if let Some(msg) = on_success {
                     app.status_message = msg;
                 }
