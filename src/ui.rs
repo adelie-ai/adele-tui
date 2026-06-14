@@ -173,7 +173,7 @@ fn draw_rename_popup(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_conversation_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let items: Vec<ListItem> = app
-        .conversations
+        .conversations()
         .iter()
         .map(|c| {
             let mut spans = vec![];

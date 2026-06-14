@@ -1523,7 +1523,7 @@ async fn handle_action(
                 let id = id.to_string();
                 // Determine if conversation is currently archived
                 let is_archived = app
-                    .conversations
+                    .conversations()
                     .get(app.selected_conversation.unwrap_or(0))
                     .is_some_and(|c| c.archived);
                 let show_archived = app.show_archived;

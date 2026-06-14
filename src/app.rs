@@ -120,7 +120,6 @@ pub enum InputMode {
 pub use adele_voice_client_common::AdeleOutput;
 
 pub struct App {
-    pub conversations: Vec<ConversationSummary>,
     pub selected_conversation: Option<usize>,
     pub current_conversation: Option<ConversationDetail>,
     pub textarea: TextArea<'static>,
@@ -223,7 +222,6 @@ pub struct App {
 impl App {
     pub fn new() -> Self {
         Self {
-            conversations: Vec::new(),
             selected_conversation: None,
             current_conversation: None,
             textarea: new_textarea(),
@@ -402,7 +400,7 @@ impl App {
         // Move sidebar selection to the linked conversation if it's
         // present in the local list. Loading the detail itself is
         // main's responsibility (it needs the WS client).
-        if let Some(idx) = self.conversations.iter().position(|c| c.id == conv_id) {
+        if let Some(idx) = self.core.conversations.iter().position(|c| c.id == conv_id) {
             self.selected_conversation = Some(idx);
         }
         self.tasks.visible = false;
@@ -464,12 +462,12 @@ impl App {
     // --- Navigation ---
 
     pub fn next_conversation(&mut self) {
-        if self.conversations.is_empty() {
+        if self.core.conversations.is_empty() {
             return;
         }
         self.selected_conversation = Some(match self.selected_conversation {
             Some(i) => {
-                if i >= self.conversations.len() - 1 {
+                if i >= self.core.conversations.len() - 1 {
                     0
                 } else {
                     i + 1
@@ -480,18 +478,18 @@ impl App {
     }
 
     pub fn previous_conversation(&mut self) {
-        if self.conversations.is_empty() {
+        if self.core.conversations.is_empty() {
             return;
         }
         self.selected_conversation = Some(match self.selected_conversation {
             Some(i) => {
                 if i == 0 {
-                    self.conversations.len() - 1
+                    self.core.conversations.len() - 1
                 } else {
                     i - 1
                 }
             }
-            None => self.conversations.len() - 1,
+            None => self.core.conversations.len() - 1,
         });
     }
 
@@ -844,7 +842,7 @@ impl App {
     /// whether it was found (TUI-8: selection is positional, so after a
     /// reconnect's list refresh we reselect by id, not index).
     pub fn select_conversation_by_id(&mut self, id: &str) -> bool {
-        match self.conversations.iter().position(|c| c.id == id) {
+        match self.core.conversations.iter().position(|c| c.id == id) {
             Some(idx) => {
                 self.selected_conversation = Some(idx);
                 true
@@ -855,23 +853,28 @@ impl App {
 
     // --- Conversation management ---
 
+    /// The conversation list, owned by the shared core (CC-3 slice 4): the
+    /// reducer is authoritative for it (its conversation arms read + mutate
+    /// `core.conversations`), and the view reads it back through here. The TUI
+    /// keeps only the *positional* selection (`selected_conversation`) as view
+    /// state.
+    pub fn conversations(&self) -> &[ConversationSummary] {
+        &self.core.conversations
+    }
+
     pub fn set_conversations(&mut self, conversations: Vec<ConversationSummary>) {
-        // Mirror the list into the shared core so it stays authoritative for the
-        // sidebar (CC-3): the reducer's conversation arms read `core.conversations`
-        // (e.g. to decide reconnect reload vs. fresh load). Paths that don't route
+        // The shared core owns the list (CC-3 slice 4): store it there directly.
+        // The reducer's conversation arms read `core.conversations` (e.g. to
+        // decide reconnect reload vs. fresh load), and paths that don't route
         // through `core.apply` (connect-time load, create/delete) funnel here, so
-        // this single dual-write keeps core in sync regardless of the caller.
-        self.core.conversations = conversations.clone();
-        self.conversations = conversations;
+        // this keeps core authoritative regardless of the caller.
+        self.core.conversations = conversations;
         // Fix selection if out of bounds (positional selection is TUI view state).
+        let len = self.core.conversations.len();
         if let Some(sel) = self.selected_conversation
-            && sel >= self.conversations.len()
+            && sel >= len
         {
-            self.selected_conversation = if self.conversations.is_empty() {
-                None
-            } else {
-                Some(self.conversations.len() - 1)
-            };
+            self.selected_conversation = if len == 0 { None } else { Some(len - 1) };
         }
     }
 
@@ -915,7 +918,7 @@ impl App {
 
     pub fn selected_conversation_id(&self) -> Option<&str> {
         let idx = self.selected_conversation?;
-        self.conversations.get(idx).map(|c| c.id.as_str())
+        self.core.conversations.get(idx).map(|c| c.id.as_str())
     }
 
     // --- Rename ---
@@ -926,7 +929,7 @@ impl App {
         let Some(idx) = self.selected_conversation else {
             return;
         };
-        let Some(conv) = self.conversations.get(idx) else {
+        let Some(conv) = self.core.conversations.get(idx) else {
             return;
         };
         let mut ta = new_textarea();
@@ -950,6 +953,7 @@ impl App {
             return None;
         }
         let unchanged = self
+            .core
             .conversations
             .iter()
             .find(|c| c.id == id)
@@ -2112,8 +2116,8 @@ mod tests {
         );
 
         // Sidebar reflects the new list (and core stays authoritative for it)...
-        assert_eq!(app.conversations.len(), 2);
-        assert_eq!(app.conversations[0].title, "First (renamed elsewhere)");
+        assert_eq!(app.conversations().len(), 2);
+        assert_eq!(app.conversations()[0].title, "First (renamed elsewhere)");
         // ...but the open conversation + its transcript are byte-for-byte intact.
         let open = app.current_conversation.as_ref().expect("still open");
         assert_eq!(open.id, "2");
@@ -2146,7 +2150,7 @@ mod tests {
 
         let deleted = app.delete_selected_conversation();
         assert_eq!(deleted, Some("2".to_string()));
-        assert_eq!(app.conversations.len(), 2);
+        assert_eq!(app.conversations().len(), 2);
         assert!(
             app.current_conversation.is_none(),
             "deleting the active conversation clears the open chat"
@@ -2189,7 +2193,7 @@ mod tests {
         app.apply_rename("2", "Renamed Second");
 
         // The sidebar row is updated via the core-owned list...
-        let row = app.conversations.iter().find(|c| c.id == "2").unwrap();
+        let row = app.conversations().iter().find(|c| c.id == "2").unwrap();
         assert_eq!(row.title, "Renamed Second");
         // ...and the open chat's cached title (the header reads it) is refreshed.
         assert_eq!(
@@ -2319,7 +2323,7 @@ mod tests {
             conversation_personality: None,
         });
         app.apply_rename("2", "Renamed");
-        assert_eq!(app.conversations[1].title, "Renamed");
+        assert_eq!(app.conversations()[1].title, "Renamed");
         assert_eq!(app.current_conversation.as_ref().unwrap().title, "Renamed");
     }
 
