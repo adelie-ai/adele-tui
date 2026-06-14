@@ -253,6 +253,20 @@ fn single_line_textarea() -> TextArea<'static> {
     ta
 }
 
+use crate::in_flight::InFlight;
+
+/// Resolved outcome of an off-loop connections RPC (modal-freeze fix). Each
+/// variant carries the daemon result (stringified error); `apply_outcome` may
+/// chain a follow-up `refresh_list` after a successful save/delete.
+enum RpcOutcome {
+    Listed(Result<CommandResult, String>),
+    Saved(Result<CommandResult, String>),
+    Deleted {
+        force: bool,
+        result: Result<CommandResult, String>,
+    },
+}
+
 struct State {
     connections: Vec<ConnectionView>,
     selected: usize,
@@ -270,6 +284,9 @@ struct State {
 struct ConnectionsScreen<'a> {
     state: State,
     client: &'a TransportClient,
+    /// In-flight list/save/delete RPCs, polled off the draw loop by
+    /// `poll_pending` so the screen never freezes during a round-trip.
+    pending: InFlight<'a, RpcOutcome>,
 }
 
 impl Screen for ConnectionsScreen<'_> {
@@ -279,16 +296,32 @@ impl Screen for ConnectionsScreen<'_> {
         draw(frame, &self.state);
     }
 
-    async fn handle_key(&mut self, key: KeyEvent) {
+    fn handle_key(&mut self, key: KeyEvent) -> impl std::future::Future<Output = ()> {
+        // Synchronous: RPC-bearing keys enqueue into `pending` rather than
+        // awaiting here, so the handler never blocks the draw/input loop.
         match self.state.mode {
-            Mode::List => handle_list_key(&mut self.state, key, self.client).await,
-            Mode::Edit => handle_edit_key(&mut self.state, key, self.client).await,
-            Mode::DeleteConfirm => handle_delete_key(&mut self.state, key, self.client).await,
+            Mode::List => handle_list_key(&mut self.state, key, self.client, &mut self.pending),
+            Mode::Edit => handle_edit_key(&mut self.state, key, self.client, &mut self.pending),
+            Mode::DeleteConfirm => {
+                handle_delete_key(&mut self.state, key, self.client, &mut self.pending)
+            }
         }
+        std::future::ready(())
     }
 
     fn take_outcome(&mut self) -> Option<()> {
         self.state.closing.then_some(())
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    async fn poll_pending(&mut self) {
+        let resolved = self.pending.next().await;
+        if let Some(outcome) = resolved {
+            apply_outcome(&mut self.state, &mut self.pending, self.client, outcome);
+        }
     }
 }
 
@@ -309,14 +342,22 @@ pub async fn run(
             closing: false,
         },
         client,
+        pending: InFlight::new(),
     };
 
-    refresh_list(&mut screen.state, client).await;
+    // Kick the initial load off-loop so "Loading connections…" shows and the
+    // screen is responsive while it lands.
+    refresh_list(&mut screen.state, &mut screen.pending, client);
 
     crate::screen::run_screen(terminal, &mut screen, signal_rx, sink).await
 }
 
-async fn handle_list_key(state: &mut State, key: KeyEvent, client: &TransportClient) {
+fn handle_list_key<'a>(
+    state: &mut State,
+    key: KeyEvent,
+    client: &'a TransportClient,
+    pending: &mut InFlight<'a, RpcOutcome>,
+) {
     match (key.code, key.modifiers) {
         (KeyCode::Esc | KeyCode::Char('q'), m) if m.is_empty() => state.closing = true,
         (KeyCode::Char('j') | KeyCode::Down, m) if m.is_empty() => advance_selection(state, 1),
@@ -338,16 +379,21 @@ async fn handle_list_key(state: &mut State, key: KeyEvent, client: &TransportCli
         {
             state.mode = Mode::DeleteConfirm;
         }
-        (KeyCode::Char('r'), m) if m.is_empty() => refresh_list(state, client).await,
+        (KeyCode::Char('r'), m) if m.is_empty() => refresh_list(state, pending, client),
         _ => {}
     }
 }
 
-async fn handle_edit_key(state: &mut State, key: KeyEvent, client: &TransportClient) {
+fn handle_edit_key<'a>(
+    state: &mut State,
+    key: KeyEvent,
+    client: &'a TransportClient,
+    pending: &mut InFlight<'a, RpcOutcome>,
+) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
     if ctrl && key.code == KeyCode::Char('s') {
-        save_edit(state, client).await;
+        save_edit(state, pending, client);
         return;
     }
 
@@ -411,19 +457,29 @@ async fn handle_edit_key(state: &mut State, key: KeyEvent, client: &TransportCli
     }
 }
 
-async fn handle_delete_key(state: &mut State, key: KeyEvent, client: &TransportClient) {
+fn handle_delete_key<'a>(
+    state: &mut State,
+    key: KeyEvent,
+    client: &'a TransportClient,
+    pending: &mut InFlight<'a, RpcOutcome>,
+) {
     match (key.code, key.modifiers) {
         (KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter, _) => {
-            do_delete(state, client, false).await;
+            do_delete(state, pending, client, false);
         }
         (KeyCode::Char('f') | KeyCode::Char('F'), _) => {
-            do_delete(state, client, true).await;
+            do_delete(state, pending, client, true);
         }
         _ => state.mode = Mode::List,
     }
 }
 
-async fn do_delete(state: &mut State, client: &TransportClient, force: bool) {
+fn do_delete<'a>(
+    state: &mut State,
+    pending: &mut InFlight<'a, RpcOutcome>,
+    client: &'a TransportClient,
+    force: bool,
+) {
     let Some(view) = state.connections.get(state.selected).cloned() else {
         state.mode = Mode::List;
         return;
@@ -433,34 +489,15 @@ async fn do_delete(state: &mut State, client: &TransportClient, force: bool) {
     } else {
         "Deleting...".into()
     });
-    match send(
-        client,
-        Command::DeleteConnection {
-            id: view.id.clone(),
+    let id = view.id.clone();
+    pending.push(async move {
+        RpcOutcome::Deleted {
             force,
-        },
-    )
-    .await
-    {
-        Ok(_) => {
-            state.busy = None;
-            state.mode = Mode::List;
-            refresh_list(state, client).await;
+            result: send(client, Command::DeleteConnection { id, force })
+                .await
+                .map_err(|e| e.to_string()),
         }
-        Err(e) => {
-            state.busy = None;
-            // The daemon refuses non-force deletes when purposes still
-            // reference the connection. Surface that and stay in the
-            // confirm overlay so the user can press `f` to force.
-            let msg = e.to_string();
-            if !force && msg.to_lowercase().contains("purpose") {
-                state.error = Some(format!("{msg} — press 'f' to force"));
-            } else {
-                state.error = Some(format!("Delete failed: {msg}"));
-                state.mode = Mode::List;
-            }
-        }
-    }
+    });
 }
 
 fn advance_selection(state: &mut State, delta: i32) {
@@ -478,27 +515,26 @@ fn advance_selection(state: &mut State, delta: i32) {
     state.selected = idx as usize;
 }
 
-async fn refresh_list(state: &mut State, client: &TransportClient) {
+fn refresh_list<'a>(
+    state: &mut State,
+    pending: &mut InFlight<'a, RpcOutcome>,
+    client: &'a TransportClient,
+) {
     state.busy = Some("Loading connections...".into());
-    let result = send(client, Command::ListConnections).await;
-    state.busy = None;
-    match result {
-        Ok(CommandResult::Connections(conns)) => {
-            state.connections = conns;
-            if state.selected >= state.connections.len() {
-                state.selected = state.connections.len().saturating_sub(1);
-            }
-        }
-        Ok(other) => {
-            state.error = Some(format!("Unexpected response: {other:?}"));
-        }
-        Err(e) => {
-            state.error = Some(format!("Failed to load connections: {e}"));
-        }
-    }
+    pending.push(async move {
+        RpcOutcome::Listed(
+            send(client, Command::ListConnections)
+                .await
+                .map_err(|e| e.to_string()),
+        )
+    });
 }
 
-async fn save_edit(state: &mut State, client: &TransportClient) {
+fn save_edit<'a>(
+    state: &mut State,
+    pending: &mut InFlight<'a, RpcOutcome>,
+    client: &'a TransportClient,
+) {
     let (id, config) = match state.form.submit() {
         Ok(parts) => parts,
         Err(e) => {
@@ -517,18 +553,56 @@ async fn save_edit(state: &mut State, client: &TransportClient) {
         Command::CreateConnection { id, config }
     };
 
-    match send(client, cmd).await {
-        Ok(_) => {
-            state.busy = None;
-            state.error = None;
-            state.form = EditForm::empty();
-            state.mode = Mode::List;
-            refresh_list(state, client).await;
-        }
-        Err(e) => {
-            state.busy = None;
-            state.error = Some(format!("Save failed: {e}"));
-        }
+    pending
+        .push(async move { RpcOutcome::Saved(send(client, cmd).await.map_err(|e| e.to_string())) });
+}
+
+/// Apply a resolved connections RPC; chains a `refresh_list` after a successful
+/// save or delete (mirroring the old inline `refresh_list().await`).
+fn apply_outcome<'a>(
+    state: &mut State,
+    pending: &mut InFlight<'a, RpcOutcome>,
+    client: &'a TransportClient,
+    outcome: RpcOutcome,
+) {
+    state.busy = None;
+    match outcome {
+        RpcOutcome::Listed(result) => match result {
+            Ok(CommandResult::Connections(conns)) => {
+                state.connections = conns;
+                if state.selected >= state.connections.len() {
+                    state.selected = state.connections.len().saturating_sub(1);
+                }
+            }
+            Ok(other) => state.error = Some(format!("Unexpected response: {other:?}")),
+            Err(e) => state.error = Some(format!("Failed to load connections: {e}")),
+        },
+        RpcOutcome::Saved(result) => match result {
+            Ok(_) => {
+                state.error = None;
+                state.form = EditForm::empty();
+                state.mode = Mode::List;
+                refresh_list(state, pending, client);
+            }
+            Err(e) => state.error = Some(format!("Save failed: {e}")),
+        },
+        RpcOutcome::Deleted { force, result } => match result {
+            Ok(_) => {
+                state.mode = Mode::List;
+                refresh_list(state, pending, client);
+            }
+            Err(msg) => {
+                // The daemon refuses non-force deletes when purposes still
+                // reference the connection. Surface that and stay in the confirm
+                // overlay so the user can press `f` to force.
+                if !force && msg.to_lowercase().contains("purpose") {
+                    state.error = Some(format!("{msg} — press 'f' to force"));
+                } else {
+                    state.error = Some(format!("Delete failed: {msg}"));
+                    state.mode = Mode::List;
+                }
+            }
+        },
     }
 }
 
