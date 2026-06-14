@@ -613,7 +613,12 @@ fn handle_delete_key(state: &mut PickerState, key: KeyEvent) {
                 state.form = FormState::empty();
             }
         }
-        _ => state.mode = Mode::List,
+        // A destructive confirm is dismissed only by an explicit cancel
+        // (n/Esc); any other key is ignored rather than silently closing it.
+        (KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc, _) => {
+            state.mode = Mode::List;
+        }
+        _ => {}
     }
 }
 
@@ -909,7 +914,7 @@ fn draw_delete_overlay(f: &mut Frame, state: &PickerState, area: Rect) {
             Style::default().fg(Color::White),
         )),
         Line::from(Span::styled(
-            "y/Enter = confirm · any other key = cancel",
+            "y/Enter = confirm · n/Esc = cancel",
             Style::default().fg(theme().text_dim),
         )),
     ])
@@ -950,7 +955,7 @@ fn draw_hints(f: &mut Frame, state: &PickerState, area: Rect) {
             ("Ctrl+L", "OAuth sign-in"),
             ("Esc", "back"),
         ],
-        Mode::DeleteConfirm => &[("y/Enter", "confirm"), ("any", "cancel")],
+        Mode::DeleteConfirm => &[("y/Enter", "confirm"), ("n/Esc", "cancel")],
     };
 
     let mut spans: Vec<Span> = Vec::with_capacity(hints.len() * 4);
@@ -1137,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_confirm_other_key_cancels() {
+    fn delete_confirm_n_cancels() {
         let p = Profile::new(
             "Local".into(),
             TransportMode::Ws,
@@ -1149,5 +1154,37 @@ mod tests {
         handle_delete_key(&mut state, key(KeyCode::Char('n')));
         assert_eq!(state.store.profiles.len(), 1);
         assert_eq!(state.mode, Mode::List);
+    }
+
+    #[test]
+    fn delete_confirm_esc_cancels() {
+        let p = Profile::new(
+            "Local".into(),
+            TransportMode::Ws,
+            "ws://x".into(),
+            "s".into(),
+        );
+        let mut state = make_state(vec![p]);
+        state.mode = Mode::DeleteConfirm;
+        handle_delete_key(&mut state, key(KeyCode::Esc));
+        assert_eq!(state.store.profiles.len(), 1);
+        assert_eq!(state.mode, Mode::List);
+    }
+
+    #[test]
+    fn delete_confirm_stray_key_is_ignored() {
+        // A key that is neither confirm (y/Enter) nor cancel (n/Esc) must
+        // leave the overlay up rather than silently dismissing it.
+        let p = Profile::new(
+            "Local".into(),
+            TransportMode::Ws,
+            "ws://x".into(),
+            "s".into(),
+        );
+        let mut state = make_state(vec![p]);
+        state.mode = Mode::DeleteConfirm;
+        handle_delete_key(&mut state, key(KeyCode::Char('x')));
+        assert_eq!(state.store.profiles.len(), 1);
+        assert_eq!(state.mode, Mode::DeleteConfirm);
     }
 }

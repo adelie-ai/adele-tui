@@ -27,7 +27,7 @@
 //!
 //! Delete-confirm overlay:
 //! - `y/Enter`: confirm
-//! - any other key: cancel
+//! - `n`/`Esc`: cancel (any other key is ignored)
 
 use std::{io, time::Duration};
 
@@ -444,7 +444,12 @@ fn handle_delete_key<'a>(
             }
             state.mode = state.return_mode;
         }
-        _ => state.mode = Mode::List,
+        // A destructive confirm is dismissed only by an explicit cancel
+        // (n/Esc); any other key is ignored rather than silently closing it.
+        (KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc, _) => {
+            state.mode = Mode::List;
+        }
+        _ => {}
     }
 }
 
@@ -860,7 +865,7 @@ fn draw_hints(f: &mut Frame, state: &State, area: Rect) {
         ],
         Mode::Search => &[("Enter", "search"), ("Esc", "clear & back")],
         Mode::Edit => &[("Tab", "next field"), ("Ctrl+S", "save"), ("Esc", "cancel")],
-        Mode::DeleteConfirm => &[("y/Enter", "confirm"), ("any", "cancel")],
+        Mode::DeleteConfirm => &[("y/Enter", "confirm"), ("n/Esc", "cancel")],
     };
 
     let mut spans: Vec<Span> = Vec::with_capacity(hints.len() * 4);
@@ -924,7 +929,7 @@ fn draw_delete_overlay(f: &mut Frame, state: &State, area: Rect) {
             Style::default().fg(Color::White),
         )),
         Line::from(Span::styled(
-            "y/Enter = confirm · any other key = cancel",
+            "y/Enter = confirm · n/Esc = cancel",
             Style::default().fg(theme().text_dim),
         )),
     ])
