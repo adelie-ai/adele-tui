@@ -465,13 +465,22 @@ fn draw_input(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     // sent — is never mutated by terminal-width line breaks.
     let mut display = app.wrapped_display_textarea(wrap_width);
 
-    let (title, border_color) = match app.mode {
+    let (base_title, mode_color) = match app.mode {
         InputMode::Normal => ("Input (press 'i' to edit)", theme().input_border_idle),
         InputMode::Editing => (
             "Input (Esc cancel, Enter send, Shift+Enter/Ctrl+J newline)",
             theme().border_active,
         ),
         InputMode::Renaming => ("Input", theme().input_border_idle),
+    };
+    // When the daemon link is down the run loop projects `connected = false`;
+    // surface it where the user types — a warn-colored border plus an `offline`
+    // tag. The tag is text (not color-only) so it still reads under NO_COLOR,
+    // where the recolor is a no-op; the status bar carries the backoff detail.
+    let (title, border_color) = if app.connected {
+        (base_title.to_string(), mode_color)
+    } else {
+        (format!("offline · {base_title}"), theme().warn)
     };
 
     display.set_block(
@@ -763,6 +772,33 @@ mod tests {
         let mut app = App::new();
         app.status_message = "Error: connection lost".into();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn draw_input_marks_offline_when_disconnected() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.connected = false;
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(
+            dump.contains("offline"),
+            "offline tag must show when disconnected"
+        );
+    }
+
+    #[test]
+    fn draw_input_has_no_offline_tag_when_connected() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        // App::new() defaults connected = true.
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(!dump.contains("offline"), "no offline tag while connected");
     }
 
     #[test]

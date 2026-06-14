@@ -422,6 +422,12 @@ async fn run(
     }
 
     loop {
+        // Project the run loop's connection state into the model so the view
+        // can render disconnect chrome — the loop owns the socket; the draw
+        // path only sees `app`. Mirror the exact predicate that gates sending
+        // (`connector.is_some()`) so the `offline` cue shows precisely when a
+        // send would be refused.
+        app.connected = connector.is_some();
         terminal.draw(|f| ui::draw(f, &mut app))?;
 
         if app.should_quit {

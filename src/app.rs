@@ -139,6 +139,13 @@ pub struct App {
     pub streaming_is_external: bool,
     pub mode: InputMode,
     pub status_message: String,
+    /// Whether the daemon connection is currently live. The run loop projects
+    /// its `ReconnectState` into this each frame (it owns the socket); the view
+    /// reads it to render disconnect chrome — a warn-colored input border plus
+    /// an `offline` tag. Defaults `true`; the loop overwrites it before the
+    /// first draw. (CC-3 moves this into the shared `core` once signals route
+    /// through the reducer.)
+    pub connected: bool,
     pub should_quit: bool,
     /// Whether the `?`/F1 keymap help overlay is shown. Any key closes it.
     pub show_help: bool,
@@ -230,6 +237,7 @@ impl App {
             streaming_is_external: false,
             mode: InputMode::Normal,
             status_message: "Connected".to_string(),
+            connected: true,
             should_quit: false,
             show_help: false,
             scroll_offset: 0,
