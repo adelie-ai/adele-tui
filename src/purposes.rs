@@ -50,6 +50,7 @@ use crate::theme::theme;
 const PURPOSES: &[PurposeKindApi] = &[
     PurposeKindApi::Interactive,
     PurposeKindApi::Dreaming,
+    PurposeKindApi::Consolidation,
     PurposeKindApi::Embedding,
     PurposeKindApi::Titling,
 ];
@@ -521,6 +522,7 @@ fn purpose_slot(view: &PurposesView, kind: PurposeKindApi) -> Option<&PurposeCon
     match kind {
         PurposeKindApi::Interactive => view.interactive.as_ref(),
         PurposeKindApi::Dreaming => view.dreaming.as_ref(),
+        PurposeKindApi::Consolidation => view.consolidation.as_ref(),
         PurposeKindApi::Embedding => view.embedding.as_ref(),
         PurposeKindApi::Titling => view.titling.as_ref(),
     }
@@ -530,6 +532,7 @@ fn purpose_label(kind: PurposeKindApi) -> &'static str {
     match kind {
         PurposeKindApi::Interactive => "Interactive",
         PurposeKindApi::Dreaming => "Dreaming",
+        PurposeKindApi::Consolidation => "Consolidation",
         PurposeKindApi::Embedding => "Embedding",
         PurposeKindApi::Titling => "Titling",
     }
