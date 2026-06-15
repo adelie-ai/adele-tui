@@ -383,7 +383,8 @@ fn advance_selection(state: &mut PickerState, delta: i32) {
 
 /// Validate and commit the connection form: on success, store the profile and
 /// return to the list; on failure, surface the validation error in place.
-/// Shared by the Enter key and the Ctrl+S accelerator.
+/// Reached via the `Ctrl+S` submit accelerator (the one form-submit key shared
+/// across every modal form in the TUI).
 fn submit_form(state: &mut PickerState) {
     match state.form.submit() {
         Ok(submitted) => {
@@ -413,10 +414,11 @@ fn handle_form_key(state: &mut PickerState, key: KeyEvent) {
         return;
     }
 
-    // Ctrl+S saves the form — the universal "submit a form" accelerator shared
-    // with the modal screens (KB / connections / purposes). There a multi-line
-    // field makes Enter a newline, so Ctrl+S is the only save key; here the
-    // fields are single-line so Enter also saves, but Ctrl+S works everywhere.
+    // Ctrl+S saves the form — the one "submit a form" accelerator, identical to
+    // the modal screens (KB / connections / purposes). Those have a multi-line
+    // field where Enter is a newline, so Ctrl+S is the only save key; we keep the
+    // same rule here for consistency rather than also overloading Enter (which
+    // would diverge from the other forms).
     if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
         submit_form(state);
         return;
@@ -441,7 +443,11 @@ fn handle_form_key(state: &mut PickerState, key: KeyEvent) {
         (KeyCode::BackTab, _) => state.form.prev_field(),
         (KeyCode::Up, m) if m.is_empty() => state.form.prev_field(),
         (KeyCode::Down, m) if m.is_empty() => state.form.next_field(),
-        (KeyCode::Enter, m) if m.is_empty() => submit_form(state),
+        // Enter is intentionally NOT a submit key: the one form-submit
+        // convention is Ctrl+S (above), matching KB / connections / purposes
+        // where a multi-line field reserves Enter for newlines. Swallow it here
+        // so it neither submits nor leaks into a single-line field as a newline.
+        (KeyCode::Enter, m) if m.is_empty() => {}
         // Transport field cycles Local → WebSocket → D-Bus with left/right
         // (space steps forward).
         (KeyCode::Right | KeyCode::Char(' '), _) if state.form.focus == Field::Transport => {
@@ -967,7 +973,7 @@ fn draw_hints(f: &mut Frame, state: &PickerState, area: Rect) {
         ],
         Mode::Form => &[
             ("Tab", "next field"),
-            ("Enter/Ctrl+S", "save"),
+            ("Ctrl+S", "save"),
             ("Ctrl+L", "OAuth sign-in"),
             ("Esc", "back"),
         ],
@@ -1144,17 +1150,30 @@ mod tests {
     fn form_submit_with_blank_name_records_error() {
         let mut state = make_state(vec![]);
         state.mode = Mode::Form;
-        // Name is empty by default.
-        handle_form_key(&mut state, key(KeyCode::Enter));
+        // Name is empty by default. Ctrl+S is the one form-submit key.
+        handle_form_key(&mut state, ctrl(KeyCode::Char('s')));
         assert!(state.error.is_some());
         assert_eq!(state.mode, Mode::Form);
     }
 
     #[test]
-    fn form_ctrl_s_saves_like_enter() {
-        // Ctrl+S is the universal form-save accelerator (it's the only save key
-        // in the multi-line modal forms); on a valid form it must commit the
-        // profile and return to the list, exactly as Enter does here.
+    fn form_enter_does_not_submit() {
+        // Enter is NOT a submit key here — the one form-submit convention is
+        // Ctrl+S, matching the modal screens whose multi-line fields reserve
+        // Enter for newlines. A valid form left on Enter must stay unsaved.
+        let mut state = make_state(vec![]);
+        state.mode = Mode::Form;
+        state.form.name.insert_str("My Conn"); // would be a valid UDS profile
+        handle_form_key(&mut state, key(KeyCode::Enter));
+        assert!(state.store.profiles.is_empty());
+        assert_eq!(state.mode, Mode::Form);
+    }
+
+    #[test]
+    fn form_ctrl_s_saves() {
+        // Ctrl+S is the universal form-save accelerator (the only save key,
+        // identical to the modal screens); on a valid form it must commit the
+        // profile and return to the list.
         let mut state = make_state(vec![]);
         state.mode = Mode::Form;
         state.form.name.insert_str("My Conn"); // UDS default needs only a name
@@ -1166,9 +1185,9 @@ mod tests {
     }
 
     #[test]
-    fn form_ctrl_s_on_blank_form_records_error_like_enter() {
-        // And it routes through the same validation: a blank form errors in
-        // place rather than committing.
+    fn form_ctrl_s_on_blank_form_records_error() {
+        // And it routes through validation: a blank form errors in place rather
+        // than committing.
         let mut state = make_state(vec![]);
         state.mode = Mode::Form;
         handle_form_key(&mut state, ctrl(KeyCode::Char('s')));
