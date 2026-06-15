@@ -92,18 +92,9 @@ impl Profile {
             ws_login_username: self.username.clone(),
             ws_login_password: password,
             socket_path: self.socket_path.clone(),
-            // Mint the UDS handshake JWT from the local `adelie-mint` minter
-            // (#101/#316) — the preferred, non-retiring source — rather than the
-            // deprecated D-Bus `generate_ws_jwt` path (removed by the cutover).
-            // UDS-only: the minter issues tokens the *local* daemon trusts;
-            // WS targets a (possibly remote) server and must keep authenticating
-            // via OAuth/password (an explicit `ws_jwt` or the `/login` fallback),
-            // and D-Bus needs no token at all (peer credentials).
-            minter_socket: if matches!(self.transport, TransportMode::Uds) {
-                desktop_assistant_client_common::minter::default_minter_socket_path()
-            } else {
-                None
-            },
+            // Local UDS authenticates by kernel peer-cred (desktop-assistant#407):
+            // no token is minted. WS still authenticates via an explicit `ws_jwt`
+            // or the `/login` fallback; D-Bus needs no token either (peer creds).
             ..Default::default()
         }
     }
