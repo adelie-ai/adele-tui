@@ -830,17 +830,29 @@ impl App {
     }
 
     pub fn load_conversation(&mut self, detail: ConversationDetail) {
-        let switching =
-            self.core.current_conversation().map(|c| c.id.as_str()) != Some(detail.id.as_str());
+        let incoming_id = detail.id.clone();
+        let outgoing_id = self.core.current_conversation().map(|c| c.id.clone());
+        let switching = outgoing_id.as_deref() != Some(incoming_id.as_str());
+        // Save the conversation we're leaving: snapshot its unsent composer text
+        // into the shared model so switching back restores it (#2). The textarea
+        // stays the live editor; the model owns the saved draft (empty drops it).
+        if switching && let Some(id) = outgoing_id.as_deref() {
+            let draft = self.textarea_content();
+            self.core.set_composer_draft(id, draft);
+        }
         // Seed the shared core's open conversation (CC-3 slice 4): it owns both the
         // rendered transcript (the reducer finalizes streamed replies into it) and
         // the id its streaming originating-conversation checks (TUI-4 / GTK-2)
         // judge against, so the stream events route to the conversation in view.
         self.core.open_conversation(detail);
-        // Drop a stale context-fill reading when the visible conversation
-        // changes; the next turn re-establishes it (#341).
         if switching {
+            // Drop a stale context-fill reading when the visible conversation
+            // changes; the next turn re-establishes it (#341).
             self.context_usage = None;
+            // Restore the conversation we're entering: load its saved draft into
+            // the composer (empty if none), cursor at end.
+            let draft = self.core.composer_draft(&incoming_id).to_string();
+            self.set_composer(&draft);
         }
     }
 
@@ -1096,6 +1108,48 @@ mod tests {
             app.context_usage, None,
             "stale reading must not bleed across"
         );
+    }
+
+    #[test]
+    fn composer_draft_is_saved_and_restored_across_a_switch() {
+        // The composer draft is per-conversation (#2): switching away snapshots
+        // the unsent text into the shared model, switching back restores it.
+        let mut app = App::new();
+        app.load_conversation(detail("c1"));
+        app.textarea.insert_str("half-written c1 message");
+
+        app.load_conversation(detail("c2"));
+        assert_eq!(
+            app.textarea_content(),
+            "",
+            "a fresh conversation opens with an empty composer"
+        );
+        app.textarea.insert_str("c2 thoughts");
+
+        app.load_conversation(detail("c1"));
+        assert_eq!(
+            app.textarea_content(),
+            "half-written c1 message",
+            "switching back restores c1's saved draft"
+        );
+
+        app.load_conversation(detail("c2"));
+        assert_eq!(
+            app.textarea_content(),
+            "c2 thoughts",
+            "and c2's draft is preserved independently"
+        );
+    }
+
+    #[test]
+    fn reopening_the_same_conversation_keeps_the_in_progress_draft() {
+        // A reload (same id — e.g. after a rename or reconnect) is not a switch,
+        // so it must not wipe what the user is mid-way through typing.
+        let mut app = App::new();
+        app.load_conversation(detail("c1"));
+        app.textarea.insert_str("still typing");
+        app.load_conversation(detail("c1"));
+        assert_eq!(app.textarea_content(), "still typing");
     }
 
     fn sample_conversations() -> Vec<ConversationSummary> {
