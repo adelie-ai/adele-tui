@@ -154,6 +154,15 @@ pub struct App {
     pub should_quit: bool,
     /// Whether the `?`/F1 keymap help overlay is shown. Any key closes it.
     pub show_help: bool,
+    /// Title of the conversation awaiting a delete confirmation, or `None` when
+    /// no confirm overlay is up. Set when `d` is pressed in the sidebar (it no
+    /// longer deletes immediately — matching the KB / connections / profile
+    /// destructive-delete convention); the overlay names this title. `y`/`Enter`
+    /// confirms (runs the delete against the still-selected row), `n`/`Esc`
+    /// cancels; any other key is ignored. Held only for display — the delete
+    /// itself operates on `selected_conversation`, which the overlay blocks the
+    /// user from moving.
+    pub pending_delete_conversation: Option<String>,
     /// Lines scrolled up from the bottom. 0 = auto-scroll to bottom.
     pub scroll_offset: u16,
     /// Whether to include archived conversations in the list.
@@ -235,6 +244,7 @@ impl App {
             connected: true,
             should_quit: false,
             show_help: false,
+            pending_delete_conversation: None,
             scroll_offset: 0,
             show_archived: false,
             rename_textarea: new_textarea(),
@@ -955,6 +965,41 @@ impl App {
             title: title.to_string(),
         });
         self.set_open_conversation_title(conversation_id, title);
+    }
+
+    // --- Delete confirmation ---
+
+    /// Arm the delete-confirm overlay for the selected conversation, stashing its
+    /// title for the prompt. No-op when nothing is selected (so a stray `d` on an
+    /// empty list does nothing). The overlay is dismissed by [`Self::confirm_delete`]
+    /// or [`Self::cancel_delete_confirm`]; the actual removal still goes through
+    /// [`Self::delete_selected_conversation`] on confirm.
+    pub fn begin_delete_confirm(&mut self) {
+        let Some(idx) = self.selected_conversation else {
+            return;
+        };
+        let Some(conv) = self.core.conversations.get(idx) else {
+            return;
+        };
+        self.pending_delete_conversation = Some(conv.title.clone());
+    }
+
+    /// Whether the delete-confirm overlay is currently up.
+    pub fn delete_confirm_pending(&self) -> bool {
+        self.pending_delete_conversation.is_some()
+    }
+
+    /// Dismiss the delete-confirm overlay on confirmation, returning `true` when
+    /// it was actually up (the caller then runs the delete). The removal itself is
+    /// left to [`Self::delete_selected_conversation`] so the existing delete path
+    /// is unchanged.
+    pub fn confirm_delete(&mut self) -> bool {
+        self.pending_delete_conversation.take().is_some()
+    }
+
+    /// Dismiss the delete-confirm overlay without deleting.
+    pub fn cancel_delete_confirm(&mut self) {
+        self.pending_delete_conversation = None;
     }
 
     pub fn delete_selected_conversation(&mut self) -> Option<String> {
@@ -1986,6 +2031,66 @@ mod tests {
             "deleting the active conversation clears the open chat"
         );
         assert_eq!(app.selected_conversation, Some(1)); // stays at 1 (now "Third")
+    }
+
+    // --- Delete-confirm gate (mirrors picker.rs's confirm tests; the event loop
+    // routes y/Enter → confirm_delete + delete, n/Esc → cancel_delete_confirm). ---
+
+    #[test]
+    fn begin_delete_confirm_arms_overlay_with_selected_title() {
+        let mut app = app_with_conversations();
+        assert!(!app.delete_confirm_pending(), "starts disarmed");
+        app.selected_conversation = Some(1); // "Second"
+        app.begin_delete_confirm();
+        assert!(app.delete_confirm_pending());
+        assert_eq!(app.pending_delete_conversation.as_deref(), Some("Second"));
+    }
+
+    #[test]
+    fn begin_delete_confirm_without_selection_is_noop() {
+        let mut app = app_with_conversations();
+        assert!(app.selected_conversation.is_none());
+        app.begin_delete_confirm();
+        assert!(
+            !app.delete_confirm_pending(),
+            "a stray `d` on nothing selected does not arm the overlay"
+        );
+    }
+
+    #[test]
+    fn confirm_delete_then_delete_removes_the_row() {
+        // The loop's y/Enter path: confirm_delete() clears the overlay and
+        // reports it was up, then delete_selected_conversation() removes the row.
+        let mut app = app_with_conversations();
+        app.selected_conversation = Some(1); // "Second"
+        app.begin_delete_confirm();
+        assert!(app.confirm_delete(), "reports the overlay was up");
+        assert!(!app.delete_confirm_pending(), "overlay cleared on confirm");
+        let deleted = app.delete_selected_conversation();
+        assert_eq!(deleted, Some("2".to_string()));
+        assert_eq!(app.conversations().len(), 2);
+        assert!(app.conversations().iter().all(|c| c.id != "2"));
+    }
+
+    #[test]
+    fn confirm_delete_returns_false_when_not_armed() {
+        // Guards the loop's gate: the confirm branch only runs the delete when
+        // the overlay was actually up (it checks `delete_confirm_pending` first,
+        // and confirm_delete() reports false otherwise).
+        let mut app = app_with_conversations();
+        assert!(!app.confirm_delete());
+    }
+
+    #[test]
+    fn cancel_delete_confirm_dismisses_without_deleting() {
+        // The loop's n/Esc path: cancel clears the overlay and the row survives.
+        let mut app = app_with_conversations();
+        app.selected_conversation = Some(1); // "Second"
+        app.begin_delete_confirm();
+        app.cancel_delete_confirm();
+        assert!(!app.delete_confirm_pending());
+        assert_eq!(app.conversations().len(), 3, "nothing was deleted");
+        assert!(app.conversations().iter().any(|c| c.id == "2"));
     }
 
     #[test]

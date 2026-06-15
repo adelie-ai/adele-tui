@@ -84,10 +84,50 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         crate::tasks::draw_overlay(f, &app.tasks, f.area());
     }
 
+    // Delete-confirm overlay (armed by `d` in the sidebar). Modal: the event
+    // loop only honors confirm/cancel keys while it's up. Rendered on top of the
+    // chat, matching the KB / connections / profile destructive-delete confirms.
+    if let Some(title) = &app.pending_delete_conversation {
+        draw_delete_overlay(f, title, f.area());
+    }
+
     // Keymap help (?/F1) sits on top of everything.
     if app.show_help {
         draw_help_overlay(f, f.area());
     }
+}
+
+/// Confirm overlay for conversation-delete (`d`). Mirrors the destructive-delete
+/// confirms in `kb.rs` / `connections.rs` / `picker.rs`: red border, the named
+/// target, and the shared `y/Enter = confirm · n/Esc = cancel` footer.
+fn draw_delete_overlay(f: &mut Frame, title: &str, area: Rect) {
+    let popup_width = 60u16.min(area.width.saturating_sub(4));
+    let popup_height = 5u16.min(area.height.saturating_sub(2));
+    let popup = centered_rect(popup_width, popup_height, area);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme().error))
+        .title(Line::from(Span::styled(
+            "Delete conversation",
+            Style::default()
+                .fg(theme().error_text)
+                .add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let body = Paragraph::new(vec![
+        Line::from(Span::styled(
+            format!("Delete \"{title}\"?"),
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            "y/Enter = confirm · n/Esc = cancel",
+            Style::default().fg(theme().text_dim),
+        )),
+    ])
+    .wrap(Wrap { trim: true });
+    f.render_widget(body, inner);
 }
 
 /// The `?`/F1 keymap help overlay. Content comes from `keys::help_sections` so

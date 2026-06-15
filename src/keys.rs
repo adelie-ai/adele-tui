@@ -8,6 +8,13 @@ pub enum Action {
     NextConversation,
     PreviousConversation,
     OpenConversation,
+    /// Arm the delete-confirm overlay for the selected conversation (`d` in the
+    /// sidebar). Deletion no longer fires on the first keypress — matching the
+    /// KB / connections / profile destructive-delete flows, which all confirm
+    /// first. The overlay's `y`/`Enter` then dispatches [`Action::DeleteConversation`].
+    BeginDeleteConversation,
+    /// Perform the conversation delete. Dispatched by the confirm overlay
+    /// (`y`/`Enter`), not bound to a key directly.
     DeleteConversation,
     ArchiveConversation,
     NewConversation,
@@ -187,7 +194,7 @@ pub fn handle_key_event(
                 KeyCode::Char('q') => Some(Action::Quit),
                 KeyCode::Char('j') | KeyCode::Down => Some(Action::NextConversation),
                 KeyCode::Char('k') | KeyCode::Up => Some(Action::PreviousConversation),
-                KeyCode::Char('d') => Some(Action::DeleteConversation),
+                KeyCode::Char('d') => Some(Action::BeginDeleteConversation),
                 KeyCode::Char('n') => Some(Action::NewConversation),
                 KeyCode::Char('a') => Some(Action::ToggleShowArchived),
                 KeyCode::Char('A') => Some(Action::ArchiveConversation),
@@ -390,10 +397,14 @@ mod tests {
     }
 
     #[test]
-    fn normal_d_deletes() {
+    fn normal_d_arms_delete_confirm() {
+        // `d` no longer deletes immediately — it arms the confirm overlay
+        // (matching the KB / connections / profile destructive-delete flows).
+        // The actual `DeleteConversation` is dispatched by the overlay on
+        // `y`/`Enter`, not bound to a key.
         assert_eq!(
             handle_key_event(key(KeyCode::Char('d')), &InputMode::Normal, false),
-            Some(Action::DeleteConversation)
+            Some(Action::BeginDeleteConversation)
         );
     }
 
