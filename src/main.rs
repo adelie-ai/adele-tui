@@ -12,8 +12,8 @@ use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches, Parser, parser::ValueSource};
 use crossterm::{
     event::{
-        DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -613,6 +613,30 @@ async fn run(
                     // dismisses it (and does nothing else).
                     if app.show_help {
                         app.show_help = false;
+                        continue;
+                    }
+                    // The delete-confirm overlay is modal: while it's up, only an
+                    // explicit confirm (y/Y/Enter) or cancel (n/N/Esc) is honored;
+                    // every other key is ignored (matching the KB / connections /
+                    // profile confirms). Confirm runs the existing delete path.
+                    if app.delete_confirm_pending() {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                                if app.confirm_delete() {
+                                    handle_action(
+                                        &mut app,
+                                        &connector,
+                                        &mut in_flight,
+                                        Action::DeleteConversation,
+                                    )
+                                    .await;
+                                }
+                            }
+                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                app.cancel_delete_confirm();
+                            }
+                            _ => {}
+                        }
                         continue;
                     }
                     if let Some(action) = handle_key_event(key, &app.mode, app.tasks.visible) {
@@ -1316,6 +1340,13 @@ async fn handle_action(
                     }
                 });
             }
+        }
+        Action::BeginDeleteConversation => {
+            // `d` arms the confirm overlay instead of deleting outright (matching
+            // the other destructive deletes). The overlay's y/Enter dispatches
+            // `DeleteConversation`; n/Esc cancels. Both are driven in the event
+            // loop, which renders the overlay while it's armed.
+            app.begin_delete_confirm();
         }
         Action::DeleteConversation => {
             // Check connectivity BEFORE mutating local state (TUI-2's shape):
