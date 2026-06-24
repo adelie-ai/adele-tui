@@ -81,6 +81,7 @@ pub fn kind_label_for(kind: &TaskKind) -> &'static str {
         TaskKind::Conversation { .. } => "Chat",
         TaskKind::Subagent { .. } => "Subagent",
         TaskKind::Standalone { .. } => "Agent",
+        TaskKind::Maintenance { .. } => "Maintenance",
     }
 }
 
@@ -94,6 +95,8 @@ impl TaskRow {
             | TaskKind::Subagent {
                 conversation_id, ..
             } => Some(conversation_id.clone()),
+            // Maintenance passes are not tied to a conversation.
+            TaskKind::Maintenance { .. } => None,
         };
         Self {
             id: view.id.clone(),

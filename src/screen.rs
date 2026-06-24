@@ -85,6 +85,15 @@ pub trait Screen {
     fn poll_pending(&mut self) -> impl Future<Output = ()> {
         std::future::pending()
     }
+
+    /// React to a daemon signal drained while this screen is open. Called by the
+    /// driver for every [`SignalEvent`] *before* it is handed to the [`SignalSink`]
+    /// (so the screen sees it by reference without a clone). Default no-op: only
+    /// the KB browser uses it today, to refetch live when the daemon broadcasts a
+    /// `KnowledgeChanged` (a maintenance pass or another client edited an entry).
+    fn on_signal(&mut self, _signal: &SignalEvent) -> impl Future<Output = ()> {
+        async {}
+    }
 }
 
 /// Sink for daemon signals drained while a modal screen is open (TUI-12).
@@ -152,8 +161,11 @@ where
                 }
             }
             // TUI-12: drain daemon signals while the screen is open so a parked
-            // client-tool turn resumes immediately instead of looking hung.
+            // client-tool turn resumes immediately instead of looking hung. The
+            // screen sees each signal first (by ref) so e.g. the KB browser can
+            // refetch live on `KnowledgeChanged`; the sink then consumes it.
             Some(signal) = signal_rx.recv() => {
+                screen.on_signal(&signal).await;
                 sink.handle(signal).await;
             }
             _ = async {
