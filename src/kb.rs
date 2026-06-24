@@ -13,6 +13,9 @@
 //! - `n`: new entry
 //! - `d`: delete selected (confirm overlay)
 //! - `/`: focus search input
+//! - `D`: run a dream-cycle extraction pass
+//! - `C`: run a dream-cycle consolidation pass
+//! - `E`: recalculate all embeddings (confirm overlay)
 //! - `Esc` or `q`: close
 //!
 //! Search input (focused via `/`):
@@ -32,7 +35,7 @@
 use std::{io, time::Duration};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use desktop_assistant_api_model::KnowledgeEntryView;
+use desktop_assistant_api_model::{KnowledgeEntryView, MaintenanceOp};
 use desktop_assistant_client_common::{AssistantClient, SignalEvent, TransportClient};
 use ratatui::{
     Frame, Terminal,
@@ -59,6 +62,8 @@ enum Mode {
     Search,
     Edit,
     DeleteConfirm,
+    /// Confirm overlay for the expensive "recalculate all embeddings" pass.
+    RecalcConfirm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +213,9 @@ struct State {
     edit: EditForm,
     error: Option<String>,
     busy: Option<String>,
+    /// Transient non-error status line (e.g. "Extraction started"). Shown in the
+    /// status row when nothing is busy or errored; cleared on the next action.
+    notice: Option<String>,
     /// True when the user pressed Esc on the list with intent to close.
     closing: bool,
 }
@@ -223,6 +231,10 @@ enum RpcOutcome {
         id: String,
         result: Result<(), String>,
     },
+    /// A maintenance pass was accepted by the daemon (`Ok` carries a status line
+    /// like "Extraction started"); it then runs in the background and streams
+    /// `KnowledgeChanged` as entries land.
+    MaintenanceStarted(Result<String, String>),
 }
 
 /// The KB browser as a [`Screen`]: its mutable [`State`] plus the borrowed
@@ -276,6 +288,19 @@ impl Screen for KbScreen<'_> {
             apply_outcome(&mut self.state, outcome);
         }
     }
+
+    fn on_signal(&mut self, signal: &SignalEvent) -> impl std::future::Future<Output = ()> {
+        // Live refresh: the daemon broadcasts `KnowledgeChanged` as a maintenance
+        // pass writes entries (or another client edits one). Refetch the list so
+        // the browser updates in place while it stays open. Only when not mid-edit,
+        // so a refetch never clobbers an in-progress entry the user is typing.
+        if matches!(signal, SignalEvent::KnowledgeChanged)
+            && !matches!(self.state.mode, Mode::Edit)
+        {
+            refresh_list(&mut self.state, &mut self.pending, self.client);
+        }
+        std::future::ready(())
+    }
 }
 
 /// Run the KB browser until the user closes it. Returns when `Esc/q` is
@@ -300,6 +325,7 @@ pub async fn run(
             edit: EditForm::empty(),
             error: None,
             busy: Some("Loading entries...".into()),
+            notice: None,
             closing: false,
         },
         client,
@@ -323,6 +349,7 @@ fn handle_key<'a>(
         Mode::Search => handle_search_key(state, key),
         Mode::Edit => handle_edit_key(state, key, client, pending),
         Mode::DeleteConfirm => handle_delete_key(state, key, client, pending),
+        Mode::RecalcConfirm => handle_recalc_confirm_key(state, key, client, pending),
     }
 }
 
@@ -357,6 +384,25 @@ fn handle_list_key<'a>(
             state.mode = Mode::Search;
         }
         (KeyCode::Char('r'), m) if m.is_empty() => refresh_list(state, pending, client),
+        // Dream-cycle controls. Uppercase (Shift) so they don't collide with the
+        // lowercase navigation/edit keys; matched with any modifier like the
+        // y/Y confirm keys below. `D`/`C` fire immediately; `E` (a full re-embed
+        // of the whole KB) is gated behind a confirm overlay.
+        (KeyCode::Char('D'), _) => {
+            start_maintenance(state, pending, client, MaintenanceOp::Extraction, "Extraction");
+        }
+        (KeyCode::Char('C'), _) => {
+            start_maintenance(
+                state,
+                pending,
+                client,
+                MaintenanceOp::Consolidation,
+                "Consolidation",
+            );
+        }
+        (KeyCode::Char('E'), _) => {
+            state.mode = Mode::RecalcConfirm;
+        }
         _ => {}
     }
 }
@@ -451,6 +497,56 @@ fn handle_delete_key<'a>(
         }
         _ => {}
     }
+}
+
+fn handle_recalc_confirm_key<'a>(
+    state: &mut State,
+    key: KeyEvent,
+    client: &'a TransportClient,
+    pending: &mut InFlight<'a, RpcOutcome>,
+) {
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter, _) => {
+            start_maintenance(
+                state,
+                pending,
+                client,
+                MaintenanceOp::RecalculateEmbeddings,
+                "Recalculate embeddings",
+            );
+            state.mode = Mode::List;
+        }
+        // Like the delete confirm: only an explicit cancel dismisses it.
+        (KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc, _) => {
+            state.mode = Mode::List;
+        }
+        _ => {}
+    }
+}
+
+/// Fire a knowledge-maintenance pass off-loop. The daemon runs it as a tracked
+/// background task and replies immediately; we surface that as a transient notice
+/// (or an error), and the live `KnowledgeChanged` stream refreshes the list as
+/// entries land.
+fn start_maintenance<'a>(
+    state: &mut State,
+    pending: &mut InFlight<'a, RpcOutcome>,
+    client: &'a TransportClient,
+    op: MaintenanceOp,
+    label: &'static str,
+) {
+    state.error = None;
+    state.notice = None;
+    state.busy = Some(format!("{label} starting..."));
+    pending.push(async move {
+        RpcOutcome::MaintenanceStarted(
+            client
+                .start_knowledge_maintenance(op)
+                .await
+                .map(|_task_id| format!("{label} started"))
+                .map_err(|e| format!("{label} failed: {e}")),
+        )
+    });
 }
 
 fn advance_selection(state: &mut State, delta: i32) {
@@ -574,6 +670,11 @@ fn apply_outcome(state: &mut State, outcome: RpcOutcome) {
             }
             Err(e) => state.error = Some(e),
         },
+        RpcOutcome::MaintenanceStarted(Ok(msg)) => {
+            state.error = None;
+            state.notice = Some(msg);
+        }
+        RpcOutcome::MaintenanceStarted(Err(e)) => state.error = Some(e),
     }
 }
 
@@ -605,6 +706,9 @@ fn draw(f: &mut Frame, state: &State) {
 
     if matches!(state.mode, Mode::DeleteConfirm) {
         draw_delete_overlay(f, state, area);
+    }
+    if matches!(state.mode, Mode::RecalcConfirm) {
+        draw_recalc_overlay(f, area);
     }
 }
 
@@ -850,6 +954,12 @@ fn draw_status(f: &mut Frame, state: &State, area: Rect) {
             Paragraph::new(Span::styled(format!(" • {err}"), style)),
             area,
         );
+    } else if let Some(notice) = &state.notice {
+        let style = Style::default().fg(theme().assistant_indicator);
+        f.render_widget(
+            Paragraph::new(Span::styled(format!(" ✓ {notice}"), style)),
+            area,
+        );
     }
 }
 
@@ -861,11 +971,15 @@ fn draw_hints(f: &mut Frame, state: &State, area: Rect) {
             ("d", "delete"),
             ("/", "search"),
             ("r", "refresh"),
+            ("D/C", "dream extract/consolidate"),
+            ("E", "recalc embeddings"),
             ("Esc", "back to chat"),
         ],
         Mode::Search => &[("Enter", "search"), ("Esc", "clear & back")],
         Mode::Edit => &[("Tab", "next field"), ("Ctrl+S", "save"), ("Esc", "cancel")],
-        Mode::DeleteConfirm => &[("y/Enter", "confirm"), ("n/Esc", "cancel")],
+        Mode::DeleteConfirm | Mode::RecalcConfirm => {
+            &[("y/Enter", "confirm"), ("n/Esc", "cancel")]
+        }
     };
 
     let mut spans: Vec<Span> = Vec::with_capacity(hints.len() * 4);
@@ -926,6 +1040,41 @@ fn draw_delete_overlay(f: &mut Frame, state: &State, area: Rect) {
     let body = Paragraph::new(vec![
         Line::from(Span::styled(
             format!("Delete \"{label}\"?"),
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            "y/Enter = confirm · n/Esc = cancel",
+            Style::default().fg(theme().text_dim),
+        )),
+    ])
+    .wrap(Wrap { trim: true });
+    f.render_widget(body, inner);
+}
+
+fn draw_recalc_overlay(f: &mut Frame, area: Rect) {
+    let popup_width = 64.min(area.width.saturating_sub(4));
+    let popup_height = 6.min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(popup_width)) / 2,
+        y: area.y + (area.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height,
+    };
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme().error))
+        .title(Line::from(Span::styled(
+            "Recalculate embeddings",
+            Style::default()
+                .fg(theme().error_text)
+                .add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let body = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "Re-embed EVERY knowledge entry? This can be slow on a large KB.",
             Style::default().fg(Color::White),
         )),
         Line::from(Span::styled(

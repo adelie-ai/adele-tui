@@ -1207,6 +1207,10 @@ async fn handle_signal(
         // The TUI has no scratchpad pane (that lives in the GTK/KDE clients), so
         // the change notification is a no-op here.
         SignalEvent::ScratchpadChanged { .. } => {}
+        // Knowledge-base change broadcast (a maintenance pass or another client
+        // edited an entry). The KB browser, when open, refetches live via its
+        // `Screen::on_signal`; here in the chat loop there is no list to refresh.
+        SignalEvent::KnowledgeChanged => {}
         // The daemon suspended a turn on a client-local tool (#107) — the TUI
         // registers `say_this` (adele-tui#73). Dispatch it, perform the side
         // effect (speak / show inline), and ALWAYS submit a result so the parked
