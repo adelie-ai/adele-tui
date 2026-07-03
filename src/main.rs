@@ -1964,6 +1964,9 @@ async fn handle_client_tool_call(
             // showing the text inline instead of dropping it silently.
             let has_backend = voice_daemon.is_available().await || voice_session.is_some();
             if has_backend {
+                // Show the spoken line in the transcript too (voice#126), tagged
+                // Spoken, so the user sees what Adele voiced — then speak it.
+                app.push_spoken_note(&call.conversation_id, &text);
                 enqueue_narration(narration_tx, voice_daemon, voice_session, text);
             } else {
                 app.push_speech_disabled_note(&call.conversation_id, &text);

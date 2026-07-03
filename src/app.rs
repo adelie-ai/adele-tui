@@ -2,7 +2,9 @@ use std::rc::Rc;
 
 use desktop_assistant_api_model::TaskId;
 use desktop_assistant_client_common::mcp_host::McpHost;
-pub use desktop_assistant_client_common::{ChatMessage, ConversationDetail, ConversationSummary};
+pub use desktop_assistant_client_common::{
+    ChatMessage, ConversationDetail, ConversationSummary, MessageKind,
+};
 use ratatui::style::Style;
 use ratatui_textarea::{CursorMove, DataCursor, TextArea};
 
@@ -386,12 +388,34 @@ impl App {
         self.core.say_this_spoken_for(conversation_id)
     }
 
-    /// Render a `say_this` call whose aside is NOT spoken (Adele == Disabled) as
-    /// an inline note in the transcript instead (adele-tui#77). Appended to
-    /// `conversation_id` only when that is the open conversation, so a call from
-    /// a stale/other conversation never bleeds into the visible chat. Returns
-    /// whether the note was shown.
+    /// Render a `say_this` call whose aside is NOT spoken (Adele ≠ OnDemand, or
+    /// no speech backend) as a transcript line instead (adele-tui#77). Appended
+    /// to `conversation_id` only when that is the open conversation, so a call
+    /// from a stale/other conversation never bleeds into the visible chat.
+    /// Returns whether the note was shown. The line carries clean `content` and
+    /// `MessageKind::SpeechDisabled`; the "(speech mode disabled)" marker is
+    /// added at render time from the metadata, not baked into the text
+    /// (voice#126).
     pub fn push_speech_disabled_note(&mut self, conversation_id: &str, text: &str) -> bool {
+        self.push_local_say_this(conversation_id, text, MessageKind::SpeechDisabled)
+    }
+
+    /// Render a `say_this` aside that WAS spoken as a transcript line tagged
+    /// `MessageKind::Spoken` (voice#126), so the user sees what Adele voiced.
+    /// Same open-conversation guard as [`Self::push_speech_disabled_note`].
+    pub fn push_spoken_note(&mut self, conversation_id: &str, text: &str) -> bool {
+        self.push_local_say_this(conversation_id, text, MessageKind::Spoken)
+    }
+
+    /// Shared body for the two `say_this` transcript lines: push a client-local
+    /// assistant message with clean `content` and an explicit presentation
+    /// `kind`, only when `conversation_id` is the open conversation.
+    fn push_local_say_this(
+        &mut self,
+        conversation_id: &str,
+        text: &str,
+        kind: MessageKind,
+    ) -> bool {
         let Some(conv) = self.core.current_conversation_mut() else {
             return false;
         };
@@ -399,12 +423,13 @@ impl App {
             return false;
         }
         conv.messages.push(ChatMessage {
-            // Local-only inline note (never persisted daemon-side), so it has no
+            // Local-only line (never persisted daemon-side), so it has no
             // daemon-assigned message id (#1): the dedupe/ordering cursor is only
             // meaningful for daemon-sourced messages.
             id: String::new(),
             role: "assistant".to_string(),
-            content: format!("(speech mode disabled) {text}"),
+            content: text.to_string(),
+            kind,
         });
         self.scroll_offset = 0;
         true
@@ -1967,11 +1992,13 @@ mod tests {
                     id: "m1".into(),
                     role: "user".into(),
                     content: "hello".into(),
+                    kind: crate::app::MessageKind::Normal,
                 },
                 ChatMessage {
                     id: "m2".into(),
                     role: "assistant".into(),
                     content: "hi there".into(),
+                    kind: crate::app::MessageKind::Normal,
                 },
             ],
             model_selection: None,
@@ -2601,40 +2628,37 @@ mod tests {
 
     #[test]
     fn adele_always_narrates_regardless_of_you() {
-        // Always reads every reply aloud whether or not You is Enabled.
+        // Always reads every reply aloud whether or not You is Enabled; say_this
+        // is NOT its spoken channel (voice#126) — the whole reply already is.
         for you in [false, true] {
             let mut app = app_with_open_conversation("c1");
             app.set_voice_in("c1", you);
             app.set_adele_output("c1", AdeleOutput::Always);
             assert!(app.narrate_for("c1"), "Always must narrate (You={you})");
             assert!(
-                app.say_this_spoken_for("c1"),
-                "Always always speaks say_this (You={you})"
+                !app.say_this_spoken_for("c1"),
+                "Always does not separately speak say_this (You={you})"
             );
         }
     }
 
     #[test]
-    fn adele_on_demand_narrates_only_when_you_enabled() {
-        // The gate's OnDemand arm: spoken iff You == Enabled.
+    fn adele_on_demand_never_narrates_but_say_this_speaks() {
+        // On-demand's spoken channel is say_this, not auto-narration (voice#126);
+        // decoupled from You — neither value narrates, both speak say_this.
         let mut app = app_with_open_conversation("c1");
         app.set_adele_output("c1", AdeleOutput::OnDemand);
-
-        // You Disabled → reply text-only, but say_this aside still spoken.
-        app.set_voice_in("c1", false);
-        assert!(
-            !app.narrate_for("c1"),
-            "OnDemand + You=Disabled: no narration"
-        );
-        assert!(
-            app.say_this_spoken_for("c1"),
-            "OnDemand say_this aside spoken even when You=Disabled"
-        );
-
-        // You Enabled → reply narrated.
-        app.set_voice_in("c1", true);
-        assert!(app.narrate_for("c1"), "OnDemand + You=Enabled narrates");
-        assert!(app.say_this_spoken_for("c1"));
+        for you in [false, true] {
+            app.set_voice_in("c1", you);
+            assert!(
+                !app.narrate_for("c1"),
+                "OnDemand must not auto-narrate (You={you})"
+            );
+            assert!(
+                app.say_this_spoken_for("c1"),
+                "OnDemand say_this aside is spoken (You={you})"
+            );
+        }
     }
 
     #[test]
@@ -2729,7 +2753,21 @@ mod tests {
         let msgs = &app.current_conversation().unwrap().messages;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "assistant");
-        assert_eq!(msgs[0].content, "(speech mode disabled) the kettle is on");
+        // Content is clean; the "(speech mode disabled)" marker is added at
+        // render time from the metadata, not baked in (voice#126).
+        assert_eq!(msgs[0].content, "the kettle is on");
+        assert_eq!(msgs[0].kind, MessageKind::SpeechDisabled);
+    }
+
+    #[test]
+    fn push_spoken_note_tags_the_line_spoken() {
+        let mut app = app_with_open_conversation("c1");
+        assert!(app.push_spoken_note("c1", "the kettle is on"));
+        let msgs = &app.current_conversation().unwrap().messages;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "assistant");
+        assert_eq!(msgs[0].content, "the kettle is on");
+        assert_eq!(msgs[0].kind, MessageKind::Spoken);
     }
 
     #[test]
