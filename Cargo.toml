@@ -38,7 +38,7 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 # Shared protocol + transport crates live in the desktop-assistant repo.
 # Cargo resolves the package by name from that workspace; Cargo.lock pins
 # the exact revision for reproducibility.
-desktop-assistant-client-common = { git = "https://github.com/adelie-ai/desktop-assistant.git", branch = "main" }
+desktop-assistant-client-common = { git = "https://github.com/adelie-ai/desktop-assistant.git", branch = "main", features = ["mcp-host"] }
 desktop-assistant-api-model = { git = "https://github.com/adelie-ai/desktop-assistant.git", branch = "main" }
 
 # The shared view-agnostic model+controller (CC-3, desktop-assistant#358).

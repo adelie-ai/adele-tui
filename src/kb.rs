@@ -294,8 +294,7 @@ impl Screen for KbScreen<'_> {
         // pass writes entries (or another client edits one). Refetch the list so
         // the browser updates in place while it stays open. Only when not mid-edit,
         // so a refetch never clobbers an in-progress entry the user is typing.
-        if matches!(signal, SignalEvent::KnowledgeChanged)
-            && !matches!(self.state.mode, Mode::Edit)
+        if matches!(signal, SignalEvent::KnowledgeChanged) && !matches!(self.state.mode, Mode::Edit)
         {
             refresh_list(&mut self.state, &mut self.pending, self.client);
         }
@@ -389,7 +388,13 @@ fn handle_list_key<'a>(
         // y/Y confirm keys below. `D`/`C` fire immediately; `E` (a full re-embed
         // of the whole KB) is gated behind a confirm overlay.
         (KeyCode::Char('D'), _) => {
-            start_maintenance(state, pending, client, MaintenanceOp::Extraction, "Extraction");
+            start_maintenance(
+                state,
+                pending,
+                client,
+                MaintenanceOp::Extraction,
+                "Extraction",
+            );
         }
         (KeyCode::Char('C'), _) => {
             start_maintenance(
@@ -977,9 +982,7 @@ fn draw_hints(f: &mut Frame, state: &State, area: Rect) {
         ],
         Mode::Search => &[("Enter", "search"), ("Esc", "clear & back")],
         Mode::Edit => &[("Tab", "next field"), ("Ctrl+S", "save"), ("Esc", "cancel")],
-        Mode::DeleteConfirm | Mode::RecalcConfirm => {
-            &[("y/Enter", "confirm"), ("n/Esc", "cancel")]
-        }
+        Mode::DeleteConfirm | Mode::RecalcConfirm => &[("y/Enter", "confirm"), ("n/Esc", "cancel")],
     };
 
     let mut spans: Vec<Span> = Vec::with_capacity(hints.len() * 4);

@@ -49,6 +49,11 @@ use adele::{
     purposes, screen, ui, voice,
 };
 use client_ui_common::{Effect, UiMessage};
+use desktop_assistant_api_model::ClientToolRegistration;
+use desktop_assistant_client_common::mcp_host::{
+    ClientMcpConfig, McpHost, default_client_mcp_path, dispatch_client_tool_call,
+    merge_registrations,
+};
 
 const DEFAULT_WS_URL: &str = desktop_assistant_client_common::config::DEFAULT_WS_URL;
 const DEFAULT_WS_SUBJECT: &str = desktop_assistant_client_common::config::DEFAULT_WS_SUBJECT;
@@ -94,6 +99,21 @@ struct CliArgs {
         default_value = DEFAULT_WS_SUBJECT
     )]
     ws_subject: String,
+    /// Send a single prompt non-interactively, print the reply to stdout, and
+    /// exit — no TUI. Client-hosted MCP tools (client-mcp.toml) still work, so
+    /// this can drive a local or remote (k8s) brain end to end.
+    #[arg(long, value_name = "TEXT")]
+    prompt: Option<String>,
+    /// Bearer (JWT) for the WebSocket transport, skipping interactive login.
+    #[arg(long = "ws-jwt", env = "DESKTOP_ASSISTANT_TUI_WS_JWT")]
+    ws_jwt: Option<String>,
+    /// Username for WebSocket password login (with --ws-login-password).
+    #[arg(long = "ws-login-username", env = "DESKTOP_ASSISTANT_TUI_WS_USERNAME")]
+    ws_login_username: Option<String>,
+    /// Password for WebSocket password login. Prefer the env var so it doesn't
+    /// land in shell history / the process list.
+    #[arg(long = "ws-login-password", env = "DESKTOP_ASSISTANT_TUI_WS_PASSWORD")]
+    ws_login_password: Option<String>,
 }
 
 impl From<CliArgs> for ConnectionConfig {
@@ -139,9 +159,9 @@ impl From<CliArgs> for ConnectionConfig {
         Self {
             transport_mode,
             ws_url,
-            ws_jwt: None,
-            ws_login_username: None,
-            ws_login_password: None,
+            ws_jwt: cli.ws_jwt,
+            ws_login_username: cli.ws_login_username,
+            ws_login_password: cli.ws_login_password,
             ws_subject,
             socket_path,
             // Local UDS authenticates by kernel peer-cred (desktop-assistant#407):
@@ -196,6 +216,13 @@ async fn main() -> Result<()> {
     let cli = CliArgs::from_arg_matches(&matches)?;
     let cli_explicit = any_explicit_connection_arg(&matches);
 
+    // Headless one-shot: `--prompt "…"` connects, prints the reply, and exits
+    // without ever entering the TUI. Runs before any terminal setup.
+    if let Some(prompt) = cli.prompt.clone() {
+        let config: ConnectionConfig = cli.into();
+        return run_headless(&config, prompt).await;
+    }
+
     // Restore the terminal on panic BEFORE any state is pushed, chaining the
     // default hook so the panic message lands on a usable screen (TUI-1).
     install_panic_hook();
@@ -227,6 +254,109 @@ async fn main() -> Result<()> {
     terminal.show_cursor()?;
 
     result
+}
+
+/// Headless one-shot mode (`--prompt`): connect, register client-hosted MCP
+/// tools, send the prompt, stream the reply to stdout, and exit. A client tool
+/// call during the turn is routed to the MCP host (or resolved via the built-in
+/// dispatch) and its result submitted so the turn always resumes.
+async fn run_headless(config: &ConnectionConfig, prompt: String) -> Result<()> {
+    use std::io::Write as _;
+
+    let conn = Connector::connect(config)
+        .await
+        .map_err(|e| anyhow::anyhow!("connection failed: {e}"))?;
+    let mut signal_rx = conn.subscribe();
+
+    // Start the client-side MCP host for the `tui` surface and advertise its
+    // tools (merged with the built-ins) so a headless prompt can trigger local
+    // tools exactly like the interactive client.
+    let servers: Vec<_> = ClientMcpConfig::load(&default_client_mcp_path())
+        .resolved_servers("tui")
+        .into_iter()
+        .cloned()
+        .collect();
+    let host = if servers.is_empty() {
+        None
+    } else {
+        Some(McpHost::start(&servers).await)
+    };
+    let host_tools = host.as_ref().map(|h| h.registrations()).unwrap_or_default();
+    let builtins = vec![
+        client_tools::say_this_registration(),
+        client_tools::request_voice_registration(),
+        client_tools::stop_voice_registration(),
+    ];
+    // Best-effort: client tools need a command channel (UDS/WS), not D-Bus.
+    let _ = conn
+        .register_client_tools(merge_registrations(builtins, host_tools))
+        .await;
+
+    let conversation_id = conn
+        .client()
+        .create_conversation("adele --prompt")
+        .await
+        .map_err(|e| anyhow::anyhow!("could not create conversation: {e}"))?;
+    let request_id = conn
+        .send_prompt_with_system_refinement(&conversation_id, &prompt, "")
+        .await
+        .map_err(|e| anyhow::anyhow!("could not send prompt: {e}"))?;
+
+    let mut stdout = io::stdout();
+    let mut streamed = false;
+    while let Some(event) = signal_rx.recv().await {
+        match event {
+            SignalEvent::Chunk {
+                request_id: rid,
+                chunk,
+                ..
+            } if rid == request_id => {
+                streamed = true;
+                let _ = stdout.write_all(chunk.as_bytes());
+                let _ = stdout.flush();
+            }
+            SignalEvent::Complete {
+                request_id: rid,
+                full_response,
+                ..
+            } if rid == request_id => {
+                // Some providers don't stream chunks; fall back to the final text.
+                if !streamed {
+                    let _ = stdout.write_all(full_response.as_bytes());
+                }
+                let _ = writeln!(stdout);
+                break;
+            }
+            SignalEvent::Error {
+                request_id: rid,
+                error,
+                ..
+            } if rid == request_id => {
+                return Err(anyhow::anyhow!("{error}"));
+            }
+            SignalEvent::ClientToolCall {
+                task_id,
+                tool_call_id,
+                tool_name,
+                arguments,
+                ..
+            } => {
+                let result = match host.as_ref() {
+                    Some(host) if host.handles(&tool_name) => {
+                        host.call(&tool_name, arguments).await
+                    }
+                    // The built-in client tools are TUI-visual (speak / show);
+                    // headless just resolves them so the turn completes.
+                    _ => client_tools::dispatch(&tool_name, &arguments, false).result,
+                };
+                let _ = conn
+                    .submit_client_tool_result(&task_id, &tool_call_id, result)
+                    .await;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Reconnect backoff state machine. Sequence: 2s → 4s → 8s → 16s → 30s,
@@ -327,6 +457,19 @@ async fn run(
     let mut app = App::new();
     let settings = Settings::load();
     app.show_debug = settings.show_debug;
+
+    // Start any client-side MCP servers configured for the `tui` surface and hold
+    // the host in `App` so its tools are advertised (register) and routed
+    // (dispatch) to whichever daemon we connect to — local or remote (k8s).
+    let mcp_cfg = ClientMcpConfig::load(&default_client_mcp_path());
+    let mcp_servers: Vec<_> = mcp_cfg
+        .resolved_servers("tui")
+        .into_iter()
+        .cloned()
+        .collect();
+    if !mcp_servers.is_empty() {
+        app.mcp_host = Some(Rc::new(McpHost::start(&mcp_servers).await));
+    }
 
     // The `Connector` owns the transport AND the signal stream, pumping every
     // `SignalEvent` to its subscribers from a dedicated task (client-common
@@ -1791,6 +1934,23 @@ async fn handle_client_tool_call(
     // Gate on the call's OWN conversation, not the open one, so the per-
     // conversation controls are honored even if the user has since switched
     // tabs. The say_this aside gate is `Adele ∈ {OnDemand, Always}` (adele-tui#77).
+    // A client-hosted MCP tool takes precedence: if the local MCP host owns this
+    // tool name it invokes it and submits the result, and we're done. Otherwise
+    // fall through to the TUI's built-in client tools (say_this / voice mode).
+    if let (Some(host), Some(conn)) = (app.mcp_host.clone(), connector.as_ref())
+        && dispatch_client_tool_call(
+            host.as_ref(),
+            conn.as_ref(),
+            &call.task_id,
+            &call.tool_call_id,
+            &call.tool_name,
+            call.arguments.clone(),
+        )
+        .await
+    {
+        return;
+    }
+
     let say_this_spoken = app.say_this_spoken_for(&call.conversation_id);
     let outcome = client_tools::dispatch(&call.tool_name, &call.arguments, say_this_spoken);
 
@@ -1868,7 +2028,14 @@ async fn finish_connection_init(app: &mut App, conn: &Connector) {
     // open conversation was already re-fetched by the reconnect resync before this
     // call, so this re-points the daemon's fan-out at it.
     subscribe_to_open_conversation(app, conn).await;
-    register_client_tools(conn).await;
+    register_client_tools(
+        conn,
+        app.mcp_host
+            .as_ref()
+            .map(|h| h.registrations())
+            .unwrap_or_default(),
+    )
+    .await;
     app.status_message = conn.label().to_string();
 }
 
@@ -1878,13 +2045,16 @@ async fn finish_connection_init(app: &mut App, conn: &Connector) {
 /// voice playback is a convenience, so a failure to register is only logged and
 /// never blocks the chat. Over D-Bus (no command channel for client tools) this
 /// is expected to fail and is silently skipped.
-async fn register_client_tools(conn: &Connector) {
+async fn register_client_tools(conn: &Connector, host_tools: Vec<ClientToolRegistration>) {
+    // Merge the TUI's built-in client tools with the MCP host's tools into the
+    // single set the daemon expects (it replaces the whole set per call).
+    let builtins = vec![
+        client_tools::say_this_registration(),
+        client_tools::request_voice_registration(),
+        client_tools::stop_voice_registration(),
+    ];
     if let Err(e) = conn
-        .register_client_tools(vec![
-            client_tools::say_this_registration(),
-            client_tools::request_voice_registration(),
-            client_tools::stop_voice_registration(),
-        ])
+        .register_client_tools(merge_registrations(builtins, host_tools))
         .await
     {
         tracing::debug!("client tool registration skipped: {e}");
