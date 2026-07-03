@@ -16,10 +16,10 @@
 //! The TUI understands three tools:
 //!
 //! * `say_this` — "speak this text aloud". Whether it actually speaks is gated
-//!   by whether the call's conversation's `Adele` level is `OnDemand` or
-//!   `Always` (i.e. not `Disabled`); the caller passes that boolean as
-//!   `say_this_spoken`. Spoken ⇒ speak (daemon-first, chunked); not spoken ⇒
-//!   render `(speech mode disabled) <text>` inline instead.
+//!   by whether the call's conversation's `Adele` level is `OnDemand` — its sole
+//!   spoken channel (voice#126); the caller passes that boolean as
+//!   `say_this_spoken`. Spoken ⇒ speak (daemon-first, chunked) AND show the line
+//!   tagged `Spoken`; not spoken ⇒ show it tagged `SpeechDisabled` instead.
 //! * `request_voice` (adele-tui#77) — the model switching this conversation into
 //!   spoken voice mode ("ok, let's talk by voice"). Sets `Adele = OnDemand`.
 //! * `stop_voice` (adele-tui#77) — the model leaving voice mode; sets
@@ -37,8 +37,8 @@ pub const SAY_THIS: &str = "say_this";
 
 /// The model-driven "enter voice mode" tool (adele-tui#77). The model calls it
 /// when the user asks to talk by voice; it sets the conversation's `Adele`
-/// output level to `OnDemand` (replies narrated when `You == Enabled` + shaped
-/// for speech, `say_this` asides always spoken).
+/// output level to `OnDemand` — the written reply stays text and `say_this` is
+/// the model's spoken channel (voice#126).
 pub const REQUEST_VOICE: &str = "request_voice";
 
 /// The model-driven "leave voice mode" tool (adele-tui#77). Sets the
@@ -125,8 +125,8 @@ pub fn handle_request_voice() -> ToolOutcome {
     ToolOutcome {
         effect: ToolEffect::SetAdeleOutput(AdeleOutput::OnDemand),
         result: Ok(
-            "voice mode on: this conversation is now spoken — replies will be read aloud and \
-             kept brief and conversational"
+            "voice mode on (on-demand): your written reply is shown as text and not read aloud; \
+             speak to the user by calling say_this, kept brief and conversational"
                 .to_string(),
         ),
     }
@@ -191,10 +191,10 @@ pub fn say_this_registration() -> desktop_assistant_api_model::ClientToolRegistr
 pub fn request_voice_registration() -> desktop_assistant_api_model::ClientToolRegistration {
     desktop_assistant_api_model::ClientToolRegistration {
         name: REQUEST_VOICE.to_string(),
-        description: "Switch this conversation into spoken voice mode (the user asked to talk by \
-            voice); replies are read aloud and kept short and conversational. Call when the user \
-            says something like \"let's talk by voice\" or \"read your replies to me\". No \
-            arguments."
+        description: "Switch this conversation into spoken (on-demand) voice mode (the user asked \
+            to talk by voice). Your written reply stays text; to speak, call say_this with a \
+            brief spoken version. Call when the user says something like \"let's talk by voice\" \
+            or \"read your replies to me\". No arguments."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",

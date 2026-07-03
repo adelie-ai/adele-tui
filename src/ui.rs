@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::app::{AdeleOutput, App, InputMode};
+use crate::app::{AdeleOutput, App, InputMode, MessageKind};
 use crate::theme::theme;
 
 const INPUT_VISIBLE_LINES: u16 = 4;
@@ -408,6 +408,34 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     if let Some(conv) = app.current_conversation() {
         for msg in &conv.messages {
+            // Client-local `say_this` lines (voice#126) carry explicit
+            // presentation metadata; render their marker from `kind` rather than
+            // parsing the content. Always shown (not debug-gated) — they're real
+            // user-facing content — with the marker as a bold prefix.
+            match msg.kind {
+                MessageKind::Spoken => {
+                    let style = Style::default()
+                        .fg(theme().assistant_prefix)
+                        .add_modifier(Modifier::ITALIC);
+                    push_prefixed_message(&mut lines, "Spoken: ", &msg.content, style);
+                    lines.push(Line::from(""));
+                    continue;
+                }
+                MessageKind::SpeechDisabled => {
+                    let style = Style::default()
+                        .fg(theme().assistant_prefix)
+                        .add_modifier(Modifier::DIM | Modifier::ITALIC);
+                    push_prefixed_message(
+                        &mut lines,
+                        "(speech mode disabled) ",
+                        &msg.content,
+                        style,
+                    );
+                    lines.push(Line::from(""));
+                    continue;
+                }
+                MessageKind::Normal => {}
+            }
             // Roles fall into a few buckets: user/assistant render normally
             // (assistant via markdown); tool/system/empty-assistant render
             // only when the debug view is enabled.
@@ -720,11 +748,13 @@ mod tests {
                     id: String::new(),
                     role: "user".into(),
                     content: "Hello".into(),
+                    kind: crate::app::MessageKind::Normal,
                 },
                 ChatMessage {
                     id: String::new(),
                     role: "assistant".into(),
                     content: "Hi there!".into(),
+                    kind: crate::app::MessageKind::Normal,
                 },
             ],
             model_selection: None,
@@ -1052,26 +1082,31 @@ mod tests {
                     id: String::new(),
                     role: "user".into(),
                     content: "Hello".into(),
+                    kind: crate::app::MessageKind::Normal,
                 },
                 ChatMessage {
                     id: String::new(),
                     role: "tool".into(),
                     content: "ran search(foo)".into(),
+                    kind: crate::app::MessageKind::Normal,
                 },
                 ChatMessage {
                     id: String::new(),
                     role: "system".into(),
                     content: "context updated".into(),
+                    kind: crate::app::MessageKind::Normal,
                 },
                 ChatMessage {
                     id: String::new(),
                     role: "assistant".into(),
                     content: "".into(), // empty — only shown in debug
+                    kind: crate::app::MessageKind::Normal,
                 },
                 ChatMessage {
                     id: String::new(),
                     role: "assistant".into(),
                     content: "Hi there!".into(),
+                    kind: crate::app::MessageKind::Normal,
                 },
             ],
             model_selection: None,
@@ -1183,6 +1218,7 @@ mod tests {
                 id: String::new(),
                 role: "assistant".into(),
                 content: "answer with **strong** word".into(),
+                kind: crate::app::MessageKind::Normal,
             }],
             model_selection: None,
             conversation_personality: None,

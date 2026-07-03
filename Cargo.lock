@@ -1566,19 +1566,14 @@ dependencies = [
 name = "desktop-assistant-mcp-client"
 version = "0.1.0"
 dependencies = [
- "base64",
  "chrono",
  "desktop-assistant-core",
- "rand 0.9.4",
- "reqwest 0.13.1",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
- "url",
  "uuid",
 ]
 
@@ -3939,7 +3934,6 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots 1.0.7",
 ]
 
 [[package]]
