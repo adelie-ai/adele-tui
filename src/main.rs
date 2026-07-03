@@ -49,6 +49,11 @@ use adele::{
     purposes, screen, ui, voice,
 };
 use client_ui_common::{Effect, UiMessage};
+use desktop_assistant_api_model::ClientToolRegistration;
+use desktop_assistant_client_common::mcp_host::{
+    ClientMcpConfig, McpHost, default_client_mcp_path, dispatch_client_tool_call,
+    merge_registrations,
+};
 
 const DEFAULT_WS_URL: &str = desktop_assistant_client_common::config::DEFAULT_WS_URL;
 const DEFAULT_WS_SUBJECT: &str = desktop_assistant_client_common::config::DEFAULT_WS_SUBJECT;
@@ -327,6 +332,19 @@ async fn run(
     let mut app = App::new();
     let settings = Settings::load();
     app.show_debug = settings.show_debug;
+
+    // Start any client-side MCP servers configured for the `tui` surface and hold
+    // the host in `App` so its tools are advertised (register) and routed
+    // (dispatch) to whichever daemon we connect to — local or remote (k8s).
+    let mcp_cfg = ClientMcpConfig::load(&default_client_mcp_path());
+    let mcp_servers: Vec<_> = mcp_cfg
+        .resolved_servers("tui")
+        .into_iter()
+        .cloned()
+        .collect();
+    if !mcp_servers.is_empty() {
+        app.mcp_host = Some(Rc::new(McpHost::start(&mcp_servers).await));
+    }
 
     // The `Connector` owns the transport AND the signal stream, pumping every
     // `SignalEvent` to its subscribers from a dedicated task (client-common
@@ -1791,6 +1809,23 @@ async fn handle_client_tool_call(
     // Gate on the call's OWN conversation, not the open one, so the per-
     // conversation controls are honored even if the user has since switched
     // tabs. The say_this aside gate is `Adele ∈ {OnDemand, Always}` (adele-tui#77).
+    // A client-hosted MCP tool takes precedence: if the local MCP host owns this
+    // tool name it invokes it and submits the result, and we're done. Otherwise
+    // fall through to the TUI's built-in client tools (say_this / voice mode).
+    if let (Some(host), Some(conn)) = (app.mcp_host.clone(), connector.as_ref())
+        && dispatch_client_tool_call(
+            host.as_ref(),
+            conn.as_ref(),
+            &call.task_id,
+            &call.tool_call_id,
+            &call.tool_name,
+            call.arguments.clone(),
+        )
+        .await
+    {
+        return;
+    }
+
     let say_this_spoken = app.say_this_spoken_for(&call.conversation_id);
     let outcome = client_tools::dispatch(&call.tool_name, &call.arguments, say_this_spoken);
 
@@ -1868,7 +1903,14 @@ async fn finish_connection_init(app: &mut App, conn: &Connector) {
     // open conversation was already re-fetched by the reconnect resync before this
     // call, so this re-points the daemon's fan-out at it.
     subscribe_to_open_conversation(app, conn).await;
-    register_client_tools(conn).await;
+    register_client_tools(
+        conn,
+        app.mcp_host
+            .as_ref()
+            .map(|h| h.registrations())
+            .unwrap_or_default(),
+    )
+    .await;
     app.status_message = conn.label().to_string();
 }
 
@@ -1878,13 +1920,16 @@ async fn finish_connection_init(app: &mut App, conn: &Connector) {
 /// voice playback is a convenience, so a failure to register is only logged and
 /// never blocks the chat. Over D-Bus (no command channel for client tools) this
 /// is expected to fail and is silently skipped.
-async fn register_client_tools(conn: &Connector) {
+async fn register_client_tools(conn: &Connector, host_tools: Vec<ClientToolRegistration>) {
+    // Merge the TUI's built-in client tools with the MCP host's tools into the
+    // single set the daemon expects (it replaces the whole set per call).
+    let builtins = vec![
+        client_tools::say_this_registration(),
+        client_tools::request_voice_registration(),
+        client_tools::stop_voice_registration(),
+    ];
     if let Err(e) = conn
-        .register_client_tools(vec![
-            client_tools::say_this_registration(),
-            client_tools::request_voice_registration(),
-            client_tools::stop_voice_registration(),
-        ])
+        .register_client_tools(merge_registrations(builtins, host_tools))
         .await
     {
         tracing::debug!("client tool registration skipped: {e}");

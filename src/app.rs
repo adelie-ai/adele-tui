@@ -1,4 +1,7 @@
+use std::rc::Rc;
+
 use desktop_assistant_api_model::TaskId;
+use desktop_assistant_client_common::mcp_host::McpHost;
 pub use desktop_assistant_client_common::{ChatMessage, ConversationDetail, ConversationSummary};
 use ratatui::style::Style;
 use ratatui_textarea::{CursorMove, DataCursor, TextArea};
@@ -151,6 +154,11 @@ pub struct App {
     /// first draw. (CC-3 moves this into the shared `core` once signals route
     /// through the reducer.)
     pub connected: bool,
+    /// Client-side MCP host (`client-mcp.toml`): local MCP servers whose tools
+    /// are exposed to the daemon as client-side tools. Created once at startup,
+    /// shared (`Rc`) between the register site and client-tool dispatch; `None`
+    /// when no servers are configured for this surface.
+    pub mcp_host: Option<Rc<McpHost>>,
     pub should_quit: bool,
     /// Whether the `?`/F1 keymap help overlay is shown. Any key closes it.
     pub show_help: bool,
@@ -260,6 +268,7 @@ impl App {
             tasks: TaskPane::new(),
             pending_task_cancel: None,
             core: WindowState::default(),
+            mcp_host: None,
         }
     }
 
