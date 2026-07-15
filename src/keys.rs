@@ -35,6 +35,10 @@ pub enum Action {
     OpenKnowledgeBase,
     OpenConnections,
     OpenPurposes,
+    /// Open the MCP-servers admin panel (`F5`, desktop-assistant#495). Mirrors
+    /// `OpenConnections`/`OpenPurposes`: a modal manager over the daemon's MCP
+    /// server config.
+    OpenMcpServers,
     OpenModelPicker,
     /// Open the per-conversation personality picker (`Ctrl+R`, "peRsonality").
     /// Mirrors `OpenModelPicker`; pins/clears the Expressive-7 traits for the
@@ -108,6 +112,10 @@ pub fn handle_key_event(
     // F4 opens the purposes manager.
     if key.code == KeyCode::F(4) && key.modifiers.is_empty() {
         return Some(Action::OpenPurposes);
+    }
+    // F5 opens the MCP-servers admin panel.
+    if key.code == KeyCode::F(5) && key.modifiers.is_empty() {
+        return Some(Action::OpenMcpServers);
     }
     // F1 toggles the keymap help overlay from any mode (`?` also opens it in
     // Normal mode; F1 is offered too since `?` is a literal character in the
@@ -290,6 +298,7 @@ pub fn help_sections() -> &'static [(&'static str, &'static [(&'static str, &'st
                 ("F2", "switch connection"),
                 ("F3", "connections manager"),
                 ("F4", "purposes"),
+                ("F5", "MCP servers"),
                 ("Ctrl+K", "knowledge base"),
                 ("Ctrl+M", "model picker"),
                 ("Ctrl+R", "personality"),

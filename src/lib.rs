@@ -13,6 +13,7 @@ pub mod in_flight;
 pub mod kb;
 pub mod keys;
 pub mod markdown;
+pub mod mcp;
 pub mod model_selector;
 pub mod oauth;
 pub mod personality_selector;

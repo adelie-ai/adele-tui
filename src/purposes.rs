@@ -291,7 +291,8 @@ async fn load_all(client: &TransportClient) -> Result<RefreshData, String> {
         Err(e) => return Err(format!("Failed to list connections: {e}")),
     };
     let purposes = match send(client, Command::GetPurposes).await {
-        Ok(CommandResult::Purposes(p)) => p,
+        // `CommandResult::Purposes` is boxed (large_enum_variant); unbox to the view.
+        Ok(CommandResult::Purposes(p)) => *p,
         Ok(other) => return Err(format!("Unexpected response loading purposes: {other:?}")),
         Err(e) => return Err(format!("Failed to load purposes: {e}")),
     };
@@ -525,6 +526,7 @@ fn purpose_slot(view: &PurposesView, kind: PurposeKindApi) -> Option<&PurposeCon
         PurposeKindApi::Consolidation => view.consolidation.as_ref(),
         PurposeKindApi::Embedding => view.embedding.as_ref(),
         PurposeKindApi::Titling => view.titling.as_ref(),
+        PurposeKindApi::Voice => view.voice.as_ref(),
     }
 }
 
@@ -535,6 +537,7 @@ fn purpose_label(kind: PurposeKindApi) -> &'static str {
         PurposeKindApi::Consolidation => "Consolidation",
         PurposeKindApi::Embedding => "Embedding",
         PurposeKindApi::Titling => "Titling",
+        PurposeKindApi::Voice => "Voice",
     }
 }
 

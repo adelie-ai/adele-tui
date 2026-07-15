@@ -19,6 +19,9 @@ chat, tool calls, and background tasks.
 - **Connection profiles**, **Connections view**, and **Purposes view** for
   CRUD over LLM provider configs and assigning a connection/model/effort to
   each purpose (chat, background, vector).
+- **MCP servers admin panel** (`F5`) — list, enable/disable, add, edit, and
+  remove the daemon's Model Context Protocol servers (local stdio or remote
+  HTTP, with bearer-token or OAuth service-account auth).
 - **OAuth2 + PKCE** authentication flow and credentials stored in the system
   keyring (libsecret / kwallet via the OS).
 - **Knowledge base browser/editor** for the daemon's built-in KB.

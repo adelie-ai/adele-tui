@@ -153,7 +153,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         lines.push(Line::from(""));
     }
     lines.push(Line::from(Span::styled(
-        "Inside modal screens (KB / connections / purposes), Ctrl+S = save.",
+        "Inside modal screens (KB / connections / purposes / MCP servers), Ctrl+S = save.",
         Style::default()
             .fg(theme().text_dim)
             .add_modifier(Modifier::ITALIC),

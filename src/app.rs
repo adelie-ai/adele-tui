@@ -122,6 +122,8 @@ pub enum ScreenRequest {
     KnowledgeBase,
     Connections,
     Purposes,
+    /// The MCP-servers admin panel (desktop-assistant#495).
+    McpServers,
     ModelPicker,
     PersonalityPicker,
 }
