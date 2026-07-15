@@ -521,8 +521,12 @@ pub struct BuiltMcpServer {
 /// Editing targets an existing name by design, so it is exempt. Returns the
 /// inline error to surface when a create would collide, or `Ok(())` otherwise.
 fn check_add_conflict(built: &BuiltMcpServer, servers: &[McpServerView]) -> Result<(), String> {
-    // TODO(spec): guard implemented in the follow-up commit.
-    let _ = (built, servers);
+    if !built.editing && servers.iter().any(|s| s.name == built.name) {
+        return Err(format!(
+            "A server named '{}' already exists — edit it instead.",
+            built.name
+        ));
+    }
     Ok(())
 }
 
@@ -1031,6 +1035,14 @@ fn save_edit<'a>(
             return;
         }
     };
+
+    // Add path only: refuse a name that already exists rather than letting the
+    // add-or-replace upsert silently overwrite the stored server and clobber its
+    // `{name}_token` secret. Edit deliberately targets an existing name.
+    if let Err(e) = check_add_conflict(&built, &state.servers) {
+        state.error = Some(e);
+        return;
+    }
 
     state.busy = Some("Saving...".into());
     pending.push(async move {
@@ -1671,8 +1683,11 @@ fn draw_status(f: &mut Frame, state: &State, area: Rect) {
         );
     } else if let Some(err) = &state.error {
         let style = Style::default().fg(theme().error);
+        // `state.error` is daemon-sourced (e.g. `format!("Unexpected response:
+        // {other:?}")` and daemon messages that echo daemon-supplied ids), so it
+        // is sanitized like every other daemon string on the draw path.
         f.render_widget(
-            Paragraph::new(Span::styled(format!(" • {err}"), style)),
+            Paragraph::new(Span::styled(format!(" • {}", sanitize(err)), style)),
             area,
         );
     }
