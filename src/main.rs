@@ -45,7 +45,7 @@ use adele::settings::Settings;
 use adele::voice::{VoiceConfig, VoiceSession};
 use adele::voice_client::VoiceController;
 use adele::{
-    client_tools, connections, credentials, kb, model_selector, personality_selector, picker,
+    client_tools, connections, credentials, kb, mcp, model_selector, personality_selector, picker,
     purposes, screen, ui, voice,
 };
 use client_ui_common::{Effect, UiMessage};
@@ -644,6 +644,23 @@ async fn run(
                             purposes::run(terminal, conn.client(), &mut signal_rx, &mut sink).await
                         {
                             sink.app.status_message = format!("Purposes error: {e}");
+                        }
+                    }
+                }
+                ScreenRequest::McpServers => {
+                    if let Some(conn) = connector.clone() {
+                        let mut sink = SubScreenSink {
+                            app: &mut app,
+                            connector: &connector,
+                            voice_daemon: &voice_daemon,
+                            voice_session: &voice_session,
+                            narration_tx: &narration_tx,
+                            disconnect: &mut disconnect,
+                        };
+                        if let Err(e) =
+                            mcp::run(terminal, conn.client(), &mut signal_rx, &mut sink).await
+                        {
+                            sink.app.status_message = format!("MCP servers error: {e}");
                         }
                     }
                 }
@@ -1755,6 +1772,13 @@ async fn handle_action(
                 app.request_screen(ScreenRequest::Purposes);
             } else {
                 app.status_message = "Not connected — purposes manager unavailable".into();
+            }
+        }
+        Action::OpenMcpServers => {
+            if client.is_some() {
+                app.request_screen(ScreenRequest::McpServers);
+            } else {
+                app.status_message = "Not connected — MCP servers manager unavailable".into();
             }
         }
         Action::OpenModelPicker => {
