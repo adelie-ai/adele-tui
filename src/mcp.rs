@@ -515,6 +515,17 @@ pub struct BuiltMcpServer {
     pub secret: Option<(String, String)>,
 }
 
+/// Guard the **add** path against silently overwriting an existing server.
+/// `UpsertMcpServer` is add-or-replace, so creating a server whose name already
+/// exists would clobber the stored config *and* wipe its `{name}_token` secret.
+/// Editing targets an existing name by design, so it is exempt. Returns the
+/// inline error to surface when a create would collide, or `Ok(())` otherwise.
+fn check_add_conflict(built: &BuiltMcpServer, servers: &[McpServerView]) -> Result<(), String> {
+    // TODO(spec): guard implemented in the follow-up commit.
+    let _ = (built, servers);
+    Ok(())
+}
+
 /// Wrap `i` into `0..len` (handles negatives), mirroring the purposes cycler.
 fn wrap_index(i: i32, len: usize) -> usize {
     if len == 0 {
@@ -2271,5 +2282,65 @@ mod tests {
             text.contains("no MCP servers"),
             "empty hint missing: {text}"
         );
+    }
+
+    #[test]
+    fn draw_status_sanitizes_hostile_error() {
+        // `state.error` is daemon-sourced (it echoes daemon error strings and
+        // ids). A control sequence in it must never reach the terminal buffer.
+        let mut state = state_with(Vec::new(), Vec::new());
+        state.error = Some("boom\u{1b}[2J\u{07}danger".into());
+        let text = rendered(&state, 120, 20);
+        assert!(!text.contains('\u{1b}'), "ESC reached the buffer: {text}");
+        assert!(!text.contains('\u{07}'), "BEL reached the buffer: {text}");
+        // The module's `sanitize` replaces each control char with a space (the
+        // render backend merely *drops* them), so the sanitized residue with its
+        // separating spaces proves `sanitize` ran on the error path — not just
+        // that ratatui happened to filter the bytes.
+        assert!(
+            text.contains("boom [2J danger"),
+            "error text not sanitized on the draw path: {text}"
+        );
+    }
+
+    // --- check_add_conflict (dup-name-on-add guard) --------------------------
+
+    fn view_named(name: &str) -> McpServerView {
+        McpServerView {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    fn built(name: &str, editing: bool) -> BuiltMcpServer {
+        BuiltMcpServer {
+            editing,
+            name: name.into(),
+            config_json: "{}".into(),
+            secret: None,
+        }
+    }
+
+    #[test]
+    fn add_rejects_duplicate_name() {
+        // Add-or-replace would clobber the existing "files" config + its secret.
+        let servers = vec![view_named("files"), view_named("web")];
+        let err = check_add_conflict(&built("files", false), &servers)
+            .expect_err("duplicate add must be refused");
+        assert!(err.contains("already exists"), "unexpected message: {err}");
+        assert!(err.contains("files"), "name missing from message: {err}");
+    }
+
+    #[test]
+    fn add_allows_unique_name() {
+        let servers = vec![view_named("files"), view_named("web")];
+        assert!(check_add_conflict(&built("calendar", false), &servers).is_ok());
+    }
+
+    #[test]
+    fn edit_allows_existing_name() {
+        // Edit targets an existing name by design — the guard must not block it.
+        let servers = vec![view_named("files"), view_named("web")];
+        assert!(check_add_conflict(&built("files", true), &servers).is_ok());
     }
 }
