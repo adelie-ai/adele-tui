@@ -114,6 +114,11 @@ struct CliArgs {
     /// land in shell history / the process list.
     #[arg(long = "ws-login-password", env = "DESKTOP_ASSISTANT_TUI_WS_PASSWORD")]
     ws_login_password: Option<String>,
+    /// Enable verbose logging (`-v` info, `-vv` debug, `-vvv` trace). Logs go to
+    /// stderr so a headless `--prompt` run pipes cleanly to a file for scripting
+    /// and debugging. `RUST_LOG`, when set, overrides the level entirely.
+    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+    verbose: u8,
 }
 
 impl From<CliArgs> for ConnectionConfig {
@@ -201,6 +206,44 @@ fn install_panic_hook() {
     }));
 }
 
+/// Build the tracing `EnvFilter` directive for a `-v` count. `RUST_LOG`, when
+/// set, takes precedence and this is not consulted. Higher counts widen the
+/// level for our own crates while keeping third-party noise at `warn`.
+fn log_filter(verbose: u8) -> String {
+    let level = match verbose {
+        0 => "warn",
+        1 => "info",
+        2 => "debug",
+        _ => "trace",
+    };
+    format!(
+        "warn,adele={level},desktop_assistant_client_common={level},\
+         desktop_assistant_mcp_client={level},client_ui_common={level}"
+    )
+}
+
+/// Install a stderr tracing subscriber when `-v`/`--verbose` is given or
+/// `RUST_LOG` is set; otherwise stay silent so normal output is clean. Logging
+/// to stderr keeps a headless `--prompt` run's reply (stdout) separable from
+/// diagnostics. Best-effort: an already-installed global subscriber is a no-op.
+fn init_logging(verbose: u8) {
+    use tracing_subscriber::EnvFilter;
+    let has_rust_log = std::env::var_os("RUST_LOG").is_some();
+    if verbose == 0 && !has_rust_log {
+        return;
+    }
+    let filter = if has_rust_log {
+        EnvFilter::from_default_env()
+    } else {
+        EnvFilter::new(log_filter(verbose))
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(true)
+        .try_init();
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Both `ring` and `aws-lc-rs` end up enabled in rustls because reqwest 0.12
@@ -215,6 +258,10 @@ async fn main() -> Result<()> {
     let matches = CliArgs::command().get_matches();
     let cli = CliArgs::from_arg_matches(&matches)?;
     let cli_explicit = any_explicit_connection_arg(&matches);
+
+    // Install logging first so connection/registration/streaming diagnostics are
+    // captured for the headless path too (verbose or RUST_LOG; silent otherwise).
+    init_logging(cli.verbose);
 
     // Headless one-shot: `--prompt "…"` connects, prints the reply, and exits
     // without ever entering the TUI. Runs before any terminal setup.
@@ -2350,6 +2397,25 @@ mod tests {
         let mut out = vec!["adele".to_string()];
         out.extend(parts.iter().map(|value| value.to_string()));
         out
+    }
+
+    #[test]
+    fn log_filter_scales_level_with_verbosity_and_quiets_third_party() {
+        assert!(
+            log_filter(0).contains("adele=warn"),
+            "no -v => our crates stay at warn"
+        );
+        assert!(log_filter(1).contains("adele=info"), "one -v => info");
+        assert!(log_filter(2).contains("adele=debug"), "two -v => debug");
+        assert!(log_filter(3).contains("adele=trace"), "three -v => trace");
+        assert!(log_filter(9).contains("adele=trace"), "saturates at trace");
+        // Our client crates track the same level so streaming/registration is visible.
+        assert!(log_filter(2).contains("desktop_assistant_client_common=debug"));
+        // Third-party noise stays at warn regardless of verbosity.
+        assert!(
+            log_filter(3).starts_with("warn,"),
+            "base directive keeps third-party at warn"
+        );
     }
 
     #[test]

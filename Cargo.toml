@@ -30,6 +30,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 url = "2"
 toml = "0.9"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Direct zbus client for the standalone voice daemon (`org.desktopAssistant.Voice`),
 # a separate D-Bus service from the orchestrator transport. Used by
 # `voice_client::VoiceController` to route narration through the daemon's warm
