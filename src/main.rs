@@ -323,10 +323,10 @@ async fn run_headless(config: &ConnectionConfig, prompt: String) -> Result<()> {
         .into_iter()
         .cloned()
         .collect();
-    // Compiled-in built-ins (da#538 Phase C): host the core MCP set in-process,
-    // minus any name a client-mcp.toml server already provides (external wins).
-    let configured: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
-    let mcp_builtins = adele::builtins::builtin_servers(&configured);
+    // Compiled-in built-ins (da#538 Phase C/D): host the full core MCP set
+    // in-process. `McpHost::start_with` centralizes the override, skipping (and
+    // logging) any built-in whose name a client-mcp.toml server already provides.
+    let mcp_builtins = adele::builtins::builtin_servers();
     let host = if servers.is_empty() && mcp_builtins.is_empty() {
         None
     } else {
@@ -518,11 +518,11 @@ async fn run(
         .into_iter()
         .cloned()
         .collect();
-    // Compiled-in built-ins (da#538 Phase C): host the core MCP set in-process,
-    // suppressing any built-in whose name a configured client-mcp server already
-    // provides (external overrides built-in).
-    let configured: Vec<String> = mcp_servers.iter().map(|s| s.name.clone()).collect();
-    let mcp_builtins = adele::builtins::builtin_servers(&configured);
+    // Compiled-in built-ins (da#538 Phase C/D): host the full core MCP set
+    // in-process. `McpHost::start_with` centralizes the override, skipping (and
+    // logging) any built-in whose name a configured client-mcp server already
+    // provides, and reports each built-in's status for the F5 panel.
+    let mcp_builtins = adele::builtins::builtin_servers();
     if !mcp_servers.is_empty() || !mcp_builtins.is_empty() {
         app.mcp_host = Some(Rc::new(
             McpHost::start_with(&mcp_servers, mcp_builtins).await,
@@ -707,6 +707,14 @@ async fn run(
                 }
                 ScreenRequest::McpServers => {
                     if let Some(conn) = connector.clone() {
+                        // Resolve the client's in-process built-ins for the panel's
+                        // read-only section (da#538 Phase D). Computed before the
+                        // sink borrows `app` mutably; empty when no host is running.
+                        let mcp_builtins = app
+                            .mcp_host
+                            .as_ref()
+                            .map(|h| adele::builtins::builtin_dtos(h.builtin_status()))
+                            .unwrap_or_default();
                         let mut sink = SubScreenSink {
                             app: &mut app,
                             connector: &connector,
@@ -715,8 +723,14 @@ async fn run(
                             narration_tx: &narration_tx,
                             disconnect: &mut disconnect,
                         };
-                        if let Err(e) =
-                            mcp::run(terminal, conn.client(), &mut signal_rx, &mut sink).await
+                        if let Err(e) = mcp::run(
+                            terminal,
+                            conn.client(),
+                            &mcp_builtins,
+                            &mut signal_rx,
+                            &mut sink,
+                        )
+                        .await
                         {
                             sink.app.status_message = format!("MCP servers error: {e}");
                         }

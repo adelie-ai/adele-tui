@@ -1,11 +1,18 @@
-//! Compiled-in ("built-in") MCP servers hosted in-process (da#538 Phase C).
+//! Compiled-in ("built-in") MCP servers hosted in-process (da#538 Phase C/D).
 //!
 //! The core set (fileio/terminal/tasks/web) is compiled in and hosted by
 //! default so a fresh tui is useful with no `client-mcp.toml`. An external
-//! client-mcp server of the SAME NAME overrides (suppresses) the built-in:
-//! external > built-in.
+//! client-mcp server of the SAME NAME overrides (suppresses) the built-in
+//! (external > built-in); that override decision now lives centrally in
+//! [`McpHost::start_with`], which skips + logs a shadowed built-in and reports
+//! it via [`McpHost::builtin_status`]. This module just enumerates the full
+//! compiled-in set and maps that status into the panel's view-model DTO.
+//!
+//! [`McpHost::start_with`]: desktop_assistant_client_common::mcp_host::McpHost::start_with
+//! [`McpHost::builtin_status`]: desktop_assistant_client_common::mcp_host::McpHost::builtin_status
 
-use desktop_assistant_client_common::mcp_host::BuiltinServer;
+use client_ui_common::BuiltinServerDto;
+use desktop_assistant_client_common::mcp_host::{BuiltinServer, BuiltinStatus};
 #[cfg(any(
     feature = "mcp-fileio",
     feature = "mcp-terminal",
@@ -14,8 +21,11 @@ use desktop_assistant_client_common::mcp_host::BuiltinServer;
 ))]
 use std::sync::Arc;
 
-/// Build the enabled built-in servers, skipping any whose name is shadowed by a
-/// configured client-mcp server of the same name (external override wins).
+/// Build every enabled built-in server as the full compiled-in set.
+///
+/// The override (skipping a built-in whose name matches a configured client-mcp
+/// server) is owned by [`McpHost::start_with`], so this returns the complete set
+/// and lets the host make and log the shadowing decision.
 ///
 /// Each `#[cfg]` block compiles in only when its `mcp-*` feature is on, so a
 /// `--no-default-features` build hosts nothing and the tui behaves as it did
@@ -23,61 +33,59 @@ use std::sync::Arc;
 /// registered; the fallible ones (terminal, tasks) are logged and skipped if
 /// their zero-config constructor fails, so a broken environment degrades to the
 /// remaining tools rather than losing the whole set.
-pub fn builtin_servers(configured_names: &[String]) -> Vec<BuiltinServer> {
-    // Unused only when every mcp-* feature is off (`--no-default-features`),
-    // where no built-in is compiled in to consult it.
-    #[cfg_attr(
-        not(any(
-            feature = "mcp-fileio",
-            feature = "mcp-terminal",
-            feature = "mcp-tasks",
-            feature = "mcp-web"
-        )),
-        allow(unused_variables)
-    )]
-    let shadowed = |name: &str| configured_names.iter().any(|n| n == name);
+///
+/// [`McpHost::start_with`]: desktop_assistant_client_common::mcp_host::McpHost::start_with
+pub fn builtin_servers() -> Vec<BuiltinServer> {
     #[allow(unused_mut)]
     let mut out: Vec<BuiltinServer> = Vec::new();
 
     #[cfg(feature = "mcp-fileio")]
-    if !shadowed("fileio") {
-        out.push(BuiltinServer::new(
-            "fileio",
-            "fileio",
-            Arc::new(fileio_mcp::build_service()),
-        ));
-    }
+    out.push(BuiltinServer::new(
+        "fileio",
+        "fileio",
+        Arc::new(fileio_mcp::build_service()),
+    ));
     #[cfg(feature = "mcp-terminal")]
-    if !shadowed("terminal") {
-        match terminal_mcp::build_service() {
-            Ok(svc) => out.push(BuiltinServer::new("terminal", "terminal", Arc::new(svc))),
-            Err(e) => tracing::warn!("built-in terminal server unavailable: {e}"),
-        }
+    match terminal_mcp::build_service() {
+        Ok(svc) => out.push(BuiltinServer::new("terminal", "terminal", Arc::new(svc))),
+        Err(e) => tracing::warn!("built-in terminal server unavailable: {e}"),
     }
     #[cfg(feature = "mcp-tasks")]
-    if !shadowed("tasks") {
-        match tasks_mcp::build_service() {
-            Ok(svc) => out.push(BuiltinServer::new("tasks", "tasks", Arc::new(svc))),
-            Err(e) => tracing::warn!("built-in tasks server unavailable: {e}"),
-        }
+    match tasks_mcp::build_service() {
+        Ok(svc) => out.push(BuiltinServer::new("tasks", "tasks", Arc::new(svc))),
+        Err(e) => tracing::warn!("built-in tasks server unavailable: {e}"),
     }
     #[cfg(feature = "mcp-web")]
-    if !shadowed("web") {
-        out.push(BuiltinServer::new(
-            "web",
-            "web",
-            Arc::new(web_mcp::build_service()),
-        ));
-    }
+    out.push(BuiltinServer::new(
+        "web",
+        "web",
+        Arc::new(web_mcp::build_service()),
+    ));
 
     out
+}
+
+/// Map the host's per-built-in [`BuiltinStatus`] into the view-model
+/// [`BuiltinServerDto`]s the shared MCP-servers panel renders via
+/// `client_ui_common::server_rows_with_builtins`. The `usize` `tool_count`
+/// widens to the DTO's `u32`; `overridden_by` carries straight through so an
+/// overridden built-in renders as a disabled row.
+pub fn builtin_dtos(status: Vec<BuiltinStatus>) -> Vec<BuiltinServerDto> {
+    status
+        .into_iter()
+        .map(|s| BuiltinServerDto {
+            name: s.name,
+            namespace: s.namespace,
+            tool_count: s.tool_count as u32,
+            overridden_by: s.overridden_by,
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use client_ui_common::{ServerKind, kind_label, server_rows_with_builtins};
-    use desktop_assistant_client_common::mcp_host::BuiltinStatus;
 
     /// fileio's constructor is infallible, so the compiled-in set deterministically
     /// contains a server named "fileio", advertised under the "fileio" namespace.
