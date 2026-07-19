@@ -76,33 +76,90 @@ pub fn builtin_servers(configured_names: &[String]) -> Vec<BuiltinServer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use client_ui_common::{ServerKind, kind_label, server_rows_with_builtins};
+    use desktop_assistant_client_common::mcp_host::BuiltinStatus;
 
-    /// fileio's constructor is infallible, so with nothing shadowing it the
-    /// built-in set deterministically contains a server named "fileio",
-    /// advertised under the "fileio" namespace.
+    /// fileio's constructor is infallible, so the compiled-in set deterministically
+    /// contains a server named "fileio", advertised under the "fileio" namespace.
+    /// The override (skipping a shadowed built-in) now lives centrally in
+    /// [`McpHost::start_with`], so `builtin_servers()` always returns the full set.
     #[cfg(feature = "mcp-fileio")]
     #[test]
-    fn fileio_builtin_present_and_namespaced_by_default() {
-        let servers = builtin_servers(&[]);
+    fn fileio_builtin_present_and_namespaced_in_full_set() {
+        let servers = builtin_servers();
         let fileio = servers
             .iter()
             .find(|s| s.name == "fileio")
-            .expect("fileio built-in must be present when nothing shadows it");
+            .expect("fileio built-in must be present in the compiled set");
         assert_eq!(
             fileio.namespace, "fileio",
             "fileio built-in must be advertised under the 'fileio' namespace"
         );
     }
 
-    /// A configured client-mcp server of the same name suppresses the built-in
-    /// (external > built-in), so the built-in set omits "fileio" entirely.
-    #[cfg(feature = "mcp-fileio")]
+    /// The panel mapping: a host [`BuiltinStatus`] list becomes [`BuiltinServerDto`]s
+    /// that `server_rows_with_builtins` turns into an active built-in row (no
+    /// disabled reason) and an overridden one (a disabled row whose reason names the
+    /// external server). This is the exact path the F5 MCP panel renders.
     #[test]
-    fn external_same_name_shadows_builtin() {
-        let servers = builtin_servers(&["fileio".to_string()]);
+    fn builtin_dtos_map_to_active_and_overridden_rows() {
+        let status = vec![
+            BuiltinStatus {
+                name: "fileio".into(),
+                namespace: "fileio".into(),
+                tool_count: 7,
+                overridden_by: None,
+            },
+            BuiltinStatus {
+                name: "web".into(),
+                namespace: "web".into(),
+                tool_count: 3,
+                overridden_by: Some("web".into()),
+            },
+        ];
+
+        let dtos = builtin_dtos(status);
+        assert_eq!(dtos.len(), 2, "each status maps to exactly one dto");
+        let fileio_dto = dtos
+            .iter()
+            .find(|d| d.name == "fileio")
+            .expect("fileio dto present");
+        assert_eq!(fileio_dto.tool_count, 7, "usize tool_count widens to u32");
+        assert_eq!(fileio_dto.overridden_by, None);
+
+        let rows = server_rows_with_builtins(&[], &[], &dtos);
+
+        let fileio = rows
+            .iter()
+            .find(|r| r.name == "fileio")
+            .expect("fileio row present");
+        assert_eq!(
+            fileio.kind,
+            ServerKind::BuiltIn,
+            "built-in rows carry the BuiltIn kind"
+        );
+        assert_eq!(
+            fileio.disabled_reason, None,
+            "an active built-in is not disabled"
+        );
+        assert_eq!(kind_label(fileio.kind), "built-in");
+
+        let web = rows
+            .iter()
+            .find(|r| r.name == "web")
+            .expect("web row present");
+        assert_eq!(web.kind, ServerKind::BuiltIn);
+        let reason = web
+            .disabled_reason
+            .as_deref()
+            .expect("an overridden built-in must render disabled with a reason");
         assert!(
-            !servers.iter().any(|s| s.name == "fileio"),
-            "an external client-mcp server named 'fileio' must suppress the built-in"
+            reason.contains("overridden"),
+            "reason explains the override: {reason}"
+        );
+        assert!(
+            reason.contains("web"),
+            "reason names the overriding server: {reason}"
         );
     }
 }

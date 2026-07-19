@@ -2237,6 +2237,7 @@ mod tests {
     fn state_with(servers: Vec<McpServerView>, accounts: Vec<ServiceAccountView>) -> State {
         State {
             servers,
+            builtins: Vec::new(),
             accounts,
             selected: 0,
             mode: Mode::List,
@@ -2245,6 +2246,78 @@ mod tests {
             busy: None,
             closing: false,
         }
+    }
+
+    // --- built-in rows (da#538 Phase D, slice 3) -----------------------------
+
+    /// A built-in [`ServerRow`] as produced by `server_rows_with_builtins`: an
+    /// in-process, client-run server whose `disabled_reason` is `Some` iff an
+    /// external server of the same name overrides it.
+    fn builtin_row(name: &str, tool_count: u32, reason: Option<&str>) -> client_ui_common::ServerRow {
+        client_ui_common::ServerRow {
+            name: name.into(),
+            runner: client_ui_common::Runner::Client,
+            transport: "builtin".into(),
+            status: if reason.is_some() { "disabled" } else { "running" }.into(),
+            tool_count,
+            detail: None,
+            kind: client_ui_common::ServerKind::BuiltIn,
+            disabled_reason: reason.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn builtin_row_display_active_has_no_reason() {
+        let d = builtin_row_display(&builtin_row("fileio", 7, None));
+        assert!(!d.disabled, "an active built-in must not render disabled");
+        assert!(d.reason.is_none(), "an active built-in has no override reason");
+        assert!(d.head.contains("fileio"), "head names the server: {}", d.head);
+        assert!(
+            d.head.contains("built-in"),
+            "head carries the kind chip: {}",
+            d.head
+        );
+    }
+
+    #[test]
+    fn builtin_row_display_overridden_dims_and_shows_reason() {
+        let d = builtin_row_display(&builtin_row(
+            "web",
+            3,
+            Some("overridden by the external \"web\""),
+        ));
+        assert!(
+            d.disabled,
+            "an overridden built-in must render disabled/dimmed"
+        );
+        let reason = d
+            .reason
+            .as_deref()
+            .expect("an overridden built-in must surface a reason");
+        assert!(
+            reason.contains("overridden"),
+            "reason explains the override: {reason}"
+        );
+    }
+
+    #[test]
+    fn draw_list_renders_builtin_section_with_override_reason() {
+        let mut state = state_with(Vec::new(), Vec::new());
+        state.builtins = vec![
+            builtin_row("fileio", 7, None),
+            builtin_row("web", 3, Some("overridden by the external \"web\"")),
+        ];
+        let text = rendered(&state, 120, 20);
+        assert!(
+            text.contains("in-process"),
+            "built-in section header missing: {text}"
+        );
+        assert!(text.contains("fileio"), "active built-in row missing: {text}");
+        assert!(text.contains("built-in"), "kind chip missing: {text}");
+        assert!(
+            text.contains("overridden"),
+            "override reason missing: {text}"
+        );
     }
 
     #[test]
