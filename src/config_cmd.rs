@@ -17,10 +17,12 @@
 //!
 //! [`default_client_mcp_path`]: desktop_assistant_client_common::mcp_host::default_client_mcp_path
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
+use desktop_assistant_client_common::mcp_host::{ClientMcpConfig, McpServerConfig};
 
 /// The default client surface the `config mcp` subcommands act on when none is
 /// given — the TUI's own surface. Mirrors the `"tui"` surface string the
@@ -51,9 +53,17 @@ impl BuiltinInfo {
 }
 
 /// `config path`: print the resolved client-MCP config file location.
+///
+/// This file is shared per machine across every Adele client (each surface
+/// selects its own subset), so the path is the same one the interactive TUI,
+/// GTK, and KDE clients read.
 pub fn config_path(path: &Path, out: &mut impl Write) -> Result<()> {
-    let _ = (path, out);
-    bail!("config_path not yet implemented")
+    writeln!(out, "Client-MCP config: {}", path.display())?;
+    writeln!(
+        out,
+        "  (shared per machine; each client surface selects its own subset)"
+    )?;
+    Ok(())
 }
 
 /// `config show [--section mcp]`: print the effective client-MCP config as TOML.
@@ -61,8 +71,30 @@ pub fn config_path(path: &Path, out: &mut impl Write) -> Result<()> {
 /// `section` restricts the output; only `mcp` (the default) is supported today,
 /// and any other value is a clear error rather than an empty print.
 pub fn config_show(path: &Path, section: Option<&str>, out: &mut impl Write) -> Result<()> {
-    let _ = (path, section, out);
-    bail!("config_show not yet implemented")
+    match section {
+        None | Some("mcp") => {}
+        Some(other) => bail!("unknown config section '{other}'; only 'mcp' is supported"),
+    }
+
+    writeln!(out, "Client-MCP config: {}", path.display())?;
+    if !path.exists() {
+        writeln!(
+            out,
+            "  (file does not exist — no client-hosted MCP servers configured)"
+        )?;
+        return Ok(());
+    }
+
+    // Load (tolerant of a malformed file, which parses to an empty config with a
+    // warning) and re-serialize the *effective* config, so `show` reflects what
+    // the clients actually see rather than echoing raw bytes.
+    let cfg = ClientMcpConfig::load(path);
+    if cfg.list_defined_servers().is_empty() {
+        writeln!(out, "  (no client-MCP servers defined)")?;
+    }
+    let toml = toml::to_string_pretty(&cfg).map_err(|e| anyhow!("serialize config: {e}"))?;
+    write!(out, "{toml}")?;
+    Ok(())
 }
 
 /// `config mcp list`: list the client-MCP servers for `surface` (with their
@@ -75,8 +107,79 @@ pub fn mcp_list(
     surface: &str,
     out: &mut impl Write,
 ) -> Result<()> {
-    let _ = (path, builtins, surface, out);
-    bail!("mcp_list not yet implemented")
+    let cfg = ClientMcpConfig::load(path);
+    let defined = cfg.list_defined_servers();
+    let enabled_names = cfg.surface_enabled_names(surface);
+    // A built-in is overridden when a same-named client-MCP server actually
+    // resolves for this surface (defined + enabled + surface-listed) — exactly
+    // the shadowing rule `McpHost::start_with` applies.
+    let overriding: Vec<&str> = cfg
+        .resolved_servers(surface)
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+
+    // Column width for the name column, sized to the longest name shown.
+    let name_w = defined
+        .iter()
+        .map(|s| s.name.len())
+        .chain(builtins.iter().map(|b| b.name.len()))
+        .max()
+        .unwrap_or(4)
+        .max(4);
+
+    writeln!(out, "Client-hosted MCP servers (surface: {surface})")?;
+    if defined.is_empty() {
+        writeln!(out, "  (none defined — add one with `config mcp add-server`)")?;
+    } else {
+        writeln!(out, "  {:name_w$}  {:<9}  COMMAND", "NAME", "STATUS")?;
+        for server in defined {
+            let status = if enabled_names.iter().any(|n| n == &server.name) {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            let target = if server.command.is_empty() {
+                "(remote/http)".to_string()
+            } else if server.args.is_empty() {
+                server.command.clone()
+            } else {
+                format!("{} {}", server.command, server.args.join(" "))
+            };
+            writeln!(out, "  {:name_w$}  {status:<9}  {target}", server.name)?;
+        }
+    }
+
+    writeln!(out)?;
+    writeln!(out, "Built-in (in-process) servers")?;
+    if builtins.is_empty() {
+        writeln!(out, "  (none compiled in)")?;
+    } else {
+        writeln!(out, "  {:name_w$}  {:<5}  STATUS", "NAME", "TOOLS")?;
+        for builtin in builtins {
+            let status = if overriding.iter().any(|n| *n == builtin.name) {
+                format!("overridden by client-MCP '{}'", builtin.name)
+            } else {
+                "active".to_string()
+            };
+            writeln!(
+                out,
+                "  {:name_w$}  {:<5}  {status}",
+                builtin.name, builtin.tool_count
+            )?;
+        }
+    }
+
+    writeln!(out)?;
+    writeln!(
+        out,
+        "Note: daemon-hosted MCP servers are not shown here (client-side config only)."
+    )?;
+    writeln!(
+        out,
+        "      Manage those from the interactive `adele` F5 panel."
+    )?;
+    Ok(())
 }
 
 /// `config mcp add-server`: define (or replace) a stdio client-MCP server, and
@@ -92,15 +195,55 @@ pub fn mcp_add_server(
     enabled: bool,
     out: &mut impl Write,
 ) -> Result<()> {
-    let _ = (path, name, command, args, namespace, surfaces, enabled, out);
-    bail!("mcp_add_server not yet implemented")
+    let mut cfg = ClientMcpConfig::load(path);
+    let existed = cfg.list_defined_servers().iter().any(|s| s.name == name);
+
+    // The definition is always enabled at the definition level (the surface
+    // enable list is the on/off switch the `enable`/`disable` subcommands drive);
+    // `--enabled` decides whether it is turned on for the given surface(s) now.
+    let server = McpServerConfig {
+        name: name.to_string(),
+        command: command.to_string(),
+        args: args.to_vec(),
+        namespace: namespace.map(str::to_string),
+        enabled: true,
+        env: HashMap::new(),
+        env_secrets: HashMap::new(),
+        http: None,
+        description: None,
+    };
+    cfg.upsert_server(server);
+    if enabled {
+        for surface in surfaces {
+            cfg.set_surface_enabled(surface, name, true);
+        }
+    }
+    cfg.save(path).map_err(|e| anyhow!(e))?;
+
+    writeln!(
+        out,
+        "{} client-MCP server '{name}' (command: {command}).",
+        if existed { "Updated" } else { "Added" }
+    )?;
+    if enabled && !surfaces.is_empty() {
+        writeln!(out, "Enabled for surface(s): {}.", surfaces.join(", "))?;
+    } else {
+        writeln!(
+            out,
+            "Defined but not enabled for any surface; run `adele config mcp enable {name}` to turn it on."
+        )?;
+    }
+    Ok(())
 }
 
 /// `config mcp remove-server`: delete a client-MCP server definition (and prune
 /// it from every surface). Errors if no server by that name is defined.
 pub fn mcp_remove_server(path: &Path, name: &str, out: &mut impl Write) -> Result<()> {
-    let _ = (path, name, out);
-    bail!("mcp_remove_server not yet implemented")
+    let mut cfg = ClientMcpConfig::load(path);
+    cfg.remove_server(name).map_err(|e| anyhow!(e))?;
+    cfg.save(path).map_err(|e| anyhow!(e))?;
+    writeln!(out, "Removed client-MCP server '{name}'.")?;
+    Ok(())
 }
 
 /// `config mcp enable`/`disable`: flip a client-MCP server's membership in one
@@ -115,8 +258,30 @@ pub fn mcp_set_enabled(
     builtins: &[BuiltinInfo],
     out: &mut impl Write,
 ) -> Result<()> {
-    let _ = (path, name, surface, on, builtins, out);
-    bail!("mcp_set_enabled not yet implemented")
+    let mut cfg = ClientMcpConfig::load(path);
+    let is_defined = cfg.list_defined_servers().iter().any(|s| s.name == name);
+
+    if is_defined {
+        cfg.set_surface_enabled(surface, name, on);
+        cfg.save(path).map_err(|e| anyhow!(e))?;
+        writeln!(
+            out,
+            "{} client-MCP server '{name}' for surface '{surface}'.",
+            if on { "Enabled" } else { "Disabled" }
+        )?;
+    } else if builtins.iter().any(|b| b.name == name) {
+        // A name that matches only a built-in: toggling built-ins needs the
+        // built-in disabled-state (da#538 slice 4), which doesn't exist yet.
+        // Report it as a normal informational decline, not an error, and make no
+        // change rather than writing a dangling surface entry.
+        writeln!(
+            out,
+            "'{name}' is a built-in (in-process) server; enabling/disabling built-ins is not yet supported (coming with the panel toggle). No change made."
+        )?;
+    } else {
+        bail!("no such client-MCP server: '{name}'");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
