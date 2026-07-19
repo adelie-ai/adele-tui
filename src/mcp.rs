@@ -56,6 +56,7 @@
 use std::collections::BTreeMap;
 use std::io;
 
+use client_ui_common::{BuiltinServerDto, ServerRow, kind_label, server_rows_with_builtins};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use desktop_assistant_api_model::{
     Command, CommandResult, McpServerView, Secret, ServiceAccountView,
@@ -768,6 +769,13 @@ enum RpcOutcome {
 
 struct State {
     servers: Vec<McpServerView>,
+    /// Built-in (in-process) MCP servers, resolved once at open from the client's
+    /// `McpHost::builtin_status()` (da#538 Phase D). Rendered as a read-only
+    /// section below the daemon servers: they are hosted inside this client, not
+    /// managed by the daemon, so they are informational and not selectable /
+    /// editable. An overridden built-in carries a `disabled_reason` and renders
+    /// disabled. Empty when built-ins are compiled out or no host is running.
+    builtins: Vec<ServerRow>,
     /// OAuth service accounts (for the editor picker). Best-effort — a failure
     /// to list them leaves the picker empty rather than blocking the panel.
     accounts: Vec<ServiceAccountView>,
@@ -826,15 +834,23 @@ impl Screen for McpScreen<'_> {
 }
 
 /// Run the MCP-servers screen. Returns when the user closes it.
+///
+/// `builtins` are the client's compiled-in (in-process) MCP servers, resolved by
+/// the caller from `McpHost::builtin_status()` and mapped to
+/// [`BuiltinServerDto`]s. They are merged into read-only [`ServerRow`]s (via
+/// `server_rows_with_builtins` with no daemon/external client rows) and shown as
+/// a separate informational section; pass an empty slice when none are hosted.
 pub async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     client: &TransportClient,
+    builtins: &[BuiltinServerDto],
     signal_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SignalEvent>,
     sink: &mut impl crate::screen::SignalSink,
 ) -> anyhow::Result<()> {
     let mut screen = McpScreen {
         state: State {
             servers: Vec::new(),
+            builtins: server_rows_with_builtins(&[], &[], builtins),
             accounts: Vec::new(),
             selected: 0,
             mode: Mode::List,
@@ -1236,7 +1252,7 @@ fn draw_header(f: &mut Frame, area: Rect) {
 }
 
 fn draw_list(f: &mut Frame, state: &State, area: Rect) {
-    let items: Vec<ListItem> = if state.servers.is_empty() {
+    let mut items: Vec<ListItem> = if state.servers.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "(no MCP servers — press 'a' to add one)",
             Style::default().fg(theme().text_dim),
@@ -1244,6 +1260,19 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
     } else {
         state.servers.iter().map(server_item).collect()
     };
+
+    // Built-in (in-process) servers render below the daemon list as a read-only
+    // section: they are hosted inside this client, so they are informational and
+    // never selectable / editable (selection stays bounded to `state.servers`).
+    if !state.builtins.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            "── Built-in (in-process) ──",
+            Style::default()
+                .fg(theme().text_dim)
+                .add_modifier(Modifier::DIM),
+        ))));
+        items.extend(state.builtins.iter().map(builtin_item));
+    }
 
     let title = if state.servers.is_empty() {
         "Servers".to_string()
@@ -1327,6 +1356,71 @@ fn server_item(server: &McpServerView) -> ListItem<'static> {
         lines.push(Line::from(Span::styled(
             "    Sign-in required — press 'c' for the command to run on the daemon host",
             Style::default().fg(theme().warn),
+        )));
+    }
+    ListItem::new(lines)
+}
+
+/// Pure display model for one built-in [`ServerRow`]: the head-line text (name +
+/// kind chip + tool count), the optional override reason, and whether the row
+/// should render disabled/dimmed. Kept pure — free of `ratatui` styling — so the
+/// overridden/disabled rendering is unit-testable without a terminal. All text
+/// is [`sanitize`]d (the overriding name is config-sourced) as elsewhere here.
+struct BuiltinRowDisplay {
+    head: String,
+    reason: Option<String>,
+    disabled: bool,
+}
+
+/// Build the display model for a built-in row. An overridden built-in
+/// (`disabled_reason == Some`) is marked `disabled` and carries its reason.
+fn builtin_row_display(row: &ServerRow) -> BuiltinRowDisplay {
+    let chip = kind_label(row.kind);
+    let n = row.tool_count;
+    let head = format!(
+        "{}  [{chip}]  {n} tool{}",
+        sanitize(&row.name),
+        if n == 1 { "" } else { "s" },
+    );
+    BuiltinRowDisplay {
+        head,
+        reason: row.disabled_reason.as_deref().map(sanitize),
+        disabled: row.disabled_reason.is_some(),
+    }
+}
+
+/// One built-in server row: a head line (name + `[built-in]` chip + tool count)
+/// plus, when the built-in is overridden by an external server of the same name,
+/// a dim disabled detail line surfacing the reason. Overridden rows render dim
+/// throughout to read as inactive.
+fn builtin_item(row: &ServerRow) -> ListItem<'static> {
+    let display = builtin_row_display(row);
+    let head_style = if display.disabled {
+        Style::default()
+            .fg(theme().text_dim)
+            .add_modifier(Modifier::DIM)
+    } else {
+        Style::default().fg(theme().text_dim)
+    };
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "○",
+            Style::default().fg(if display.disabled {
+                theme().text_dim
+            } else {
+                theme().ok
+            }),
+        ),
+        Span::raw(" "),
+        Span::styled(display.head, head_style),
+    ])];
+    if let Some(reason) = display.reason {
+        lines.push(Line::from(Span::styled(
+            format!("    {reason}"),
+            Style::default()
+                .fg(theme().text_dim)
+                .add_modifier(Modifier::ITALIC | Modifier::DIM),
         )));
     }
     ListItem::new(lines)
@@ -2237,6 +2331,7 @@ mod tests {
     fn state_with(servers: Vec<McpServerView>, accounts: Vec<ServiceAccountView>) -> State {
         State {
             servers,
+            builtins: Vec::new(),
             accounts,
             selected: 0,
             mode: Mode::List,
@@ -2245,6 +2340,97 @@ mod tests {
             busy: None,
             closing: false,
         }
+    }
+
+    // --- built-in rows (da#538 Phase D, slice 3) -----------------------------
+
+    /// A built-in [`ServerRow`] as produced by `server_rows_with_builtins`: an
+    /// in-process, client-run server whose `disabled_reason` is `Some` iff an
+    /// external server of the same name overrides it.
+    fn builtin_row(
+        name: &str,
+        tool_count: u32,
+        reason: Option<&str>,
+    ) -> client_ui_common::ServerRow {
+        client_ui_common::ServerRow {
+            name: name.into(),
+            runner: client_ui_common::Runner::Client,
+            transport: "builtin".into(),
+            status: if reason.is_some() {
+                "disabled"
+            } else {
+                "running"
+            }
+            .into(),
+            tool_count,
+            detail: None,
+            kind: client_ui_common::ServerKind::BuiltIn,
+            disabled_reason: reason.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn builtin_row_display_active_has_no_reason() {
+        let d = builtin_row_display(&builtin_row("fileio", 7, None));
+        assert!(!d.disabled, "an active built-in must not render disabled");
+        assert!(
+            d.reason.is_none(),
+            "an active built-in has no override reason"
+        );
+        assert!(
+            d.head.contains("fileio"),
+            "head names the server: {}",
+            d.head
+        );
+        assert!(
+            d.head.contains("built-in"),
+            "head carries the kind chip: {}",
+            d.head
+        );
+    }
+
+    #[test]
+    fn builtin_row_display_overridden_dims_and_shows_reason() {
+        let d = builtin_row_display(&builtin_row(
+            "web",
+            3,
+            Some("overridden by the external \"web\""),
+        ));
+        assert!(
+            d.disabled,
+            "an overridden built-in must render disabled/dimmed"
+        );
+        let reason = d
+            .reason
+            .as_deref()
+            .expect("an overridden built-in must surface a reason");
+        assert!(
+            reason.contains("overridden"),
+            "reason explains the override: {reason}"
+        );
+    }
+
+    #[test]
+    fn draw_list_renders_builtin_section_with_override_reason() {
+        let mut state = state_with(Vec::new(), Vec::new());
+        state.builtins = vec![
+            builtin_row("fileio", 7, None),
+            builtin_row("web", 3, Some("overridden by the external \"web\"")),
+        ];
+        let text = rendered(&state, 120, 20);
+        assert!(
+            text.contains("in-process"),
+            "built-in section header missing: {text}"
+        );
+        assert!(
+            text.contains("fileio"),
+            "active built-in row missing: {text}"
+        );
+        assert!(text.contains("built-in"), "kind chip missing: {text}");
+        assert!(
+            text.contains("overridden"),
+            "override reason missing: {text}"
+        );
     }
 
     #[test]
