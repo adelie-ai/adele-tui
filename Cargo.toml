@@ -45,6 +45,17 @@ desktop-assistant-api-model = { git = "https://github.com/adelie-ai/desktop-assi
 # The shared view-agnostic model+controller (CC-3, desktop-assistant#358).
 client-ui-common = { path = "../client-ui-common" }
 
+# Compiled-in ("built-in") MCP servers hosted in-process (da#538 Phase C). Each
+# core server lib exposes `build_service()`; the tui hosts them via
+# `McpHost::start_with` so a fresh client has core tools with no client-mcp.toml.
+# Optional + feature-gated (see `[features]`) so a `--no-default-features` build
+# links none of them and behaves exactly as before. Sibling path-deps, matching
+# how the desktop-assistant crates are path-patched below.
+fileio-mcp = { path = "../fileio-mcp", optional = true }
+terminal-mcp = { path = "../terminal-mcp", optional = true }
+tasks-mcp = { path = "../tasks-mcp", optional = true }
+web-mcp = { path = "../web-mcp", optional = true }
+
 # Embeddable voice module (adelie-ai/voice phase 1) for in-app dictation +
 # reply playback with no voice daemon — see adele-tui#67 / voice#34. Path-dep
 # of the sibling `voice` checkout, mirroring how we path-dep desktop-assistant
@@ -79,6 +90,30 @@ path = "../voice/crates/stt-whisper"
 desktop-assistant-client-common = { path = "../desktop-assistant/crates/client-common" }
 desktop-assistant-api-model = { path = "../desktop-assistant/crates/api-model" }
 
+# Collapse mcp-core to a SINGLE source. client-common pins it to a git rev while
+# the built-in server libs (fileio/terminal/tasks/web) float the git dep; two
+# git sources would split `mcp_core::McpService` into incompatible types (E0308)
+# when a built-in's `Arc<dyn McpService>` is handed to `BuiltinServer::new`.
+# Patching the URL to the local checkout resolves every consumer to one
+# mcp-core. `../mcp-core` is a superset of the pinned rev (only security/CLI
+# hardening + docs ahead; the `McpService` trait is byte-identical), so the API
+# client-common compiles against is unchanged.
+[patch."https://github.com/adelie-ai/mcp-core"]
+mcp-core = { path = "../mcp-core" }
+
+
+[features]
+# The core built-in MCP set is compiled in and hosted in-process by default, so
+# a fresh tui is useful with no client-mcp.toml (da#538 Phase C). Turn a server
+# off with e.g. `--no-default-features --features mcp-fileio,mcp-terminal`, or
+# drop them all with `--no-default-features` (the tui then behaves exactly as it
+# did before this feature — client-mcp.toml servers only).
+default = ["builtin-core"]
+builtin-core = ["mcp-fileio", "mcp-terminal", "mcp-tasks", "mcp-web"]
+mcp-fileio = ["dep:fileio-mcp"]
+mcp-terminal = ["dep:terminal-mcp"]
+mcp-tasks = ["dep:tasks-mcp"]
+mcp-web = ["dep:web-mcp"]
 
 [lints.rust]
 warnings = "deny"

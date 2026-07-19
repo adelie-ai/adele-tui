@@ -323,10 +323,14 @@ async fn run_headless(config: &ConnectionConfig, prompt: String) -> Result<()> {
         .into_iter()
         .cloned()
         .collect();
-    let host = if servers.is_empty() {
+    // Compiled-in built-ins (da#538 Phase C): host the core MCP set in-process,
+    // minus any name a client-mcp.toml server already provides (external wins).
+    let configured: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
+    let mcp_builtins = adele::builtins::builtin_servers(&configured);
+    let host = if servers.is_empty() && mcp_builtins.is_empty() {
         None
     } else {
-        Some(McpHost::start(&servers).await)
+        Some(McpHost::start_with(&servers, mcp_builtins).await)
     };
     let host_tools = host.as_ref().map(|h| h.registrations()).unwrap_or_default();
     let builtins = vec![
@@ -514,8 +518,15 @@ async fn run(
         .into_iter()
         .cloned()
         .collect();
-    if !mcp_servers.is_empty() {
-        app.mcp_host = Some(Rc::new(McpHost::start(&mcp_servers).await));
+    // Compiled-in built-ins (da#538 Phase C): host the core MCP set in-process,
+    // suppressing any built-in whose name a configured client-mcp server already
+    // provides (external overrides built-in).
+    let configured: Vec<String> = mcp_servers.iter().map(|s| s.name.clone()).collect();
+    let mcp_builtins = adele::builtins::builtin_servers(&configured);
+    if !mcp_servers.is_empty() || !mcp_builtins.is_empty() {
+        app.mcp_host = Some(Rc::new(
+            McpHost::start_with(&mcp_servers, mcp_builtins).await,
+        ));
     }
 
     // The `Connector` owns the transport AND the signal stream, pumping every
