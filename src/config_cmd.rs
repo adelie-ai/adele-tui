@@ -1,0 +1,401 @@
+//! Non-interactive `config` subcommand handlers (adele-tui#122).
+//!
+//! The scriptable twin of the interactive `F5` MCP-servers panel and the
+//! connection/config screens: `adele config …` loads, mutates, and saves the
+//! shared client-MCP config ([`ClientMcpConfig`], `client-mcp.toml`) without ever
+//! standing up a TUI or a daemon connection, so it composes in shell scripts.
+//!
+//! Every handler here is **pure over an injected config path** — the caller
+//! resolves [`default_client_mcp_path`] and passes it in — and writes its
+//! human-facing output to an injected [`Write`] sink, so the whole surface is
+//! unit-testable against a tempfile and an in-memory buffer with no real daemon,
+//! filesystem-global state, or terminal.
+//!
+//! Scope: this manages the **client-side** MCP config only. Daemon-hosted MCP
+//! servers are out of this first cut (they need a live connection + the typed
+//! command channel the `F5` panel uses); [`mcp_list`] says so in its output.
+//!
+//! [`default_client_mcp_path`]: desktop_assistant_client_common::mcp_host::default_client_mcp_path
+
+use std::io::Write;
+use std::path::Path;
+
+use anyhow::{Result, bail};
+
+/// The default client surface the `config mcp` subcommands act on when none is
+/// given — the TUI's own surface. Mirrors the `"tui"` surface string the
+/// interactive client hosts its client-MCP servers under.
+pub const DEFAULT_SURFACE: &str = "tui";
+
+/// A compiled-in built-in server, reduced to what [`mcp_list`] renders: its name
+/// and advertised tool count. The caller resolves these from
+/// `crate::builtins::builtin_servers()` (`name` + `service.tools().len()`) and
+/// passes them in, so this module stays free of the feature-gated built-in
+/// server deps and is testable with synthetic built-ins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltinInfo {
+    /// The built-in's name (also its default tool-namespace prefix).
+    pub name: String,
+    /// The number of tools the built-in advertises (`service.tools().len()`).
+    pub tool_count: usize,
+}
+
+impl BuiltinInfo {
+    /// Convenience constructor.
+    pub fn new(name: impl Into<String>, tool_count: usize) -> Self {
+        Self {
+            name: name.into(),
+            tool_count,
+        }
+    }
+}
+
+/// `config path`: print the resolved client-MCP config file location.
+pub fn config_path(path: &Path, out: &mut impl Write) -> Result<()> {
+    let _ = (path, out);
+    bail!("config_path not yet implemented")
+}
+
+/// `config show [--section mcp]`: print the effective client-MCP config as TOML.
+///
+/// `section` restricts the output; only `mcp` (the default) is supported today,
+/// and any other value is a clear error rather than an empty print.
+pub fn config_show(path: &Path, section: Option<&str>, out: &mut impl Write) -> Result<()> {
+    let _ = (path, section, out);
+    bail!("config_show not yet implemented")
+}
+
+/// `config mcp list`: list the client-MCP servers for `surface` (with their
+/// command + whether they're enabled for that surface), then the compiled-in
+/// built-ins (with tool counts, marking any overridden by a same-named,
+/// surface-enabled client-MCP server).
+pub fn mcp_list(
+    path: &Path,
+    builtins: &[BuiltinInfo],
+    surface: &str,
+    out: &mut impl Write,
+) -> Result<()> {
+    let _ = (path, builtins, surface, out);
+    bail!("mcp_list not yet implemented")
+}
+
+/// `config mcp add-server`: define (or replace) a stdio client-MCP server, and
+/// — when `enabled` — turn it on for each of `surfaces`.
+#[allow(clippy::too_many_arguments)]
+pub fn mcp_add_server(
+    path: &Path,
+    name: &str,
+    command: &str,
+    args: &[String],
+    namespace: Option<&str>,
+    surfaces: &[String],
+    enabled: bool,
+    out: &mut impl Write,
+) -> Result<()> {
+    let _ = (path, name, command, args, namespace, surfaces, enabled, out);
+    bail!("mcp_add_server not yet implemented")
+}
+
+/// `config mcp remove-server`: delete a client-MCP server definition (and prune
+/// it from every surface). Errors if no server by that name is defined.
+pub fn mcp_remove_server(path: &Path, name: &str, out: &mut impl Write) -> Result<()> {
+    let _ = (path, name, out);
+    bail!("mcp_remove_server not yet implemented")
+}
+
+/// `config mcp enable`/`disable`: flip a client-MCP server's membership in one
+/// surface's enable list. A name that matches only a built-in is reported as
+/// not-yet-supported (a normal informational outcome, not an error); a name that
+/// matches neither is an error.
+pub fn mcp_set_enabled(
+    path: &Path,
+    name: &str,
+    surface: &str,
+    on: bool,
+    builtins: &[BuiltinInfo],
+    out: &mut impl Write,
+) -> Result<()> {
+    let _ = (path, name, surface, on, builtins, out);
+    bail!("mcp_set_enabled not yet implemented")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use desktop_assistant_client_common::mcp_host::ClientMcpConfig;
+    use tempfile::tempdir;
+
+    /// A fresh tempdir + the config path inside it (the file itself does not yet
+    /// exist, exercising the load-absent-as-default path).
+    fn temp_cfg() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("client-mcp.toml");
+        (dir, path)
+    }
+
+    fn out_string(f: impl FnOnce(&mut Vec<u8>) -> Result<()>) -> String {
+        let mut buf = Vec::new();
+        f(&mut buf).expect("handler ok");
+        String::from_utf8(buf).expect("utf8 output")
+    }
+
+    #[test]
+    fn add_server_then_list_includes_it() {
+        let (_dir, path) = temp_cfg();
+
+        mcp_add_server(
+            &path,
+            "notes",
+            "notes-mcp",
+            &["serve".to_string()],
+            Some("nt"),
+            &["tui".to_string()],
+            true,
+            &mut Vec::new(),
+        )
+        .expect("add");
+
+        // The definition was written and reloads.
+        let cfg = ClientMcpConfig::load(&path);
+        let server = cfg
+            .list_defined_servers()
+            .iter()
+            .find(|s| s.name == "notes")
+            .expect("notes server defined after add");
+        assert_eq!(server.command, "notes-mcp");
+        assert_eq!(server.args, vec!["serve".to_string()]);
+        assert_eq!(server.namespace.as_deref(), Some("nt"));
+
+        // And `list` reflects it, with its command and enabled status.
+        let listed = out_string(|o| mcp_list(&path, &[], "tui", o));
+        assert!(listed.contains("notes"), "list names the server: {listed}");
+        assert!(
+            listed.contains("notes-mcp"),
+            "list shows the command: {listed}"
+        );
+        assert!(
+            listed.contains("enabled"),
+            "an added+enabled server lists as enabled: {listed}"
+        );
+    }
+
+    #[test]
+    fn add_server_without_enabled_leaves_surface_off() {
+        let (_dir, path) = temp_cfg();
+        mcp_add_server(
+            &path,
+            "notes",
+            "notes-mcp",
+            &[],
+            None,
+            &["tui".to_string()],
+            false,
+            &mut Vec::new(),
+        )
+        .expect("add");
+
+        let cfg = ClientMcpConfig::load(&path);
+        assert!(
+            cfg.list_defined_servers().iter().any(|s| s.name == "notes"),
+            "server is defined"
+        );
+        assert!(
+            !cfg.surface_enabled_names("tui").iter().any(|n| n == "notes"),
+            "without --enabled the server is not turned on for the surface"
+        );
+    }
+
+    #[test]
+    fn enable_disable_toggles_surface() {
+        let (_dir, path) = temp_cfg();
+        mcp_add_server(
+            &path,
+            "notes",
+            "notes-mcp",
+            &[],
+            None,
+            &["tui".to_string()],
+            false,
+            &mut Vec::new(),
+        )
+        .expect("add");
+
+        mcp_set_enabled(&path, "notes", "tui", true, &[], &mut Vec::new()).expect("enable");
+        assert!(
+            ClientMcpConfig::load(&path)
+                .surface_enabled_names("tui")
+                .iter()
+                .any(|n| n == "notes"),
+            "enable adds the server to the tui surface"
+        );
+
+        mcp_set_enabled(&path, "notes", "tui", false, &[], &mut Vec::new()).expect("disable");
+        assert!(
+            !ClientMcpConfig::load(&path)
+                .surface_enabled_names("tui")
+                .iter()
+                .any(|n| n == "notes"),
+            "disable removes the server from the tui surface"
+        );
+    }
+
+    #[test]
+    fn remove_server_removes_it() {
+        let (_dir, path) = temp_cfg();
+        mcp_add_server(
+            &path,
+            "notes",
+            "notes-mcp",
+            &[],
+            None,
+            &["tui".to_string()],
+            true,
+            &mut Vec::new(),
+        )
+        .expect("add");
+        assert!(
+            ClientMcpConfig::load(&path)
+                .list_defined_servers()
+                .iter()
+                .any(|s| s.name == "notes")
+        );
+
+        mcp_remove_server(&path, "notes", &mut Vec::new()).expect("remove");
+        let cfg = ClientMcpConfig::load(&path);
+        assert!(
+            !cfg.list_defined_servers().iter().any(|s| s.name == "notes"),
+            "the definition is gone after remove"
+        );
+        assert!(
+            !cfg.surface_enabled_names("tui").iter().any(|n| n == "notes"),
+            "remove prunes the surface enable entry too"
+        );
+    }
+
+    #[test]
+    fn remove_absent_server_errors() {
+        let (_dir, path) = temp_cfg();
+        let err = mcp_remove_server(&path, "ghost", &mut Vec::new())
+            .expect_err("removing an undefined server errors");
+        assert!(
+            err.to_string().contains("ghost"),
+            "the error names the missing server: {err}"
+        );
+    }
+
+    #[test]
+    fn list_marks_builtin_overridden_when_same_name_enabled() {
+        let (_dir, path) = temp_cfg();
+        // A client-MCP server named "fileio", enabled for tui, shadows the
+        // built-in of the same name (external > built-in).
+        mcp_add_server(
+            &path,
+            "fileio",
+            "my-fileio",
+            &[],
+            None,
+            &["tui".to_string()],
+            true,
+            &mut Vec::new(),
+        )
+        .expect("add");
+
+        let builtins = [BuiltinInfo::new("fileio", 7), BuiltinInfo::new("terminal", 4)];
+        let listed = out_string(|o| mcp_list(&path, &builtins, "tui", o));
+
+        // The overriding built-in renders as overridden; the untouched one does not.
+        assert!(
+            listed.contains("fileio") && listed.contains("overridden"),
+            "an overridden built-in is marked overridden: {listed}"
+        );
+        // The built-in section shows tool counts.
+        assert!(
+            listed.contains('7') && listed.contains('4'),
+            "built-in tool counts are shown: {listed}"
+        );
+        // "terminal" is not overridden (no same-named client-MCP server).
+        let terminal_line = listed
+            .lines()
+            .find(|l| l.contains("terminal"))
+            .expect("terminal built-in listed");
+        assert!(
+            !terminal_line.contains("overridden"),
+            "a non-shadowed built-in is not marked overridden: {terminal_line}"
+        );
+    }
+
+    #[test]
+    fn enable_builtin_only_name_is_declined_not_errored() {
+        let (_dir, path) = temp_cfg();
+        let builtins = [BuiltinInfo::new("fileio", 7)];
+        // "fileio" exists only as a built-in (no client-MCP definition).
+        let msg = out_string(|o| mcp_set_enabled(&path, "fileio", "tui", true, &builtins, o));
+        assert!(
+            msg.contains("built-in") && msg.contains("not yet supported"),
+            "toggling a built-in-only name is declined with a clear message: {msg}"
+        );
+        // Nothing was written to the surface list.
+        assert!(
+            !ClientMcpConfig::load(&path)
+                .surface_enabled_names("tui")
+                .iter()
+                .any(|n| n == "fileio"),
+            "a declined built-in toggle does not mutate the config"
+        );
+    }
+
+    #[test]
+    fn enable_unknown_name_errors() {
+        let (_dir, path) = temp_cfg();
+        let err = mcp_set_enabled(&path, "ghost", "tui", true, &[], &mut Vec::new())
+            .expect_err("enabling an unknown, non-built-in name errors");
+        assert!(
+            err.to_string().contains("ghost"),
+            "the error names the unknown server: {err}"
+        );
+    }
+
+    #[test]
+    fn show_reports_added_server_and_path() {
+        let (_dir, path) = temp_cfg();
+        mcp_add_server(
+            &path,
+            "notes",
+            "notes-mcp",
+            &[],
+            None,
+            &["tui".to_string()],
+            true,
+            &mut Vec::new(),
+        )
+        .expect("add");
+
+        let shown = out_string(|o| config_show(&path, None, o));
+        assert!(shown.contains("notes"), "show renders the server: {shown}");
+        assert!(
+            shown.contains("client-mcp.toml"),
+            "show names the config path: {shown}"
+        );
+    }
+
+    #[test]
+    fn show_rejects_unknown_section() {
+        let (_dir, path) = temp_cfg();
+        let err = config_show(&path, Some("bogus"), &mut Vec::new())
+            .expect_err("an unknown --section is rejected");
+        assert!(
+            err.to_string().contains("bogus") || err.to_string().contains("mcp"),
+            "the error explains only mcp is supported: {err}"
+        );
+    }
+
+    #[test]
+    fn path_prints_config_location() {
+        let (_dir, path) = temp_cfg();
+        let printed = out_string(|o| config_path(&path, o));
+        assert!(
+            printed.contains("client-mcp.toml"),
+            "path prints the config location: {printed}"
+        );
+    }
+}

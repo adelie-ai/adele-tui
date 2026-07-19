@@ -30,6 +30,7 @@ dependencies = [
  "serde_json",
  "syntect",
  "tasks-mcp",
+ "tempfile",
  "terminal-mcp",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
