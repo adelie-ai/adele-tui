@@ -67,9 +67,29 @@ enum CliTransportMode {
     Dbus,
 }
 
+/// The `adele` command line: global connection/verbosity options (flattened,
+/// parsed at the top level so they apply to the interactive TUI and the `exec`
+/// one-shot alike) plus an optional subcommand.
+///
+/// No subcommand -> the interactive TUI (unchanged). `exec <PROMPT>` -> a
+/// one-shot headless turn (the preferred replacement for the deprecated
+/// `--prompt` flag). `config …` -> scriptable, daemon-free management of the
+/// shared client-MCP config, the non-interactive twin of the `F5` panel.
 #[derive(Debug, Parser)]
 #[command(name = "adele")]
 struct CliArgs {
+    #[command(flatten)]
+    global: Global,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Connection, credential, and verbosity options shared by the interactive and
+/// `exec` paths. Flattened into [`CliArgs`], so they are given before any
+/// subcommand (`adele --ws exec "hi"`) and read the same way whether or not a
+/// subcommand is present.
+#[derive(Debug, clap::Args)]
+struct Global {
     /// Transport used when neither --socket nor --ws is given. Defaults to
     /// the daemon's local Unix socket.
     #[arg(
@@ -99,10 +119,10 @@ struct CliArgs {
         default_value = DEFAULT_WS_SUBJECT
     )]
     ws_subject: String,
-    /// Send a single prompt non-interactively, print the reply to stdout, and
-    /// exit — no TUI. Client-hosted MCP tools (client-mcp.toml) still work, so
-    /// this can drive a local or remote (k8s) brain end to end.
-    #[arg(long, value_name = "TEXT")]
+    /// Deprecated: use the `exec <TEXT>` subcommand instead. Send a single
+    /// prompt non-interactively, print the reply to stdout, and exit — no TUI.
+    /// Kept as a hidden back-compat alias; `exec` is the preferred form.
+    #[arg(long, value_name = "TEXT", hide = true)]
     prompt: Option<String>,
     /// Bearer (JWT) for the WebSocket transport, skipping interactive login.
     #[arg(long = "ws-jwt", env = "DESKTOP_ASSISTANT_TUI_WS_JWT")]
@@ -115,16 +135,116 @@ struct CliArgs {
     #[arg(long = "ws-login-password", env = "DESKTOP_ASSISTANT_TUI_WS_PASSWORD")]
     ws_login_password: Option<String>,
     /// Enable verbose logging (`-v` info, `-vv` debug, `-vvv` trace). Logs go to
-    /// stderr so a headless `--prompt` run pipes cleanly to a file for scripting
+    /// stderr so a headless `exec` run pipes cleanly to a file for scripting
     /// and debugging. `RUST_LOG`, when set, overrides the level entirely.
     #[arg(short = 'v', long, action = clap::ArgAction::Count)]
     verbose: u8,
 }
 
-impl From<CliArgs> for ConnectionConfig {
-    fn from(cli: CliArgs) -> Self {
+/// Top-level subcommands. Absent -> the interactive TUI.
+#[derive(Debug, clap::Subcommand)]
+enum Command {
+    /// Send a single prompt non-interactively, print the reply, and exit — no
+    /// TUI. Client-hosted MCP tools (client-mcp.toml) still work, so this can
+    /// drive a local or remote (k8s) brain end to end. The preferred form of
+    /// the old `--prompt` flag.
+    #[command(alias = "prompt")]
+    Exec {
+        /// The prompt text to send.
+        prompt: String,
+    },
+    /// Scriptable, daemon-free management of the shared client-MCP config — the
+    /// non-interactive twin of the interactive `F5` panel.
+    Config(ConfigArgs),
+}
+
+/// `config` subcommand group.
+#[derive(Debug, clap::Args)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    command: ConfigCommand,
+}
+
+/// `config <…>` operations.
+#[derive(Debug, clap::Subcommand)]
+enum ConfigCommand {
+    /// Print the client-MCP config file location.
+    Path,
+    /// Print the effective config (currently the client-MCP config).
+    Show {
+        /// Restrict to a section. Only `mcp` is supported today (the default).
+        #[arg(long)]
+        section: Option<String>,
+    },
+    /// Manage client-hosted MCP servers.
+    Mcp(McpArgs),
+}
+
+/// `config mcp` subcommand group.
+#[derive(Debug, clap::Args)]
+struct McpArgs {
+    #[command(subcommand)]
+    command: McpCommand,
+}
+
+/// `config mcp <…>` operations. These act on the client-side `client-mcp.toml`
+/// only; daemon-hosted MCP servers are out of scope for this non-interactive
+/// surface (manage those from the interactive `F5` panel).
+#[derive(Debug, clap::Subcommand)]
+enum McpCommand {
+    /// List client-MCP servers (for the tui surface) and the compiled-in
+    /// built-ins, with status.
+    List,
+    /// Define (or replace) a stdio client-MCP server.
+    AddServer {
+        /// Server name (also the default tool-namespace prefix).
+        name: String,
+        /// Command to spawn (stdio transport).
+        #[arg(long)]
+        command: String,
+        /// A launch argument; repeat the flag for multiple. Hyphen-leading
+        /// values are accepted (e.g. `--arg --root=/data`), since MCP server
+        /// arguments commonly start with `--`.
+        #[arg(long = "arg", value_name = "A", allow_hyphen_values = true)]
+        arg: Vec<String>,
+        /// Optional tool-namespace prefix.
+        #[arg(long)]
+        namespace: Option<String>,
+        /// Surface(s) to enable it for when --enabled is given (default: tui).
+        /// Repeat the flag for multiple.
+        #[arg(long)]
+        surface: Vec<String>,
+        /// Also enable the server for the given surface(s) now.
+        #[arg(long)]
+        enabled: bool,
+    },
+    /// Remove a client-MCP server definition.
+    RemoveServer {
+        /// Server name.
+        name: String,
+    },
+    /// Enable a client-MCP server for a surface.
+    Enable {
+        /// Server name.
+        name: String,
+        /// Surface to enable it for.
+        #[arg(long, default_value = "tui")]
+        surface: String,
+    },
+    /// Disable a client-MCP server for a surface.
+    Disable {
+        /// Server name.
+        name: String,
+        /// Surface to disable it for.
+        #[arg(long, default_value = "tui")]
+        surface: String,
+    },
+}
+
+impl From<Global> for ConnectionConfig {
+    fn from(global: Global) -> Self {
         let ws_url = {
-            let trimmed = cli.ws_url.trim();
+            let trimmed = global.ws_url.trim();
             if trimmed.is_empty() {
                 DEFAULT_WS_URL.to_string()
             } else {
@@ -133,7 +253,7 @@ impl From<CliArgs> for ConnectionConfig {
         };
 
         let ws_subject = {
-            let trimmed = cli.ws_subject.trim();
+            let trimmed = global.ws_subject.trim();
             if trimmed.is_empty() {
                 DEFAULT_WS_SUBJECT.to_string()
             } else {
@@ -144,16 +264,16 @@ impl From<CliArgs> for ConnectionConfig {
         // `--socket` and `--ws` are explicit selectors that override the
         // (always-defaulted) `--transport`. clap makes them mutually
         // exclusive, so at most one is `Some` here.
-        let (transport_mode, socket_path, ws_url) = if let Some(path) = cli.socket {
+        let (transport_mode, socket_path, ws_url) = if let Some(path) = global.socket {
             (TransportMode::Uds, path, ws_url)
-        } else if let Some(url) = cli.ws {
+        } else if let Some(url) = global.ws {
             let resolved = match url {
                 Some(u) if !u.trim().is_empty() => u.trim().to_string(),
                 _ => ws_url,
             };
             (TransportMode::Ws, None, resolved)
         } else {
-            let mode = match cli.transport {
+            let mode = match global.transport {
                 CliTransportMode::Local => TransportMode::Uds,
                 CliTransportMode::Ws => TransportMode::Ws,
                 CliTransportMode::Dbus => TransportMode::Dbus,
@@ -164,9 +284,9 @@ impl From<CliArgs> for ConnectionConfig {
         Self {
             transport_mode,
             ws_url,
-            ws_jwt: cli.ws_jwt,
-            ws_login_username: cli.ws_login_username,
-            ws_login_password: cli.ws_login_password,
+            ws_jwt: global.ws_jwt,
+            ws_login_username: global.ws_login_username,
+            ws_login_password: global.ws_login_password,
             ws_subject,
             socket_path,
             // Local UDS authenticates by kernel peer-cred (desktop-assistant#407):
@@ -174,6 +294,77 @@ impl From<CliArgs> for ConnectionConfig {
             ..Default::default()
         }
     }
+}
+
+/// Dispatch a `config` subcommand: pure, daemon-free config management that
+/// loads/mutates/saves the shared `client-mcp.toml` and prints to stdout. Runs
+/// before any TUI/terminal or daemon connection setup. Built-in server info
+/// (name + advertised tool count) is resolved from the compiled-in set so
+/// `mcp list`/`enable`/`disable` can report built-ins without a daemon.
+fn run_config(command: &ConfigCommand) -> Result<()> {
+    use adele::config_cmd as cc;
+
+    let path = default_client_mcp_path();
+    let mut out = io::stdout().lock();
+    match command {
+        ConfigCommand::Path => cc::config_path(&path, &mut out),
+        ConfigCommand::Show { section } => cc::config_show(&path, section.as_deref(), &mut out),
+        ConfigCommand::Mcp(mcp) => run_config_mcp(&path, &mcp.command, &mut out),
+    }
+}
+
+/// Dispatch a `config mcp` subcommand against the client-MCP config at `path`.
+fn run_config_mcp(
+    path: &std::path::Path,
+    command: &McpCommand,
+    out: &mut impl std::io::Write,
+) -> Result<()> {
+    use adele::config_cmd as cc;
+
+    match command {
+        McpCommand::List => cc::mcp_list(path, &builtin_infos(), cc::DEFAULT_SURFACE, out),
+        McpCommand::AddServer {
+            name,
+            command,
+            arg,
+            namespace,
+            surface,
+            enabled,
+        } => {
+            let surfaces = if surface.is_empty() {
+                vec![cc::DEFAULT_SURFACE.to_string()]
+            } else {
+                surface.clone()
+            };
+            cc::mcp_add_server(
+                path,
+                name,
+                command,
+                arg,
+                namespace.as_deref(),
+                &surfaces,
+                *enabled,
+                out,
+            )
+        }
+        McpCommand::RemoveServer { name } => cc::mcp_remove_server(path, name, out),
+        McpCommand::Enable { name, surface } => {
+            cc::mcp_set_enabled(path, name, surface, true, &builtin_infos(), out)
+        }
+        McpCommand::Disable { name, surface } => {
+            cc::mcp_set_enabled(path, name, surface, false, &builtin_infos(), out)
+        }
+    }
+}
+
+/// Resolve the compiled-in built-in MCP servers to the `(name, tool_count)`
+/// pairs the `config mcp` handlers render — the same set the interactive client
+/// hosts in-process. Empty when built-ins are compiled out.
+fn builtin_infos() -> Vec<adele::config_cmd::BuiltinInfo> {
+    adele::builtins::builtin_servers()
+        .iter()
+        .map(|s| adele::config_cmd::BuiltinInfo::new(s.name.clone(), s.service.tools().len()))
+        .collect()
 }
 
 /// Best-effort terminal restoration (TUI-1): undo everything `main`'s setup
@@ -261,12 +452,24 @@ async fn main() -> Result<()> {
 
     // Install logging first so connection/registration/streaming diagnostics are
     // captured for the headless path too (verbose or RUST_LOG; silent otherwise).
-    init_logging(cli.verbose);
+    init_logging(cli.global.verbose);
 
-    // Headless one-shot: `--prompt "…"` connects, prints the reply, and exits
-    // without ever entering the TUI. Runs before any terminal setup.
-    if let Some(prompt) = cli.prompt.clone() {
-        let config: ConnectionConfig = cli.into();
+    // `config …`: pure, daemon-free config management. Dispatch and return
+    // before any terminal setup or daemon connection.
+    if let Some(Command::Config(cfg)) = &cli.command {
+        return run_config(&cfg.command);
+    }
+
+    // Headless one-shot: `exec <PROMPT>` (preferred) or the deprecated
+    // `--prompt` flag connects, prints the reply, and exits without ever
+    // entering the TUI. Runs before any terminal setup.
+    let exec_prompt = match &cli.command {
+        Some(Command::Exec { prompt }) => Some(prompt.clone()),
+        // `config` already returned above; only `None` remains here.
+        _ => cli.global.prompt.clone(),
+    };
+    if let Some(prompt) = exec_prompt {
+        let config: ConnectionConfig = cli.global.into();
         return run_headless(&config, prompt).await;
     }
 
@@ -294,7 +497,7 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, cli, cli_explicit).await;
+    let result = run_app(&mut terminal, cli.global, cli_explicit).await;
 
     // Restore terminal (same best-effort path the panic hook uses).
     restore_terminal();
@@ -463,17 +666,17 @@ enum RunOutcome {
 /// connection switch.
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    cli: CliArgs,
+    global: Global,
     cli_explicit: bool,
 ) -> Result<()> {
     // First connection: respect explicit CLI/env args; otherwise picker if
     // we have profiles, else fall back to CLI defaults.
     let mut config = if cli_explicit {
-        ConnectionConfig::from(cli)
+        ConnectionConfig::from(global)
     } else {
         let store = ProfileStore::load();
         if store.profiles.is_empty() {
-            ConnectionConfig::from(cli)
+            ConnectionConfig::from(global)
         } else {
             match picker::run(terminal, store).await?.0 {
                 PickerOutcome::Selected(profile) => profile.to_connection_config(),
@@ -2455,15 +2658,17 @@ mod tests {
         ]))
         .unwrap();
 
-        assert_eq!(parsed.transport, CliTransportMode::Dbus);
-        assert_eq!(parsed.ws_url, "wss://example/ws");
-        assert_eq!(parsed.ws_subject, "custom-client");
+        assert_eq!(parsed.global.transport, CliTransportMode::Dbus);
+        assert_eq!(parsed.global.ws_url, "wss://example/ws");
+        assert_eq!(parsed.global.ws_subject, "custom-client");
     }
 
     #[test]
     fn clap_default_with_no_flags_is_local_uds() {
         let cli = CliArgs::try_parse_from(args(&[])).unwrap();
-        let config = ConnectionConfig::from(cli);
+        // No subcommand => interactive TUI.
+        assert!(cli.command.is_none());
+        let config = ConnectionConfig::from(cli.global);
         // UDS is now the default connector.
         assert_eq!(config.transport_mode, TransportMode::Uds);
         assert_eq!(config.socket_path, None); // None => daemon default socket
@@ -2476,7 +2681,7 @@ mod tests {
     #[test]
     fn socket_flag_without_value_selects_uds_default_path() {
         let cli = CliArgs::try_parse_from(args(&["--socket"])).unwrap();
-        let config = ConnectionConfig::from(cli);
+        let config = ConnectionConfig::from(cli.global);
         assert_eq!(config.transport_mode, TransportMode::Uds);
         assert_eq!(config.socket_path, None);
     }
@@ -2484,7 +2689,7 @@ mod tests {
     #[test]
     fn socket_flag_with_path_sets_socket_path() {
         let cli = CliArgs::try_parse_from(args(&["--socket=/tmp/custom.sock"])).unwrap();
-        let config = ConnectionConfig::from(cli);
+        let config = ConnectionConfig::from(cli.global);
         assert_eq!(config.transport_mode, TransportMode::Uds);
         assert_eq!(config.socket_path, Some(PathBuf::from("/tmp/custom.sock")));
     }
@@ -2492,7 +2697,7 @@ mod tests {
     #[test]
     fn ws_flag_with_url_selects_websocket() {
         let cli = CliArgs::try_parse_from(args(&["--ws=wss://host/ws"])).unwrap();
-        let config = ConnectionConfig::from(cli);
+        let config = ConnectionConfig::from(cli.global);
         assert_eq!(config.transport_mode, TransportMode::Ws);
         assert_eq!(config.ws_url, "wss://host/ws");
         assert_eq!(config.socket_path, None);
@@ -2501,7 +2706,7 @@ mod tests {
     #[test]
     fn ws_flag_without_value_falls_back_to_default_ws_url() {
         let cli = CliArgs::try_parse_from(args(&["--ws"])).unwrap();
-        let config = ConnectionConfig::from(cli);
+        let config = ConnectionConfig::from(cli.global);
         assert_eq!(config.transport_mode, TransportMode::Ws);
         assert_eq!(config.ws_url, DEFAULT_WS_URL);
     }
@@ -2517,7 +2722,7 @@ mod tests {
     fn dbus_transport_still_selectable() {
         // No regression: --transport dbus continues to map to D-Bus.
         let cli = CliArgs::try_parse_from(args(&["--transport", "dbus"])).unwrap();
-        let config = ConnectionConfig::from(cli);
+        let config = ConnectionConfig::from(cli.global);
         assert_eq!(config.transport_mode, TransportMode::Dbus);
     }
 
@@ -2526,7 +2731,7 @@ mod tests {
         // No regression: the explicit ws transport + --ws-url path.
         let cli = CliArgs::try_parse_from(args(&["--transport", "ws", "--ws-url", "wss://h/ws"]))
             .unwrap();
-        let config = ConnectionConfig::from(cli);
+        let config = ConnectionConfig::from(cli.global);
         assert_eq!(config.transport_mode, TransportMode::Ws);
         assert_eq!(config.ws_url, "wss://h/ws");
     }
@@ -2538,6 +2743,145 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("ws"));
         assert!(rendered.contains("dbus"));
+    }
+
+    // --- Subcommand structure (adele-tui#122) ---
+
+    #[test]
+    fn bare_args_have_no_subcommand() {
+        // Back-compat: `adele` (with only global flags) still means the
+        // interactive TUI — no subcommand.
+        let cli = CliArgs::try_parse_from(args(&["--socket"])).unwrap();
+        assert!(cli.command.is_none(), "bare adele has no subcommand");
+    }
+
+    #[test]
+    fn exec_subcommand_parses_prompt() {
+        let cli = CliArgs::try_parse_from(args(&["exec", "hello there"])).unwrap();
+        match cli.command {
+            Some(Command::Exec { prompt }) => assert_eq!(prompt, "hello there"),
+            other => panic!("expected Exec, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_alias_maps_to_exec() {
+        // `prompt` is a subcommand alias of `exec`.
+        let cli = CliArgs::try_parse_from(args(&["prompt", "hi"])).unwrap();
+        assert!(matches!(cli.command, Some(Command::Exec { prompt }) if prompt == "hi"));
+    }
+
+    #[test]
+    fn legacy_prompt_flag_still_parses() {
+        // Back-compat: the deprecated `--prompt <TEXT>` global flag still parses
+        // (no subcommand) and carries the prompt for the headless path.
+        let cli = CliArgs::try_parse_from(args(&["--prompt", "legacy"])).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.global.prompt.as_deref(), Some("legacy"));
+    }
+
+    #[test]
+    fn exec_accepts_global_flags_before_it() {
+        // Globals are parsed at the top level, so they precede the subcommand.
+        let cli = CliArgs::try_parse_from(args(&["--ws=wss://h/ws", "exec", "hi"])).unwrap();
+        assert!(matches!(&cli.command, Some(Command::Exec { prompt }) if prompt == "hi"));
+        let config = ConnectionConfig::from(cli.global);
+        assert_eq!(config.transport_mode, TransportMode::Ws);
+    }
+
+    #[test]
+    fn config_mcp_list_parses() {
+        let cli = CliArgs::try_parse_from(args(&["config", "mcp", "list"])).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Config(ConfigArgs {
+                command: ConfigCommand::Mcp(McpArgs {
+                    command: McpCommand::List
+                })
+            }))
+        ));
+    }
+
+    #[test]
+    fn config_path_and_show_parse() {
+        let path = CliArgs::try_parse_from(args(&["config", "path"])).unwrap();
+        assert!(matches!(
+            path.command,
+            Some(Command::Config(ConfigArgs {
+                command: ConfigCommand::Path
+            }))
+        ));
+
+        let show = CliArgs::try_parse_from(args(&["config", "show", "--section", "mcp"])).unwrap();
+        match show.command {
+            Some(Command::Config(ConfigArgs {
+                command: ConfigCommand::Show { section },
+            })) => assert_eq!(section.as_deref(), Some("mcp")),
+            other => panic!("expected config show, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_mcp_add_server_parses_flags() {
+        let cli = CliArgs::try_parse_from(args(&[
+            "config",
+            "mcp",
+            "add-server",
+            "notes",
+            "--command",
+            "notes-mcp",
+            "--arg",
+            "serve",
+            "--arg",
+            "--root=/x",
+            "--namespace",
+            "nt",
+            "--surface",
+            "tui",
+            "--enabled",
+        ]))
+        .unwrap();
+        match cli.command {
+            Some(Command::Config(ConfigArgs {
+                command:
+                    ConfigCommand::Mcp(McpArgs {
+                        command:
+                            McpCommand::AddServer {
+                                name,
+                                command,
+                                arg,
+                                namespace,
+                                surface,
+                                enabled,
+                            },
+                    }),
+            })) => {
+                assert_eq!(name, "notes");
+                assert_eq!(command, "notes-mcp");
+                assert_eq!(arg, vec!["serve".to_string(), "--root=/x".to_string()]);
+                assert_eq!(namespace.as_deref(), Some("nt"));
+                assert_eq!(surface, vec!["tui".to_string()]);
+                assert!(enabled);
+            }
+            other => panic!("expected add-server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_mcp_enable_defaults_surface_to_tui() {
+        let cli = CliArgs::try_parse_from(args(&["config", "mcp", "enable", "notes"])).unwrap();
+        match cli.command {
+            Some(Command::Config(ConfigArgs {
+                command:
+                    ConfigCommand::Mcp(McpArgs {
+                        command: McpCommand::Enable { name, surface },
+                    }),
+            })) => {
+                assert_eq!(name, "notes");
+                assert_eq!(surface, "tui", "surface defaults to tui");
+            }
+            other => panic!("expected enable, got {other:?}"),
+        }
     }
 
     // --- Panic hook (TUI-1) ---

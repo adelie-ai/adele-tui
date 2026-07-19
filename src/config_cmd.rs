@@ -130,7 +130,10 @@ pub fn mcp_list(
 
     writeln!(out, "Client-hosted MCP servers (surface: {surface})")?;
     if defined.is_empty() {
-        writeln!(out, "  (none defined — add one with `config mcp add-server`)")?;
+        writeln!(
+            out,
+            "  (none defined — add one with `config mcp add-server`)"
+        )?;
     } else {
         writeln!(out, "  {:name_w$}  {:<9}  COMMAND", "NAME", "STATUS")?;
         for server in defined {
@@ -365,7 +368,9 @@ mod tests {
             "server is defined"
         );
         assert!(
-            !cfg.surface_enabled_names("tui").iter().any(|n| n == "notes"),
+            !cfg.surface_enabled_names("tui")
+                .iter()
+                .any(|n| n == "notes"),
             "without --enabled the server is not turned on for the surface"
         );
     }
@@ -432,7 +437,9 @@ mod tests {
             "the definition is gone after remove"
         );
         assert!(
-            !cfg.surface_enabled_names("tui").iter().any(|n| n == "notes"),
+            !cfg.surface_enabled_names("tui")
+                .iter()
+                .any(|n| n == "notes"),
             "remove prunes the surface enable entry too"
         );
     }
@@ -465,7 +472,10 @@ mod tests {
         )
         .expect("add");
 
-        let builtins = [BuiltinInfo::new("fileio", 7), BuiltinInfo::new("terminal", 4)];
+        let builtins = [
+            BuiltinInfo::new("fileio", 7),
+            BuiltinInfo::new("terminal", 4),
+        ];
         let listed = out_string(|o| mcp_list(&path, &builtins, "tui", o));
 
         // The overriding built-in renders as overridden; the untouched one does not.
