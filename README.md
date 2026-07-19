@@ -82,20 +82,60 @@ cargo install --path .   # installs `adele` to ~/.cargo/bin
 ## Run
 
 ```sh
-adele
+adele                       # interactive TUI (default)
+adele exec "summarize X"    # one-shot: send a prompt, print the reply, exit
+adele config mcp list       # scriptable config, no daemon needed
 ```
 
-### CLI options
+`adele` with no subcommand launches the interactive TUI (the global options
+below still apply). The subcommands are:
+
+### `exec <PROMPT>` (alias: `prompt`)
+
+Send a single prompt non-interactively, stream the reply to stdout, and exit —
+no TUI. Client-hosted MCP tools (`client-mcp.toml`) still work, so this can
+drive a local or remote (k8s) brain end to end. This replaces the old
+`--prompt <TEXT>` flag, which still works (hidden, deprecated) for back-compat.
+
+### `config` — scriptable config management
+
+The non-interactive twin of the `F5` MCP-servers panel. It loads, mutates, and
+saves the shared client-MCP config (`$XDG_CONFIG_HOME/adele/client-mcp.toml`)
+directly, with no daemon connection:
+
+```sh
+adele config path                     # print the config file location
+adele config show [--section mcp]     # print the effective config as TOML
+adele config mcp list                 # list client-MCP servers + built-ins
+adele config mcp add-server <NAME> --command <CMD> [--arg <A>]... \
+    [--namespace <NS>] [--surface <S>]... [--enabled]
+adele config mcp remove-server <NAME>
+adele config mcp enable  <NAME> [--surface tui]
+adele config mcp disable <NAME> [--surface tui]
+```
+
+`config mcp list` also shows the compiled-in **built-in** servers (with tool
+counts), marking any that a same-named, surface-enabled client-MCP server
+overrides. Built-in enable/disable is not yet supported from the CLI (it needs
+the panel's built-in toggle); that case is reported clearly rather than silently
+ignored. Daemon-hosted MCP servers are out of scope here — manage those from the
+interactive `F5` panel.
+
+### Global options
+
+Given before any subcommand (they apply to the TUI and `exec` alike):
 
 | Flag | Env var | Default | Description |
 |------|---------|---------|-------------|
-| `--transport` | `DESKTOP_ASSISTANT_TUI_TRANSPORT` | `ws` | Transport: `ws` or `dbus` |
-| `--ws-url` | `DESKTOP_ASSISTANT_TUI_WS_URL` | `ws://127.0.0.1:11339/ws` | WebSocket URL |
+| `--transport` | `DESKTOP_ASSISTANT_TUI_TRANSPORT` | `local` | Transport: `local` (UDS), `ws`, or `dbus` |
+| `--socket [PATH]` | | | Connect over the local Unix socket (optional path override) |
+| `--ws [URL]` | | | Connect over WebSocket (optional URL override) |
+| `--ws-url` | `DESKTOP_ASSISTANT_TUI_WS_URL` | `wss://127.0.0.1:11339/ws` | WebSocket URL |
 | `--ws-jwt` | `DESKTOP_ASSISTANT_TUI_WS_JWT` | | Direct JWT token |
-| `--ws-login-username` | `DESKTOP_ASSISTANT_TUI_WS_LOGIN_USERNAME` | | Login username |
-| `--ws-login-password` | `DESKTOP_ASSISTANT_TUI_WS_LOGIN_PASSWORD` | | Login password |
+| `--ws-login-username` | `DESKTOP_ASSISTANT_TUI_WS_USERNAME` | | Login username |
+| `--ws-login-password` | `DESKTOP_ASSISTANT_TUI_WS_PASSWORD` | | Login password |
 | `--ws-subject` | `DESKTOP_ASSISTANT_TUI_WS_SUBJECT` | `desktop-tui` | JWT subject |
-| `--dbus-service` | `DESKTOP_ASSISTANT_DBUS_SERVICE` | `org.desktopAssistant` | D-Bus service name |
+| `-v`, `--verbose` | | | Verbose logging to stderr (`-v`/`-vv`/`-vvv`) |
 
 ## Test
 

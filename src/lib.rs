@@ -8,6 +8,7 @@
 pub mod app;
 pub mod builtins;
 pub mod client_tools;
+pub mod config_cmd;
 pub mod connections;
 pub mod credentials;
 pub mod in_flight;

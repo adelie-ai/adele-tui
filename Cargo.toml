@@ -102,6 +102,11 @@ desktop-assistant-api-model = { path = "../desktop-assistant/crates/api-model" }
 mcp-core = { path = "../mcp-core" }
 
 
+[dev-dependencies]
+# Tempfile config paths for the `config_cmd` unit tests, so they mutate/save
+# `ClientMcpConfig` against a throwaway file instead of the user's real config.
+tempfile = "3"
+
 [features]
 # The core built-in MCP set is compiled in and hosted in-process by default, so
 # a fresh tui is useful with no client-mcp.toml (da#538 Phase C). Turn a server
