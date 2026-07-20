@@ -625,7 +625,9 @@ mod tests {
         let cfg = ClientMcpConfig::load(&path);
         // The server was disabled for the surface (server path)...
         assert!(
-            !cfg.surface_enabled_names("tui").iter().any(|n| n == "fileio"),
+            !cfg.surface_enabled_names("tui")
+                .iter()
+                .any(|n| n == "fileio"),
             "the defined server is the one toggled off"
         );
         // ...and the built-in disabled list was NOT touched.
