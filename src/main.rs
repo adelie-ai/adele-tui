@@ -520,20 +520,31 @@ async fn run_headless(config: &ConnectionConfig, prompt: String) -> Result<()> {
 
     // Start the client-side MCP host for the `tui` surface and advertise its
     // tools (merged with the built-ins) so a headless prompt can trigger local
-    // tools exactly like the interactive client.
-    let servers: Vec<_> = ClientMcpConfig::load(&default_client_mcp_path())
+    // tools exactly like the interactive client. Keep the loaded config in scope
+    // so its per-surface disabled-built-in list can be consulted below.
+    let mcp_cfg = ClientMcpConfig::load(&default_client_mcp_path());
+    let servers: Vec<_> = mcp_cfg
         .resolved_servers("tui")
         .into_iter()
         .cloned()
         .collect();
     // Compiled-in built-ins (da#538 Phase C/D): host the full core MCP set
-    // in-process. `McpHost::start_with` centralizes the override, skipping (and
-    // logging) any built-in whose name a client-mcp.toml server already provides.
+    // in-process. `McpHost::start_with_disabled` centralizes the override,
+    // skipping (and logging) any built-in whose name a client-mcp.toml server
+    // already provides, plus any the user disabled for the `tui` surface in
+    // client config (da#538 slice 4).
     let mcp_builtins = adele::builtins::builtin_servers();
     let host = if servers.is_empty() && mcp_builtins.is_empty() {
         None
     } else {
-        Some(McpHost::start_with(&servers, mcp_builtins).await)
+        Some(
+            McpHost::start_with_disabled(
+                &servers,
+                mcp_builtins,
+                mcp_cfg.surface_disabled_builtins("tui"),
+            )
+            .await,
+        )
     };
     let host_tools = host.as_ref().map(|h| h.registrations()).unwrap_or_default();
     let builtins = vec![
@@ -722,13 +733,20 @@ async fn run(
         .cloned()
         .collect();
     // Compiled-in built-ins (da#538 Phase C/D): host the full core MCP set
-    // in-process. `McpHost::start_with` centralizes the override, skipping (and
-    // logging) any built-in whose name a configured client-mcp server already
-    // provides, and reports each built-in's status for the F5 panel.
+    // in-process. `McpHost::start_with_disabled` centralizes the override,
+    // skipping (and logging) any built-in whose name a configured client-mcp
+    // server already provides, plus any the user turned off for the `tui` surface
+    // in client config (da#538 slice 4); it reports each built-in's status
+    // (including `disabled_by_config`) for the F5 panel.
     let mcp_builtins = adele::builtins::builtin_servers();
     if !mcp_servers.is_empty() || !mcp_builtins.is_empty() {
         app.mcp_host = Some(Rc::new(
-            McpHost::start_with(&mcp_servers, mcp_builtins).await,
+            McpHost::start_with_disabled(
+                &mcp_servers,
+                mcp_builtins,
+                mcp_cfg.surface_disabled_builtins("tui"),
+            )
+            .await,
         ));
     }
 
