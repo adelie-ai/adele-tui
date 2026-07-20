@@ -76,13 +76,14 @@ pub fn builtin_servers() -> Vec<BuiltinServer> {
     // The opt-in "broad set" extras (da#538), each off unless its `mcp-*` feature
     // (or the `builtin-extras` umbrella) is enabled. All five have infallible
     // `build_service()` constructors, so they always register when compiled in.
-    // Each uses its own canonical short name for both `name` and `namespace`
-    // (matching the server's documented client-mcp config key) so an in-process
-    // built-in and the standalone binary share one namespace and override cleanly.
+    // Each uses its fleet-canonical name for both `name` and `namespace` (the
+    // `name` from the daemon's `deploy/mcp/mcp_servers.default.toml`, e.g.
+    // `weather-forecast`), so an in-process built-in, the standalone binary, and a
+    // same-named external override all share one namespace and interchange cleanly.
     #[cfg(feature = "mcp-weather")]
     out.push(BuiltinServer::new(
-        "weather",
-        "weather",
+        "weather-forecast",
+        "weather-forecast",
         Arc::new(weather_forecast_mcp::build_service()),
     ));
     #[cfg(feature = "mcp-internet-radio")]
@@ -173,7 +174,7 @@ mod tests {
     fn builtin_extras_present_and_namespaced_in_full_set() {
         let servers = builtin_servers();
         for name in [
-            "weather",
+            "weather-forecast",
             "internet-radio",
             "openstreetmap",
             "geocode",
