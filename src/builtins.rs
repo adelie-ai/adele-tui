@@ -107,6 +107,40 @@ mod tests {
         );
     }
 
+    /// With the opt-in "broad set" extras compiled in (the `builtin-extras`
+    /// umbrella), the full built-in set additionally contains each of the five
+    /// broad-set servers, every one advertised under its own canonical
+    /// namespace so an in-process server is indistinguishable from the
+    /// standalone binary (da#538). Gated on all five `mcp-*` extras features, so
+    /// it exercises only the extras build and leaves the default (core-only)
+    /// build's expectations untouched.
+    #[cfg(all(
+        feature = "mcp-weather",
+        feature = "mcp-internet-radio",
+        feature = "mcp-openstreetmap",
+        feature = "mcp-geocode",
+        feature = "mcp-skills"
+    ))]
+    #[test]
+    fn builtin_extras_present_and_namespaced_in_full_set() {
+        let servers = builtin_servers();
+        for name in [
+            "weather",
+            "internet-radio",
+            "openstreetmap",
+            "geocode",
+            "skills",
+        ] {
+            let server = servers.iter().find(|s| s.name == name).unwrap_or_else(|| {
+                panic!("broad-set built-in {name:?} must be present under the extras build")
+            });
+            assert_eq!(
+                server.namespace, name,
+                "broad-set built-in {name:?} must be advertised under the {name:?} namespace"
+            );
+        }
+    }
+
     /// The panel mapping: a host [`BuiltinStatus`] list becomes [`BuiltinServerDto`]s
     /// that `server_rows_with_builtins` turns into an active built-in row (no
     /// disabled reason) and an overridden one (a disabled row whose reason names the
