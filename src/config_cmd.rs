@@ -99,8 +99,9 @@ pub fn config_show(path: &Path, section: Option<&str>, out: &mut impl Write) -> 
 
 /// `config mcp list`: list the client-MCP servers for `surface` (with their
 /// command + whether they're enabled for that surface), then the compiled-in
-/// built-ins (with tool counts, marking any overridden by a same-named,
-/// surface-enabled client-MCP server).
+/// built-ins (with tool counts). A built-in is marked `disabled (config)` when
+/// it is explicitly turned off for the surface, else `overridden ...` when a
+/// same-named, surface-enabled client-MCP server shadows it, else `active`.
 pub fn mcp_list(
     path: &Path,
     builtins: &[BuiltinInfo],
@@ -118,6 +119,10 @@ pub fn mcp_list(
         .iter()
         .map(|s| s.name.as_str())
         .collect();
+    // Built-ins the user explicitly turned off for this surface (da#538 slice 4).
+    // A config-disable is the explicit off-switch, so it takes display precedence
+    // over an override — mirroring `server_rows_with_builtins`.
+    let disabled_builtins = cfg.surface_disabled_builtins(surface);
 
     // Column width for the name column, sized to the longest name shown.
     let name_w = defined
@@ -160,7 +165,9 @@ pub fn mcp_list(
     } else {
         writeln!(out, "  {:name_w$}  {:<5}  STATUS", "NAME", "TOOLS")?;
         for builtin in builtins {
-            let status = if overriding.iter().any(|n| *n == builtin.name) {
+            let status = if disabled_builtins.iter().any(|n| n == &builtin.name) {
+                "disabled (config)".to_string()
+            } else if overriding.iter().any(|n| *n == builtin.name) {
                 format!("overridden by client-MCP '{}'", builtin.name)
             } else {
                 "active".to_string()
@@ -249,10 +256,18 @@ pub fn mcp_remove_server(path: &Path, name: &str, out: &mut impl Write) -> Resul
     Ok(())
 }
 
-/// `config mcp enable`/`disable`: flip a client-MCP server's membership in one
-/// surface's enable list. A name that matches only a built-in is reported as
-/// not-yet-supported (a normal informational outcome, not an error); a name that
-/// matches neither is an error.
+/// `config mcp enable`/`disable`: turn a server or built-in on/off for one
+/// surface.
+///
+/// Precedence mirrors the interactive host: a name that matches a **defined**
+/// client-MCP server toggles that server's per-surface enable list, even if a
+/// built-in of the same name also exists (the server shadows the built-in). A
+/// name that matches only a **built-in** toggles that built-in's per-surface
+/// `disabled_builtins` list (`on = false` disables it, `on = true` re-enables
+/// it) — da#538 slice 4. A name that matches neither is an error.
+///
+/// A built-in toggled here takes effect on the next client launch (the running
+/// in-process host is not restarted), matching the F5 panel's behavior.
 pub fn mcp_set_enabled(
     path: &Path,
     name: &str,
@@ -273,13 +288,15 @@ pub fn mcp_set_enabled(
             if on { "Enabled" } else { "Disabled" }
         )?;
     } else if builtins.iter().any(|b| b.name == name) {
-        // A name that matches only a built-in: toggling built-ins needs the
-        // built-in disabled-state (da#538 slice 4), which doesn't exist yet.
-        // Report it as a normal informational decline, not an error, and make no
-        // change rather than writing a dangling surface entry.
+        // A name that matches only a built-in: record its per-surface off state.
+        // `on = false` disables (adds to `disabled_builtins`); `on = true`
+        // re-enables (removes it). Both are idempotent and per-surface.
+        cfg.set_builtin_disabled(surface, name, !on);
+        cfg.save(path).map_err(|e| anyhow!(e))?;
         writeln!(
             out,
-            "'{name}' is a built-in (in-process) server; enabling/disabling built-ins is not yet supported (coming with the panel toggle). No change made."
+            "{} built-in '{name}' for surface '{surface}' (applies on next launch).",
+            if on { "Enabled" } else { "Disabled" }
         )?;
     } else {
         bail!("no such client-MCP server: '{name}'");
@@ -506,8 +523,9 @@ mod tests {
         // "fileio" exists only as a built-in (no client-MCP definition). `on =
         // false` disables it, so it is added to the surface's disabled_builtins.
         let msg = out_string(|o| mcp_set_enabled(&path, "fileio", "tui", false, &builtins, o));
+        let lower = msg.to_lowercase();
         assert!(
-            msg.contains("fileio") && msg.contains("disabled") && msg.contains("tui"),
+            lower.contains("fileio") && lower.contains("disabled") && lower.contains("tui"),
             "disabling a built-in confirms name + state + surface: {msg}"
         );
         assert_eq!(
@@ -529,8 +547,9 @@ mod tests {
         );
 
         let msg = out_string(|o| mcp_set_enabled(&path, "web", "tui", true, &builtins, o));
+        let lower = msg.to_lowercase();
         assert!(
-            msg.contains("web") && msg.contains("enabled"),
+            lower.contains("web") && lower.contains("enabled"),
             "re-enabling a built-in confirms it: {msg}"
         );
         assert!(
