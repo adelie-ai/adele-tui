@@ -1,7 +1,12 @@
 //! Compiled-in ("built-in") MCP servers hosted in-process (da#538 Phase C/D).
 //!
 //! The core set (fileio/terminal/tasks/web) is compiled in and hosted by
-//! default so a fresh tui is useful with no `client-mcp.toml`. An external
+//! default so a fresh tui is useful with no `client-mcp.toml`. A second,
+//! opt-in "broad set" (weather/internet-radio/openstreetmap/geocode/skills) is
+//! **off by default**: each links in only under its own `mcp-*` feature or the
+//! `builtin-extras` umbrella, so the stock build links only the core four and
+//! behaves exactly as before. (A future mac client is expected to turn
+//! `builtin-extras` on in its own default.) An external
 //! client-mcp server of the SAME NAME overrides (suppresses) the built-in
 //! (external > built-in); that override decision now lives centrally in
 //! [`McpHost::start_with`], which skips + logs a shadowed built-in and reports
@@ -17,7 +22,12 @@ use desktop_assistant_client_common::mcp_host::{BuiltinServer, BuiltinStatus};
     feature = "mcp-fileio",
     feature = "mcp-terminal",
     feature = "mcp-tasks",
-    feature = "mcp-web"
+    feature = "mcp-web",
+    feature = "mcp-weather",
+    feature = "mcp-internet-radio",
+    feature = "mcp-openstreetmap",
+    feature = "mcp-geocode",
+    feature = "mcp-skills"
 ))]
 use std::sync::Arc;
 
@@ -29,10 +39,11 @@ use std::sync::Arc;
 ///
 /// Each `#[cfg]` block compiles in only when its `mcp-*` feature is on, so a
 /// `--no-default-features` build hosts nothing and the tui behaves as it did
-/// before Phase C. The infallible constructors (fileio, web) are always
-/// registered; the fallible ones (terminal, tasks) are logged and skipped if
-/// their zero-config constructor fails, so a broken environment degrades to the
-/// remaining tools rather than losing the whole set.
+/// before Phase C. The infallible constructors (fileio, web, and all five
+/// opt-in broad-set extras) are always registered; the fallible core ones
+/// (terminal, tasks) are logged and skipped if their zero-config constructor
+/// fails, so a broken environment degrades to the remaining tools rather than
+/// losing the whole set.
 ///
 /// [`McpHost::start_with`]: desktop_assistant_client_common::mcp_host::McpHost::start_with
 pub fn builtin_servers() -> Vec<BuiltinServer> {
@@ -60,6 +71,44 @@ pub fn builtin_servers() -> Vec<BuiltinServer> {
         "web",
         "web",
         Arc::new(web_mcp::build_service()),
+    ));
+
+    // The opt-in "broad set" extras (da#538), each off unless its `mcp-*` feature
+    // (or the `builtin-extras` umbrella) is enabled. All five have infallible
+    // `build_service()` constructors, so they always register when compiled in.
+    // Each uses its fleet-canonical name for both `name` and `namespace` (the
+    // `name` from the daemon's `deploy/mcp/mcp_servers.default.toml`, e.g.
+    // `weather-forecast`), so an in-process built-in, the standalone binary, and a
+    // same-named external override all share one namespace and interchange cleanly.
+    #[cfg(feature = "mcp-weather")]
+    out.push(BuiltinServer::new(
+        "weather-forecast",
+        "weather-forecast",
+        Arc::new(weather_forecast_mcp::build_service()),
+    ));
+    #[cfg(feature = "mcp-internet-radio")]
+    out.push(BuiltinServer::new(
+        "internet-radio",
+        "internet-radio",
+        Arc::new(internet_radio_mcp::build_service()),
+    ));
+    #[cfg(feature = "mcp-openstreetmap")]
+    out.push(BuiltinServer::new(
+        "openstreetmap",
+        "openstreetmap",
+        Arc::new(openstreetmap_mcp::build_service()),
+    ));
+    #[cfg(feature = "mcp-geocode")]
+    out.push(BuiltinServer::new(
+        "geocode",
+        "geocode",
+        Arc::new(geocode_mcp::build_service()),
+    ));
+    #[cfg(feature = "mcp-skills")]
+    out.push(BuiltinServer::new(
+        "skills",
+        "skills",
+        Arc::new(skills_mcp::build_service()),
     ));
 
     out
@@ -105,6 +154,40 @@ mod tests {
             fileio.namespace, "fileio",
             "fileio built-in must be advertised under the 'fileio' namespace"
         );
+    }
+
+    /// With the opt-in "broad set" extras compiled in (the `builtin-extras`
+    /// umbrella), the full built-in set additionally contains each of the five
+    /// broad-set servers, every one advertised under its own canonical
+    /// namespace so an in-process server is indistinguishable from the
+    /// standalone binary (da#538). Gated on all five `mcp-*` extras features, so
+    /// it exercises only the extras build and leaves the default (core-only)
+    /// build's expectations untouched.
+    #[cfg(all(
+        feature = "mcp-weather",
+        feature = "mcp-internet-radio",
+        feature = "mcp-openstreetmap",
+        feature = "mcp-geocode",
+        feature = "mcp-skills"
+    ))]
+    #[test]
+    fn builtin_extras_present_and_namespaced_in_full_set() {
+        let servers = builtin_servers();
+        for name in [
+            "weather-forecast",
+            "internet-radio",
+            "openstreetmap",
+            "geocode",
+            "skills",
+        ] {
+            let server = servers.iter().find(|s| s.name == name).unwrap_or_else(|| {
+                panic!("broad-set built-in {name:?} must be present under the extras build")
+            });
+            assert_eq!(
+                server.namespace, name,
+                "broad-set built-in {name:?} must be advertised under the {name:?} namespace"
+            );
+        }
     }
 
     /// The panel mapping: a host [`BuiltinStatus`] list becomes [`BuiltinServerDto`]s

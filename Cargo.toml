@@ -56,6 +56,18 @@ terminal-mcp = { path = "../terminal-mcp", optional = true }
 tasks-mcp = { path = "../tasks-mcp", optional = true }
 web-mcp = { path = "../web-mcp", optional = true }
 
+# The "broad set" of built-in MCP servers (the "mac broad set", da#538). These
+# are default-OFF opt-in extras: the default tui links only the core four above,
+# and these five link in only when their `mcp-*` feature (or the `builtin-extras`
+# umbrella) is enabled. All five expose an infallible `build_service()`. A future
+# mac client copies the `builtin-extras` feature block and turns it on by default.
+# Same sibling path-dep + `mcp-core` URL-patch treatment as the core four.
+weather-forecast-mcp = { path = "../weather-forecast-mcp", optional = true }
+internet-radio-mcp = { path = "../internet-radio-mcp", optional = true }
+openstreetmap-mcp = { path = "../openstreetmap-mcp", optional = true }
+geocode-mcp = { path = "../geocode-mcp", optional = true }
+skills-mcp = { path = "../skills-mcp", optional = true }
+
 # Embeddable voice module (adelie-ai/voice phase 1) for in-app dictation +
 # reply playback with no voice daemon — see adele-tui#67 / voice#34. Path-dep
 # of the sibling `voice` checkout, mirroring how we path-dep desktop-assistant
@@ -119,6 +131,24 @@ mcp-fileio = ["dep:fileio-mcp"]
 mcp-terminal = ["dep:terminal-mcp"]
 mcp-tasks = ["dep:tasks-mcp"]
 mcp-web = ["dep:web-mcp"]
+
+# The "broad set" opt-in extras (da#538), OFF by default. Enable an individual
+# server with e.g. `--features mcp-weather`, or all five with the `builtin-extras`
+# umbrella. Deliberately NOT part of `default`/`builtin-core`, so the stock tui
+# build is byte-for-byte the same as before and links none of these crates. A
+# future mac client is expected to add `builtin-extras` to its own default.
+builtin-extras = [
+    "mcp-weather",
+    "mcp-internet-radio",
+    "mcp-openstreetmap",
+    "mcp-geocode",
+    "mcp-skills",
+]
+mcp-weather = ["dep:weather-forecast-mcp"]
+mcp-internet-radio = ["dep:internet-radio-mcp"]
+mcp-openstreetmap = ["dep:openstreetmap-mcp"]
+mcp-geocode = ["dep:geocode-mcp"]
+mcp-skills = ["dep:skills-mcp"]
 
 [lints.rust]
 warnings = "deny"
