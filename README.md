@@ -21,7 +21,8 @@ chat, tool calls, and background tasks.
   each purpose (chat, background, vector).
 - **MCP servers admin panel** (`F5`) — list, enable/disable, add, edit, and
   remove the daemon's Model Context Protocol servers (local stdio or remote
-  HTTP, with bearer-token or OAuth service-account auth).
+  HTTP, with bearer-token or OAuth service-account auth), and enable/disable the
+  client's compiled-in **built-in** servers (per-surface; applies on restart).
 - **OAuth2 + PKCE** authentication flow and credentials stored in the system
   keyring (libsecret / kwallet via the OS).
 - **Knowledge base browser/editor** for the daemon's built-in KB.
@@ -115,11 +116,34 @@ adele config mcp disable <NAME> [--surface tui]
 ```
 
 `config mcp list` also shows the compiled-in **built-in** servers (with tool
-counts), marking any that a same-named, surface-enabled client-MCP server
-overrides. Built-in enable/disable is not yet supported from the CLI (it needs
-the panel's built-in toggle); that case is reported clearly rather than silently
-ignored. Daemon-hosted MCP servers are out of scope here — manage those from the
-interactive `F5` panel.
+counts) and their status: `disabled (config)` when you turned the built-in off
+for the surface, `overridden by client-MCP '<name>'` when a same-named,
+surface-enabled client-MCP server shadows it, else `active`.
+
+**Enabling/disabling a built-in** is per-surface (the TUI uses the `tui`
+surface):
+
+```sh
+adele config mcp disable web            # turn the built-in `web` off for tui
+adele config mcp enable  web            # turn it back on
+adele config mcp disable web --surface gtk   # another surface, independently
+```
+
+`disable` adds the built-in to that surface's `disabled_builtins` list; `enable`
+removes it. The change is written to `client-mcp.toml` and takes effect on the
+**next client launch** (the running in-process host is not restarted). A name
+that is *both* a defined client-MCP server and a built-in resolves to the
+server (the server shadows the built-in), so `enable`/`disable` toggles the
+server, not the built-in.
+
+You can do the same from the interactive **`F5` panel**: the cursor moves over
+the built-in rows too, and `Space`/`t` toggles the selected built-in. The panel
+writes the same per-surface config and shows a green "(applies on restart)"
+note; a disabled built-in renders dimmed with its reason. Edit/remove/sign-in in
+the panel remain daemon-server operations.
+
+Daemon-hosted MCP servers are out of scope for the `config` CLI — manage those
+from the interactive `F5` panel.
 
 ### Global options
 

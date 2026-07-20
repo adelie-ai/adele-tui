@@ -32,13 +32,14 @@
 //! Keys
 //! ----
 //!
-//! List mode:
+//! List mode (the cursor spans the daemon servers then the built-ins):
 //! - `j`/`k` or arrows: navigate
-//! - `Enter` / `e`: edit selected
+//! - `Enter` / `e`: edit selected (daemon servers only)
 //! - `a`: add new
-//! - `Space` / `t`: enable/disable selected
+//! - `Space` / `t`: enable/disable selected — a daemon server via the daemon; a
+//!   built-in via this client's config (`disabled_builtins`), applied on restart
 //! - `c`: show the sign-in command for a server that needs OAuth sign-in
-//! - `d`: remove selected (with confirm)
+//! - `d`: remove selected (with confirm; daemon servers only)
 //! - `r`: refresh from daemon
 //! - `Esc` / `q`: close
 //!
@@ -55,12 +56,14 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::path::PathBuf;
 
 use client_ui_common::{BuiltinServerDto, ServerRow, kind_label, server_rows_with_builtins};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use desktop_assistant_api_model::{
     Command, CommandResult, McpServerView, Secret, ServiceAccountView,
 };
+use desktop_assistant_client_common::mcp_host::{ClientMcpConfig, default_client_mcp_path};
 use desktop_assistant_client_common::{SignalEvent, TransportClient};
 use ratatui::{
     Frame, Terminal,
@@ -540,6 +543,49 @@ fn wrap_index(i: i32, len: usize) -> usize {
     (((i % len) + len) % len) as usize
 }
 
+/// The client surface this panel manages. The TUI hosts its client-MCP servers
+/// and built-ins under `"tui"`, so a built-in toggled here is written to that
+/// surface's `disabled_builtins` list (da#538 slice 4).
+const SURFACE: &str = "tui";
+
+/// What the list cursor currently points at. The panel's selectable rows are the
+/// daemon-managed servers followed by the in-process built-ins, so one flat
+/// cursor (`State::selected`) spans both sections; this names which side (and
+/// index) a given cursor position resolves to. Built-in rows were read-only
+/// before slice 4 — making them selectable is what enables the in-panel toggle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sel {
+    /// The daemon server at this index into `State::servers`.
+    Daemon(usize),
+    /// The built-in at this index into `State::builtin_dtos`.
+    Builtin(usize),
+}
+
+/// The selectable targets in display order: every daemon server, then every
+/// built-in. Pure over the two counts so the cursor mapping is unit-testable
+/// without a terminal.
+fn selectable(servers: usize, builtins: usize) -> Vec<Sel> {
+    (0..servers)
+        .map(Sel::Daemon)
+        .chain((0..builtins).map(Sel::Builtin))
+        .collect()
+}
+
+/// The flat [`ListItem`] index a selectable target renders at, so the list
+/// highlight lands on the right row. The item layout is: the daemon rows (or a
+/// single placeholder item when there are none), then — when any built-ins are
+/// shown — one separator header, then the built-in rows. Kept pure (over the
+/// daemon-server count) so the highlight math is unit-testable.
+fn highlight_index(servers_len: usize, sel: Sel) -> usize {
+    // An empty daemon list still occupies one item (the "(no MCP servers)" hint).
+    let daemon_items = servers_len.max(1);
+    match sel {
+        Sel::Daemon(i) => i,
+        // +1 for the "── Built-in (in-process) ──" separator header.
+        Sel::Builtin(i) => daemon_items + 1 + i,
+    }
+}
+
 // ===========================================================================
 // TUI screen (mirrors `crate::connections`)
 // ===========================================================================
@@ -769,22 +815,38 @@ enum RpcOutcome {
 
 struct State {
     servers: Vec<McpServerView>,
-    /// Built-in (in-process) MCP servers, resolved once at open from the client's
-    /// `McpHost::builtin_status()` (da#538 Phase D). Rendered as a read-only
-    /// section below the daemon servers: they are hosted inside this client, not
-    /// managed by the daemon, so they are informational and not selectable /
-    /// editable. An overridden built-in carries a `disabled_reason` and renders
-    /// disabled. Empty when built-ins are compiled out or no host is running.
-    builtins: Vec<ServerRow>,
+    /// Built-in (in-process) MCP servers, resolved at open from the client's
+    /// `McpHost::builtin_status()` (da#538 Phase D) and kept as the source of
+    /// truth so an in-panel toggle can flip a built-in's `disabled_by_config`
+    /// and re-derive its row (slice 4). Rendered as a section below the daemon
+    /// servers; an overridden or config-disabled built-in renders disabled.
+    /// Empty when built-ins are compiled out or no host is running.
+    builtin_dtos: Vec<BuiltinServerDto>,
     /// OAuth service accounts (for the editor picker). Best-effort — a failure
     /// to list them leaves the picker empty rather than blocking the panel.
     accounts: Vec<ServiceAccountView>,
+    /// Flat cursor over the selectable rows ([`selectable`]): daemon servers
+    /// first, then built-ins.
     selected: usize,
     mode: Mode,
     form: FormState,
     error: Option<String>,
     busy: Option<String>,
+    /// A transient success/info line (e.g. after a built-in toggle), shown in the
+    /// status area when nothing is busy or errored.
+    notice: Option<String>,
+    /// The client-MCP config file a built-in toggle persists to. Injected so the
+    /// toggle path is testable against a tempfile.
+    config_path: PathBuf,
     closing: bool,
+}
+
+/// The selectable target the flat cursor currently points at, if any. `None`
+/// when there is nothing selectable (no daemon servers and no built-ins).
+fn current_sel(state: &State) -> Option<Sel> {
+    selectable(state.servers.len(), state.builtin_dtos.len())
+        .get(state.selected)
+        .copied()
 }
 
 /// The MCP-servers manager as a [`Screen`]: its [`State`] plus the borrowed
@@ -850,13 +912,15 @@ pub async fn run(
     let mut screen = McpScreen {
         state: State {
             servers: Vec::new(),
-            builtins: server_rows_with_builtins(&[], &[], builtins),
+            builtin_dtos: builtins.to_vec(),
             accounts: Vec::new(),
             selected: 0,
             mode: Mode::List,
             form: FormState::blank(),
             error: None,
             busy: Some("Loading MCP servers...".into()),
+            notice: None,
+            config_path: default_client_mcp_path(),
             closing: false,
         },
         client,
@@ -880,23 +944,33 @@ fn handle_list_key<'a>(
         (KeyCode::Esc | KeyCode::Char('q'), m) if m.is_empty() => state.closing = true,
         (KeyCode::Char('j') | KeyCode::Down, m) if m.is_empty() => advance_selection(state, 1),
         (KeyCode::Char('k') | KeyCode::Up, m) if m.is_empty() => advance_selection(state, -1),
+        // Edit is a daemon-server operation; built-ins aren't daemon-managed.
         (KeyCode::Enter | KeyCode::Char('e'), m) if m.is_empty() => {
-            if let Some(view) = state.servers.get(state.selected).cloned() {
+            if let Some(Sel::Daemon(i)) = current_sel(state)
+                && let Some(view) = state.servers.get(i).cloned()
+            {
+                state.notice = None;
                 state.form = FormState::from_pure(McpForm::from_view(&view));
                 state.error = None;
                 state.mode = Mode::Edit;
             }
         }
         (KeyCode::Char('a'), m) if m.is_empty() => {
+            state.notice = None;
             state.form = FormState::blank();
             state.error = None;
             state.mode = Mode::Edit;
         }
+        // Space/t toggles whatever is selected: a daemon server via the daemon,
+        // a built-in via the client's own config (slice 4).
         (KeyCode::Char(' ') | KeyCode::Char('t'), m) if m.is_empty() => {
-            do_toggle(state, pending, client)
+            toggle_selected(state, pending, client)
         }
         (KeyCode::Char('c'), m) if m.is_empty() => show_signin(state),
-        (KeyCode::Char('d'), m) if m.is_empty() && state.servers.get(state.selected).is_some() => {
+        // Remove is a daemon-server operation only.
+        (KeyCode::Char('d'), m)
+            if m.is_empty() && matches!(current_sel(state), Some(Sel::Daemon(_))) =>
+        {
             state.mode = Mode::RemoveConfirm;
         }
         (KeyCode::Char('r'), m) if m.is_empty() => refresh_all(state, pending, client),
@@ -998,8 +1072,12 @@ fn handle_remove_key<'a>(
 
 /// Show the OAuth sign-in command for the selected server (honest degradation):
 /// the TUI can't spawn the daemon-host browser, so it prints the command to run.
+/// Sign-in is a daemon-server concept; a selected built-in has none.
 fn show_signin(state: &mut State) {
-    let Some(server) = state.servers.get(state.selected) else {
+    let Some(Sel::Daemon(i)) = current_sel(state) else {
+        return;
+    };
+    let Some(server) = state.servers.get(i) else {
         return;
     };
     if server.configure_command.is_empty() {
@@ -1010,8 +1088,9 @@ fn show_signin(state: &mut State) {
     state.mode = Mode::SignInInfo;
 }
 
+/// Move the flat cursor across the combined daemon + built-in row list, wrapping.
 fn advance_selection(state: &mut State, delta: i32) {
-    let len = state.servers.len();
+    let len = state.servers.len() + state.builtin_dtos.len();
     if len == 0 {
         return;
     }
@@ -1083,16 +1162,32 @@ fn save_edit<'a>(
     });
 }
 
-fn do_toggle<'a>(
+/// Toggle whatever the cursor is on: a daemon server flips via the daemon
+/// (`SetMcpServerEnabled`), a built-in flips its per-surface config off-switch.
+fn toggle_selected<'a>(
     state: &mut State,
     pending: &mut InFlight<'a, RpcOutcome>,
     client: &'a TransportClient,
 ) {
-    let Some(server) = state.servers.get(state.selected) else {
+    match current_sel(state) {
+        Some(Sel::Daemon(i)) => do_toggle(state, pending, client, i),
+        Some(Sel::Builtin(i)) => toggle_builtin(state, i),
+        None => {}
+    }
+}
+
+fn do_toggle<'a>(
+    state: &mut State,
+    pending: &mut InFlight<'a, RpcOutcome>,
+    client: &'a TransportClient,
+    index: usize,
+) {
+    let Some(server) = state.servers.get(index) else {
         return;
     };
     let name = server.name.clone();
     let enabled = server.enabled;
+    state.notice = None;
     state.busy = Some(
         if enabled {
             "Disabling..."
@@ -1117,12 +1212,49 @@ fn do_toggle<'a>(
     });
 }
 
+/// Toggle a built-in's per-surface off state (da#538 slice 4). Unlike a daemon
+/// server this is a client-side config write, not an RPC: load the shared
+/// client-MCP config, flip `disabled_builtins` for `SURFACE`, persist, and flip
+/// the DTO so the row re-derives (disabled <-> active) on the next draw. The
+/// running in-process host is not restarted, so the change takes effect on the
+/// next client launch — surfaced in the confirmation note. Loading fresh (rather
+/// than trusting an in-memory copy) means a concurrent CLI edit isn't clobbered.
+fn toggle_builtin(state: &mut State, index: usize) {
+    let Some(dto) = state.builtin_dtos.get(index) else {
+        return;
+    };
+    let name = dto.name.clone();
+    let new_disabled = !dto.disabled_by_config;
+
+    let mut cfg = ClientMcpConfig::load(&state.config_path);
+    cfg.set_builtin_disabled(SURFACE, &name, new_disabled);
+    match cfg.save(&state.config_path) {
+        Ok(()) => {
+            state.builtin_dtos[index].disabled_by_config = new_disabled;
+            state.error = None;
+            state.busy = None;
+            state.notice = Some(format!(
+                "Built-in '{name}' {} for '{SURFACE}' (applies on restart)",
+                if new_disabled { "disabled" } else { "enabled" }
+            ));
+        }
+        Err(e) => {
+            state.notice = None;
+            state.error = Some(format!("Failed to save config: {e}"));
+        }
+    }
+}
+
 fn do_remove<'a>(
     state: &mut State,
     pending: &mut InFlight<'a, RpcOutcome>,
     client: &'a TransportClient,
 ) {
-    let Some(server) = state.servers.get(state.selected) else {
+    let server = match current_sel(state) {
+        Some(Sel::Daemon(i)) => state.servers.get(i),
+        _ => None,
+    };
+    let Some(server) = server else {
         state.mode = Mode::List;
         return;
     };
@@ -1151,8 +1283,11 @@ fn apply_outcome<'a>(
             match servers {
                 Ok(list) => {
                     state.servers = list;
-                    if state.selected >= state.servers.len() {
-                        state.selected = state.servers.len().saturating_sub(1);
+                    // Clamp the flat cursor to the combined daemon + built-in row
+                    // count so a shrunk server list can't strand it out of range.
+                    let selectable_len = state.servers.len() + state.builtin_dtos.len();
+                    if state.selected >= selectable_len {
+                        state.selected = selectable_len.saturating_sub(1);
                     }
                     state.error = None;
                 }
@@ -1261,17 +1396,19 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
         state.servers.iter().map(server_item).collect()
     };
 
-    // Built-in (in-process) servers render below the daemon list as a read-only
-    // section: they are hosted inside this client, so they are informational and
-    // never selectable / editable (selection stays bounded to `state.servers`).
-    if !state.builtins.is_empty() {
+    // Built-in (in-process) servers render below the daemon list, derived from
+    // the DTO source of truth so a toggle re-derives the row (active <-> disabled)
+    // on the next draw. They are selectable (for the built-in toggle) but not
+    // daemon-editable — edit/remove/sign-in stay daemon-only (slice 4).
+    let builtin_rows = server_rows_with_builtins(&[], &[], &state.builtin_dtos);
+    if !builtin_rows.is_empty() {
         items.push(ListItem::new(Line::from(Span::styled(
             "── Built-in (in-process) ──",
             Style::default()
                 .fg(theme().text_dim)
                 .add_modifier(Modifier::DIM),
         ))));
-        items.extend(state.builtins.iter().map(builtin_item));
+        items.extend(builtin_rows.iter().map(builtin_item));
     }
 
     let title = if state.servers.is_empty() {
@@ -1301,8 +1438,8 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
         .highlight_symbol("▸ ");
 
     let mut list_state = ListState::default();
-    if !state.servers.is_empty() {
-        list_state.select(Some(state.selected));
+    if let Some(sel) = current_sel(state) {
+        list_state.select(Some(highlight_index(state.servers.len(), sel)));
     }
     f.render_stateful_widget(list, area, &mut list_state);
 }
@@ -1676,11 +1813,12 @@ fn draw_account_line(f: &mut Frame, area: Rect, state: &State, focused: bool) {
 }
 
 fn draw_remove_overlay(f: &mut Frame, state: &State, area: Rect) {
-    let label = state
-        .servers
-        .get(state.selected)
-        .map(|s| sanitize(&s.name))
-        .unwrap_or_else(|| "this server".to_string());
+    let label = match current_sel(state) {
+        Some(Sel::Daemon(i)) => state.servers.get(i),
+        _ => None,
+    }
+    .map(|s| sanitize(&s.name))
+    .unwrap_or_else(|| "this server".to_string());
     let popup = centered_rect(64, 6, area);
     f.render_widget(Clear, popup);
     let block = Block::default()
@@ -1711,7 +1849,11 @@ fn draw_remove_overlay(f: &mut Frame, state: &State, area: Rect) {
 /// The read-only OAuth sign-in overlay: prints the exact command to run on the
 /// daemon host (honest degradation — the TUI can't spawn a remote browser).
 fn draw_signin_overlay(f: &mut Frame, state: &State, area: Rect) {
-    let Some(server) = state.servers.get(state.selected) else {
+    let server = match current_sel(state) {
+        Some(Sel::Daemon(i)) => state.servers.get(i),
+        _ => None,
+    };
+    let Some(server) = server else {
         return;
     };
     let command = server
@@ -1782,6 +1924,15 @@ fn draw_status(f: &mut Frame, state: &State, area: Rect) {
         // is sanitized like every other daemon string on the draw path.
         f.render_widget(
             Paragraph::new(Span::styled(format!(" • {}", sanitize(err)), style)),
+            area,
+        );
+    } else if let Some(notice) = &state.notice {
+        // A transient success/info line (e.g. a built-in toggle's "applies on
+        // restart" confirmation). Sanitized: it interpolates a config-sourced
+        // built-in name.
+        let style = Style::default().fg(theme().ok);
+        f.render_widget(
+            Paragraph::new(Span::styled(format!(" ✓ {}", sanitize(notice)), style)),
             area,
         );
     }
@@ -2331,14 +2482,34 @@ mod tests {
     fn state_with(servers: Vec<McpServerView>, accounts: Vec<ServiceAccountView>) -> State {
         State {
             servers,
-            builtins: Vec::new(),
+            builtin_dtos: Vec::new(),
             accounts,
             selected: 0,
             mode: Mode::List,
             form: FormState::blank(),
             error: None,
             busy: None,
+            notice: None,
+            config_path: PathBuf::from("/nonexistent/client-mcp.toml"),
             closing: false,
+        }
+    }
+
+    /// A [`BuiltinServerDto`] for the panel's built-in section. `overridden` names
+    /// an external server that shadows it (else active); `disabled_by_config`
+    /// marks it explicitly turned off in this client's config.
+    fn builtin_dto(
+        name: &str,
+        tool_count: u32,
+        overridden: Option<&str>,
+        disabled_by_config: bool,
+    ) -> BuiltinServerDto {
+        BuiltinServerDto {
+            name: name.into(),
+            namespace: name.into(),
+            tool_count,
+            overridden_by: overridden.map(Into::into),
+            disabled_by_config,
         }
     }
 
@@ -2413,9 +2584,9 @@ mod tests {
     #[test]
     fn draw_list_renders_builtin_section_with_override_reason() {
         let mut state = state_with(Vec::new(), Vec::new());
-        state.builtins = vec![
-            builtin_row("fileio", 7, None),
-            builtin_row("web", 3, Some("overridden by the external \"web\"")),
+        state.builtin_dtos = vec![
+            builtin_dto("fileio", 7, None, false),
+            builtin_dto("web", 3, Some("web"), false),
         ];
         let text = rendered(&state, 120, 20);
         assert!(
@@ -2430,6 +2601,154 @@ mod tests {
         assert!(
             text.contains("overridden"),
             "override reason missing: {text}"
+        );
+    }
+
+    #[test]
+    fn draw_list_renders_config_disabled_builtin_dimmed_with_reason() {
+        // A built-in turned off in this client's config renders in the built-in
+        // section as a disabled row whose reason names the config off-switch
+        // (da#538 slice 4) — the F5 panel's display path for a disabled built-in.
+        let mut state = state_with(Vec::new(), Vec::new());
+        state.builtin_dtos = vec![builtin_dto("web", 3, None, true)];
+        let text = rendered(&state, 120, 20);
+        assert!(text.contains("web"), "config-disabled built-in row missing");
+        assert!(
+            text.contains("config"),
+            "config-disable reason missing: {text}"
+        );
+    }
+
+    // --- selection model spanning daemon + built-in rows (slice 4) -----------
+
+    #[test]
+    fn selectable_lists_daemon_then_builtins() {
+        assert_eq!(
+            selectable(2, 3),
+            vec![
+                Sel::Daemon(0),
+                Sel::Daemon(1),
+                Sel::Builtin(0),
+                Sel::Builtin(1),
+                Sel::Builtin(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn selectable_empty_when_no_rows() {
+        assert!(selectable(0, 0).is_empty());
+    }
+
+    #[test]
+    fn highlight_index_daemon_is_the_row_index() {
+        assert_eq!(highlight_index(3, Sel::Daemon(0)), 0);
+        assert_eq!(highlight_index(3, Sel::Daemon(2)), 2);
+    }
+
+    #[test]
+    fn highlight_index_builtin_skips_the_separator_header() {
+        // 3 daemon rows, then a separator, then built-ins: first built-in is #4.
+        assert_eq!(highlight_index(3, Sel::Builtin(0)), 4);
+        assert_eq!(highlight_index(3, Sel::Builtin(2)), 6);
+        // No daemon servers: the "(no MCP servers)" placeholder holds slot 0 and
+        // the separator slot 1, so the first built-in is #2.
+        assert_eq!(highlight_index(0, Sel::Builtin(0)), 2);
+    }
+
+    #[test]
+    fn current_sel_spans_daemon_then_builtins() {
+        let mut state = state_with(vec![view_named("alpha")], Vec::new());
+        state.builtin_dtos = vec![
+            builtin_dto("fileio", 7, None, false),
+            builtin_dto("web", 3, None, false),
+        ];
+        state.selected = 0;
+        assert_eq!(current_sel(&state), Some(Sel::Daemon(0)));
+        state.selected = 1;
+        assert_eq!(current_sel(&state), Some(Sel::Builtin(0)));
+        state.selected = 2;
+        assert_eq!(current_sel(&state), Some(Sel::Builtin(1)));
+        // Past the end resolves to nothing rather than panicking.
+        state.selected = 3;
+        assert_eq!(current_sel(&state), None);
+    }
+
+    #[test]
+    fn advance_selection_wraps_across_both_sections() {
+        let mut state = state_with(vec![view_named("alpha")], Vec::new());
+        state.builtin_dtos = vec![builtin_dto("web", 3, None, false)];
+        // Two selectable rows: daemon "alpha" then built-in "web".
+        assert_eq!(state.selected, 0);
+        advance_selection(&mut state, 1);
+        assert_eq!(current_sel(&state), Some(Sel::Builtin(0)));
+        advance_selection(&mut state, 1);
+        assert_eq!(
+            current_sel(&state),
+            Some(Sel::Daemon(0)),
+            "wraps back to top"
+        );
+        advance_selection(&mut state, -1);
+        assert_eq!(current_sel(&state), Some(Sel::Builtin(0)), "wraps backward");
+    }
+
+    // --- interactive built-in toggle persists to client config (slice 4) -----
+
+    #[test]
+    fn toggle_builtin_disables_persisting_and_flips_dto() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("client-mcp.toml");
+        let mut state = state_with(Vec::new(), Vec::new());
+        state.config_path = path.clone();
+        state.builtin_dtos = vec![builtin_dto("web", 3, None, false)];
+
+        toggle_builtin(&mut state, 0);
+
+        // Persisted to the tui surface's disabled_builtins.
+        assert_eq!(
+            ClientMcpConfig::load(&path).surface_disabled_builtins("tui"),
+            &["web"],
+            "toggle writes the built-in to the surface disabled list"
+        );
+        // The in-memory DTO flipped so the row re-derives disabled.
+        assert!(state.builtin_dtos[0].disabled_by_config);
+        // The confirmation note names the built-in and the restart caveat.
+        let notice = state.notice.as_deref().expect("a toggle sets a notice");
+        assert!(
+            notice.contains("web") && notice.contains("disabled") && notice.contains("restart"),
+            "notice explains the toggle + restart caveat: {notice}"
+        );
+        assert!(state.error.is_none(), "a successful toggle sets no error");
+    }
+
+    #[test]
+    fn toggle_builtin_reenable_removes_from_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("client-mcp.toml");
+        let mut state = state_with(Vec::new(), Vec::new());
+        state.config_path = path.clone();
+        // Start disabled, then toggle back on.
+        state.builtin_dtos = vec![builtin_dto("web", 3, None, true)];
+        // Seed the config so the re-enable has something to remove.
+        {
+            let mut cfg = ClientMcpConfig::load(&path);
+            cfg.set_builtin_disabled("tui", "web", true);
+            cfg.save(&path).expect("seed save");
+        }
+
+        toggle_builtin(&mut state, 0);
+
+        assert!(
+            ClientMcpConfig::load(&path)
+                .surface_disabled_builtins("tui")
+                .is_empty(),
+            "re-enabling removes the built-in from the disabled list"
+        );
+        assert!(!state.builtin_dtos[0].disabled_by_config);
+        let notice = state.notice.as_deref().expect("notice set");
+        assert!(
+            notice.contains("enabled"),
+            "notice reports re-enable: {notice}"
         );
     }
 
