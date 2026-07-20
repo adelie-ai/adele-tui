@@ -68,8 +68,9 @@ pub fn builtin_servers() -> Vec<BuiltinServer> {
 /// Map the host's per-built-in [`BuiltinStatus`] into the view-model
 /// [`BuiltinServerDto`]s the shared MCP-servers panel renders via
 /// `client_ui_common::server_rows_with_builtins`. The `usize` `tool_count`
-/// widens to the DTO's `u32`; `overridden_by` carries straight through so an
-/// overridden built-in renders as a disabled row.
+/// widens to the DTO's `u32`; `overridden_by` and `disabled_by_config` carry
+/// straight through so a built-in that is overridden or explicitly turned off in
+/// this client's config renders as a disabled row (da#538 slice 4).
 pub fn builtin_dtos(status: Vec<BuiltinStatus>) -> Vec<BuiltinServerDto> {
     status
         .into_iter()
@@ -78,6 +79,7 @@ pub fn builtin_dtos(status: Vec<BuiltinStatus>) -> Vec<BuiltinServerDto> {
             namespace: s.namespace,
             tool_count: s.tool_count as u32,
             overridden_by: s.overridden_by,
+            disabled_by_config: s.disabled_by_config,
         })
         .collect()
 }
@@ -117,12 +119,14 @@ mod tests {
                 namespace: "fileio".into(),
                 tool_count: 7,
                 overridden_by: None,
+                disabled_by_config: false,
             },
             BuiltinStatus {
                 name: "web".into(),
                 namespace: "web".into(),
                 tool_count: 3,
                 overridden_by: Some("web".into()),
+                disabled_by_config: false,
             },
         ];
 
@@ -168,6 +172,41 @@ mod tests {
         assert!(
             reason.contains("web"),
             "reason names the overriding server: {reason}"
+        );
+    }
+
+    /// A built-in explicitly turned off in this client's config maps to a DTO
+    /// carrying `disabled_by_config`, which `server_rows_with_builtins` renders
+    /// as a disabled row whose reason names the config off-switch (and takes
+    /// precedence over any override reason). This is the F5 panel's display path
+    /// for a config-disabled built-in (da#538 slice 4).
+    #[test]
+    fn config_disabled_builtin_maps_to_disabled_row() {
+        let status = vec![BuiltinStatus {
+            name: "web".into(),
+            namespace: "web".into(),
+            tool_count: 3,
+            // Both flags set at once: config-disable must win the display.
+            overridden_by: Some("web".into()),
+            disabled_by_config: true,
+        }];
+
+        let dtos = builtin_dtos(status);
+        assert!(
+            dtos[0].disabled_by_config,
+            "the config-disabled flag carries into the DTO"
+        );
+
+        let rows = server_rows_with_builtins(&[], &[], &dtos);
+        let web = rows.iter().find(|r| r.name == "web").expect("web row");
+        assert_eq!(web.kind, ServerKind::BuiltIn);
+        let reason = web
+            .disabled_reason
+            .as_deref()
+            .expect("a config-disabled built-in renders disabled with a reason");
+        assert!(
+            reason.contains("config"),
+            "the config-disable reason wins the display: {reason}"
         );
     }
 }
