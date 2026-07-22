@@ -55,18 +55,25 @@ use crate::theme::theme;
 pub enum ConnectorKind {
     Anthropic,
     OpenAi,
+    OpenRouter,
     Bedrock,
     Ollama,
 }
 
 impl ConnectorKind {
-    const ALL: &'static [ConnectorKind] =
-        &[Self::Anthropic, Self::OpenAi, Self::Bedrock, Self::Ollama];
+    const ALL: &'static [ConnectorKind] = &[
+        Self::Anthropic,
+        Self::OpenAi,
+        Self::OpenRouter,
+        Self::Bedrock,
+        Self::Ollama,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Anthropic => "Anthropic",
             Self::OpenAi => "OpenAI",
+            Self::OpenRouter => "OpenRouter",
             Self::Bedrock => "Bedrock",
             Self::Ollama => "Ollama",
         }
@@ -77,6 +84,7 @@ impl ConnectorKind {
         match self {
             Self::Anthropic => "anthropic",
             Self::OpenAi => "openai",
+            Self::OpenRouter => "openrouter",
             Self::Bedrock => "bedrock",
             Self::Ollama => "ollama",
         }
@@ -159,7 +167,7 @@ impl EditForm {
 
     fn fields_for_kind(kind: ConnectorKind) -> &'static [Field] {
         match kind {
-            ConnectorKind::Anthropic | ConnectorKind::OpenAi => {
+            ConnectorKind::Anthropic | ConnectorKind::OpenAi | ConnectorKind::OpenRouter => {
                 &[Field::Id, Field::Type, Field::ApiKeyEnv, Field::BaseUrl]
             }
             ConnectorKind::Bedrock => &[
@@ -210,6 +218,13 @@ impl EditForm {
                 max_context_tokens: None,
             },
             ConnectorKind::OpenAi => ConnectionConfigView::OpenAi {
+                base_url: opt(&self.base_url),
+                api_key_env: opt(&self.api_key_env),
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
+            },
+            ConnectorKind::OpenRouter => ConnectionConfigView::OpenRouter {
                 base_url: opt(&self.base_url),
                 api_key_env: opt(&self.api_key_env),
                 connect_timeout_secs: None,
@@ -1003,8 +1018,11 @@ mod tests {
     #[test]
     fn connector_kind_next_prev_cycle() {
         assert_eq!(ConnectorKind::Anthropic.next(), ConnectorKind::OpenAi);
+        assert_eq!(ConnectorKind::OpenAi.next(), ConnectorKind::OpenRouter);
+        assert_eq!(ConnectorKind::OpenRouter.next(), ConnectorKind::Bedrock);
         assert_eq!(ConnectorKind::Ollama.next(), ConnectorKind::Anthropic);
         assert_eq!(ConnectorKind::Anthropic.prev(), ConnectorKind::Ollama);
+        assert_eq!(ConnectorKind::OpenRouter.prev(), ConnectorKind::OpenAi);
     }
 
     #[test]
@@ -1021,6 +1039,11 @@ mod tests {
         let anthropic_fields = EditForm::fields_for_kind(ConnectorKind::Anthropic);
         assert!(anthropic_fields.contains(&Field::ApiKeyEnv));
         assert!(!anthropic_fields.contains(&Field::Region));
+
+        let openrouter_fields = EditForm::fields_for_kind(ConnectorKind::OpenRouter);
+        assert!(openrouter_fields.contains(&Field::ApiKeyEnv));
+        assert!(openrouter_fields.contains(&Field::BaseUrl));
+        assert!(!openrouter_fields.contains(&Field::Region));
     }
 
     #[test]
@@ -1058,6 +1081,28 @@ mod tests {
                 assert!(base_url.is_none());
             }
             other => panic!("expected Anthropic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submit_openrouter_emits_correct_variant() {
+        let mut form = EditForm::empty();
+        form.id.insert_str("router");
+        form.api_key_env.insert_str("OPENROUTER_API_KEY");
+        form.base_url.insert_str("https://openrouter.ai/api/v1");
+        form.kind = ConnectorKind::OpenRouter;
+        let (id, config) = form.submit().unwrap();
+        assert_eq!(id, "router");
+        match config {
+            ConnectionConfigView::OpenRouter {
+                api_key_env,
+                base_url,
+                ..
+            } => {
+                assert_eq!(api_key_env.as_deref(), Some("OPENROUTER_API_KEY"));
+                assert_eq!(base_url.as_deref(), Some("https://openrouter.ai/api/v1"));
+            }
+            other => panic!("expected OpenRouter, got {other:?}"),
         }
     }
 
