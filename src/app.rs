@@ -1927,6 +1927,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn in_view_stream_complete_flush_preserves_a_fresh_composer_draft() {
+        // AC9: a reply completing while the conversation is in view flushes the
+        // queued backlog as ONE combined send, but a fresh, not-yet-Entered draft
+        // the user has since typed into the live composer must survive untouched.
+        // The flush drains only the committed queue; it must never emit a
+        // `SetComposerText("")` that clears the in-progress composer.
+        let mut app = app_streaming_on_c1();
+        submit(&mut app, "q1"); // queued while busy; composer clears
+        app.set_composer("half-typed"); // user starts a fresh draft mid-stream
+
+        let effects = app.apply_core(UiMessage::StreamComplete {
+            request_id: "srv-1".into(),
+            full_response: "reply".into(),
+        });
+
+        assert_eq!(
+            sent_prompt(&effects).as_deref(),
+            Some("q1"),
+            "the in-view completion flushes the queued backlog as a send"
+        );
+        assert_eq!(
+            app.textarea_content(),
+            "half-typed",
+            "the fresh composer draft must survive the flush, not be cleared"
+        );
+    }
+
+    #[test]
+    fn stream_complete_while_editing_a_recalled_message_defers_the_flush() {
+        // AC8: if a reply completes while the user has a queued message checked
+        // out for editing, the flush is DEFERRED — flushing the partial queue now
+        // would send a stale burst and orphan the checked-out edit. No send fires;
+        // the edit and the remaining queue stay intact until the user finishes (or
+        // cancels) the edit.
+        let mut app = app_streaming_on_c1();
+        submit(&mut app, "a");
+        submit(&mut app, "b");
+        app.recall_prev_queued(); // check out "b" (index 1) into the composer
+        assert_eq!(app.editing_queued_index(), Some(1));
+        assert_eq!(app.textarea_content(), "b");
+        assert_eq!(app.queued_messages_for_view(), &["a".to_string()]);
+
+        let effects = app.apply_core(UiMessage::StreamComplete {
+            request_id: "srv-1".into(),
+            full_response: "reply".into(),
+        });
+
+        assert!(
+            sent_prompt(&effects).is_none(),
+            "the flush must be deferred while a queued item is checked out: {effects:?}"
+        );
+        assert_eq!(
+            app.editing_queued_index(),
+            Some(1),
+            "the checked-out edit is preserved across the deferred flush"
+        );
+        assert_eq!(
+            app.queued_messages_for_view(),
+            &["a".to_string()],
+            "the remaining queue stays intact — nothing sent, nothing orphaned"
+        );
+    }
+
     // --- Bracketed paste (TUI-3) ---
 
     #[test]
