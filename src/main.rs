@@ -38,7 +38,7 @@ use tokio::{
 // plumbing types) lives in this file.
 use adele::app::{AdeleOutput, App, InputMode, ScreenRequest};
 use adele::in_flight::InFlight;
-use adele::keys::{Action, handle_key_event};
+use adele::keys::{Action, editing_recall_action, handle_key_event};
 use adele::picker::PickerOutcome;
 use adele::profile::ProfileStore;
 use adele::settings::{Settings, default_settings_path};
@@ -1143,7 +1143,23 @@ async fn run(
                         }
                         continue;
                     }
-                    if let Some(action) = handle_key_event(key, &app.mode, app.tasks.visible) {
+                    // Queued-message recall (feat/queue-messages): an unmodified
+                    // Up/Down in edit mode walks the queue only when the composer
+                    // is empty (so it doesn't fight caret movement) and a queue
+                    // exists; otherwise fall through to the normal keymap, which
+                    // forwards a bare arrow to the textarea.
+                    let recall = if matches!(app.mode, InputMode::Editing) {
+                        editing_recall_action(
+                            key,
+                            app.textarea_content().is_empty(),
+                            !app.queued_messages_for_view().is_empty(),
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(action) =
+                        recall.or_else(|| handle_key_event(key, &app.mode, app.tasks.visible))
+                    {
                         if action == Action::Dictate {
                             // Push-to-talk (adele-tui#77). Prefer the voice
                             // daemon's dictation when it is running: it captures,
@@ -1260,10 +1276,11 @@ async fn run(
                         // exists daemon-side) and reselect it by ID — the
                         // sidebar selection is positional and the refreshed
                         // list may have reordered.
+                        let mut resync_flush: Vec<Effect> = Vec::new();
                         if let Some(open_id) = app.current_conversation().map(|c| c.id.clone()) {
                             app.select_conversation_by_id(&open_id);
                             match conn.client().get_conversation(&open_id).await {
-                                Ok(detail) => app.load_conversation(detail),
+                                Ok(detail) => resync_flush = app.load_conversation(detail),
                                 Err(e) => {
                                     app.status_message =
                                         format!("Error refreshing conversation: {e}");
@@ -1273,6 +1290,17 @@ async fn run(
                         finish_connection_init(&mut app, &conn).await;
                         reconnect = ReconnectState::Connected;
                         connector = Some(Rc::new(conn));
+                        // The connector is live again: flush any backlog the user
+                        // queued before the gap (a no-op unless idle with a queue).
+                        run_controller_effects(
+                            &mut app,
+                            &connector,
+                            resync_flush,
+                            &voice_daemon,
+                            &voice_session,
+                            &narration_tx,
+                        )
+                        .await;
                     }
                     Err(e) => {
                         reconnect = schedule_reconnect(prev_delay);
@@ -1335,11 +1363,23 @@ async fn run(
                 // daemon's live turn-event fan-out at the now-open conversation
                 // (#1 multi-client sync) so turns started elsewhere — another
                 // client, or the voice daemon — render live here.
-                if apply_rpc_outcome(&mut app, outcome)
+                let applied = apply_rpc_outcome(&mut app, outcome);
+                if applied.conversation_changed
                     && let Some(conn) = connector.as_ref()
                 {
                     subscribe_to_open_conversation(&mut app, conn).await;
                 }
+                // Run any switch-back queue flush the open surfaced. Subscribing
+                // first (above) means the flushed turn's live events route here.
+                run_controller_effects(
+                    &mut app,
+                    &connector,
+                    applied.effects,
+                    &voice_daemon,
+                    &voice_session,
+                    &narration_tx,
+                )
+                .await;
             }
         }
     }
@@ -1403,27 +1443,57 @@ enum RpcOutcome {
     TaskCancelFailed { task_id: String, error: String },
 }
 
+/// The result of applying an [`RpcOutcome`] to `App`: whether the open
+/// conversation changed (so the caller re-subscribes the live fan-out) and any
+/// controller-level effects the reducer bubbled up for the loop to run — today
+/// the switch-back queue flush's [`Effect::SendPrompt`], which needs the connector
+/// + narration handles this transport-free function deliberately does not hold.
+struct RpcApplied {
+    conversation_changed: bool,
+    effects: Vec<Effect>,
+}
+
+impl RpcApplied {
+    /// No conversation change and nothing to run — the common path.
+    fn inert() -> Self {
+        Self {
+            conversation_changed: false,
+            effects: Vec::new(),
+        }
+    }
+
+    /// A switch/open succeeded: re-subscribe, and run `effects` (a switch-back
+    /// flush's send, if any).
+    fn switched(effects: Vec<Effect>) -> Self {
+        Self {
+            conversation_changed: true,
+            effects,
+        }
+    }
+}
+
 /// Apply a completed [`RpcOutcome`] to `App` (TUI-5 / #83). This is the only
 /// place RPC results touch `App`; it runs on the event loop after the RPC has
 /// resolved off it.
 ///
-/// Returns `true` when the open conversation changed (an open/create succeeded),
-/// so the caller can (re)send `SubscribeConversations` for the now-open
-/// conversation (#1 live multi-client sync) — this function stays transport-free,
-/// so the actual command send happens on the event loop where the connector
-/// lives.
-fn apply_rpc_outcome(app: &mut App, outcome: RpcOutcome) -> bool {
+/// Returns an [`RpcApplied`]: `conversation_changed` is `true` when the open
+/// conversation changed (an open/create succeeded), so the caller can (re)send
+/// `SubscribeConversations` for the now-open conversation (#1 live multi-client
+/// sync); `effects` carries any switch-back queue flush to run. This function
+/// stays transport-free, so both the subscribe and the flush send happen on the
+/// event loop where the connector lives.
+fn apply_rpc_outcome(app: &mut App, outcome: RpcOutcome) -> RpcApplied {
     match outcome {
         RpcOutcome::ConversationOpened {
             result,
             enter_editing,
         } => match result {
             Ok(detail) => {
-                app.load_conversation(detail);
+                let flush = app.load_conversation(detail);
                 if enter_editing {
                     app.enter_editing_mode();
                 }
-                return true;
+                return RpcApplied::switched(flush);
             }
             Err(e) => app.status_message = format!("Error: {e}"),
         },
@@ -1436,7 +1506,7 @@ fn apply_rpc_outcome(app: &mut App, outcome: RpcOutcome) -> bool {
                 Ok(id) => id,
                 Err(e) => {
                     app.status_message = format!("Create error: {e}");
-                    return false;
+                    return RpcApplied::inert();
                 }
             };
             match list {
@@ -1452,9 +1522,11 @@ fn apply_rpc_outcome(app: &mut App, outcome: RpcOutcome) -> bool {
             }
             match detail {
                 Some(Ok(detail)) => {
-                    app.load_conversation(detail);
+                    // A freshly-created conversation has no backlog, so the flush
+                    // is empty; run it uniformly anyway.
+                    let flush = app.load_conversation(detail);
                     app.enter_editing_mode();
-                    return true;
+                    return RpcApplied::switched(flush);
                 }
                 Some(Err(e)) => app.status_message = format!("Error opening: {e}"),
                 None => {}
@@ -1508,7 +1580,7 @@ fn apply_rpc_outcome(app: &mut App, outcome: RpcOutcome) -> bool {
         }
     }
     // No open-conversation change on any path that reached here.
-    false
+    RpcApplied::inert()
 }
 
 /// What [`handle_signal`] asks its caller to do after handling a signal. Almost
@@ -1533,27 +1605,52 @@ enum SignalAction {
     RefreshConversations,
 }
 
-/// Run the controller-level effects [`App::apply_core`] bubbled up from a
-/// streaming signal — the ones the view can't perform itself. Today the streaming
-/// arms bubble up only [`Effect::Speak`] (reply narration, already gated by
-/// core's `StreamComplete`); the view-level effects (including the side-pane
-/// no-ops) were already absorbed inside `apply_core`. Later CC-3 slices route the
-/// open-conversation RPC effects and handle them here.
-fn run_stream_controller_effects(
+/// Run the controller-level effects [`App::apply_core`] bubbled up from a signal
+/// — the ones the view can't perform itself. Two kinds reach here:
+///
+/// - [`Effect::Speak`] — reply narration, already gated by core's `StreamComplete`
+///   (reaching it means the gate passed; an empty reply is skipped so we don't
+///   enqueue silence).
+/// - [`Effect::SendPrompt`] — the queue flush a `StreamComplete`/`StreamError`
+///   emits when the user queued follow-ups while the reply streamed. It is a real
+///   send (not tied to the composer), so it runs through [`run_send_prompt`],
+///   which deliberately leaves the live composer alone (a fresh draft must
+///   survive the flush).
+///
+/// The view-level effects (transcript, chat status, and the composer clear on
+/// enqueue) were already absorbed inside `apply_core`.
+async fn run_controller_effects(
+    app: &mut App,
+    connector: &Option<Rc<Connector>>,
     effects: Vec<Effect>,
     voice_daemon: &VoiceController,
     voice_session: &Option<VoiceSession>,
     narration_tx: &UnboundedSender<NarrationRequest>,
 ) {
-    // Today the streaming arms bubble up only `Speak`; any other effect is
-    // ignored here (later CC-3 slices route the open-conversation RPC effects).
-    // Reaching the body means core's narration gate passed; skip an empty reply
-    // so we don't enqueue silence.
     for effect in effects {
-        if let Effect::Speak(text) = effect
-            && !text.trim().is_empty()
-        {
-            enqueue_narration(narration_tx, voice_daemon, voice_session, text);
+        match effect {
+            Effect::Speak(text) if !text.trim().is_empty() => {
+                enqueue_narration(narration_tx, voice_daemon, voice_session, text);
+            }
+            Effect::SendPrompt {
+                conversation_id,
+                prompt,
+                system_refinement,
+            } => {
+                // Background queue flush: on failure, only recover the batch into
+                // the composer if it's empty — never clobber a fresh draft the
+                // reducer deliberately preserved through the flush.
+                run_send_prompt(
+                    app,
+                    connector,
+                    conversation_id,
+                    prompt,
+                    system_refinement,
+                    ComposerRecovery::IfComposerEmpty,
+                )
+                .await;
+            }
+            _ => {}
         }
     }
 }
@@ -1581,11 +1678,12 @@ async fn handle_signal(
         // (`App::apply_core`): the reducer owns the in-flight state machine —
         // request-id claiming, originating-conversation targeting (TUI-4), and
         // the reply-narration gate — and emits effects. `apply_core` applies the
-        // view-level effects (transcript, chat status, context fill) onto `App`
-        // in place and returns the controller-level ones (narration) for
-        // `run_stream_controller_effects` to run. The events carry
-        // `conversation_id` too, but the in-flight slot routes the stream arms by
-        // `request_id`, so the reducer drops it there.
+        // view-level effects (transcript, chat status, context fill, and the
+        // composer clear on a queued submit) onto `App` in place and returns the
+        // controller-level ones (narration, and the queue-flush send) for
+        // `run_controller_effects` to run. The events carry `conversation_id` too,
+        // but the in-flight slot routes the stream arms by `request_id`, so the
+        // reducer drops it there.
         SignalEvent::UserMessageAdded {
             conversation_id,
             request_id,
@@ -1596,13 +1694,29 @@ async fn handle_signal(
                 request_id,
                 content,
             });
-            run_stream_controller_effects(effects, voice_daemon, voice_session, narration_tx);
+            run_controller_effects(
+                app,
+                connector,
+                effects,
+                voice_daemon,
+                voice_session,
+                narration_tx,
+            )
+            .await;
         }
         SignalEvent::Chunk {
             request_id, chunk, ..
         } => {
             let effects = app.apply_core(UiMessage::StreamChunk { request_id, chunk });
-            run_stream_controller_effects(effects, voice_daemon, voice_session, narration_tx);
+            run_controller_effects(
+                app,
+                connector,
+                effects,
+                voice_daemon,
+                voice_session,
+                narration_tx,
+            )
+            .await;
         }
         SignalEvent::Complete {
             request_id,
@@ -1614,14 +1728,24 @@ async fn handle_signal(
             // `OnDemand` AND `You == Enabled`), external-turn suppression, and the
             // `say_this` dedupe — now lives in core's `StreamComplete`, which
             // emits a `Speak` effect when (and only when) the reply should be
-            // spoken. `run_stream_controller_effects` routes that through the
-            // single narration queue (TUI-11) so synth never blocks the UI and a
-            // `say_this` aside can't interleave.
+            // spoken. `run_controller_effects` routes that through the single
+            // narration queue (TUI-11) so synth never blocks the UI and a
+            // `say_this` aside can't interleave — and, on this same completion,
+            // runs the `SendPrompt` the reducer emits to flush any queued
+            // follow-ups as one combined turn.
             let effects = app.apply_core(UiMessage::StreamComplete {
                 request_id,
                 full_response,
             });
-            run_stream_controller_effects(effects, voice_daemon, voice_session, narration_tx);
+            run_controller_effects(
+                app,
+                connector,
+                effects,
+                voice_daemon,
+                voice_session,
+                narration_tx,
+            )
+            .await;
         }
         SignalEvent::Error {
             request_id, error, ..
@@ -1630,7 +1754,15 @@ async fn handle_signal(
                 request_id,
                 error: error.clone(),
             });
-            run_stream_controller_effects(effects, voice_daemon, voice_session, narration_tx);
+            run_controller_effects(
+                app,
+                connector,
+                effects,
+                voice_daemon,
+                voice_session,
+                narration_tx,
+            )
+            .await;
             // The reducer surfaces "Error: …" in the status line only for the
             // matching in-flight stream; set it unconditionally too so an error
             // for an already-resolved request still reaches the user.
@@ -1645,7 +1777,15 @@ async fn handle_signal(
                 request_id,
                 message,
             });
-            run_stream_controller_effects(effects, voice_daemon, voice_session, narration_tx);
+            run_controller_effects(
+                app,
+                connector,
+                effects,
+                voice_daemon,
+                voice_session,
+                narration_tx,
+            )
+            .await;
         }
         SignalEvent::ContextUsage {
             conversation_id,
@@ -1660,7 +1800,15 @@ async fn handle_signal(
                 budget_tokens,
                 compaction_active,
             });
-            run_stream_controller_effects(effects, voice_daemon, voice_session, narration_tx);
+            run_controller_effects(
+                app,
+                connector,
+                effects,
+                voice_daemon,
+                voice_session,
+                narration_tx,
+            )
+            .await;
         }
         SignalEvent::TitleChanged {
             conversation_id,
@@ -1933,8 +2081,19 @@ async fn handle_action(
                 app.status_message = "Open a conversation first (Enter) or create one (n)".into();
             }
         }
-        Action::ExitEditMode => app.enter_normal_mode(),
+        Action::ExitEditMode => {
+            // Esc while editing a recalled queued message abandons the edit:
+            // return the checked-out message to the queue unchanged and clear the
+            // composer (a no-op when composing a fresh message), then leave edit
+            // mode.
+            app.cancel_queued_edit_if_active();
+            app.enter_normal_mode();
+        }
         Action::SubmitPrompt => send_prompt_from_input(app, connector).await,
+        // Up/Down in edit mode (empty composer + non-empty queue) recall queued
+        // messages for editing; the index walk + reducer dispatch live on `App`.
+        Action::RecallQueued => app.recall_prev_queued(),
+        Action::RecallNext => app.recall_next_queued(),
         // Dictation is handled in the event loop (it needs the embedded voice
         // session + a result channel + a spawned capture task — loop-local
         // resources that don't belong in `handle_action`'s signature), which
@@ -2526,38 +2685,111 @@ fn insert_dictated_text(app: &mut App, text: &str) {
 /// so both honor the staged model override and the same ack handling.
 ///
 /// The send *decision* lives in the shared core (`UiMessage::SubmitPrompt`,
-/// Phase-2): it runs the streaming/empty gate (TUI-7), draws the user bubble
-/// optimistically, and — when accepted — hands back an [`Effect::SendPrompt`]
-/// for this executor to run as the actual RPC. Only the connection gate and the
-/// transport-specific RPC + override stay here. A failed send rolls the
-/// optimistic bubble back via `UiMessage::SendFailed` and refills the composer.
+/// Phase-2): it draws the user bubble optimistically and, when the conversation
+/// is idle, hands back an [`Effect::SendPrompt`] for this executor to run. While
+/// a reply streams it instead QUEUES the text and clears the composer via
+/// [`Effect::SetComposerText`] (applied inside `apply_core`) — that burst flushes
+/// as one combined turn when the reply finishes (see [`run_controller_effects`]).
+/// Only the connection gate and the transport-specific RPC + override stay here.
 async fn send_prompt_from_input(app: &mut App, connector: &Option<Rc<Connector>>) {
     // Connection gate: transport state the core doesn't own.
-    let Some(connector) = connector.as_ref() else {
+    if connector.is_none() {
         app.status_message = "Not connected — message not sent (your text is preserved)".into();
         return;
-    };
+    }
     let prompt = app.textarea_content();
     let effects = app.apply_core(UiMessage::SubmitPrompt { prompt });
-    let Some(Effect::SendPrompt {
+    let Some((conversation_id, prompt, system_refinement)) = take_send_prompt(effects) else {
+        // Queued / edit-reinsert / empty: the reducer already cleared the live
+        // composer (via SetComposerText, applied in apply_core) for the queue
+        // paths, or left a fresh draft untouched. Nothing to send right now.
+        return;
+    };
+    // A direct send consumes the composer's text, so clear it and snap to the
+    // bottom (the idle-send path emits no SetComposerText). A background flush
+    // takes a different route (`run_controller_effects`) and must NOT clear the
+    // composer, so the clear lives here, not in `run_send_prompt`.
+    app.clear_composer();
+    app.scroll_to_bottom();
+    // Direct submit: on failure, refill the (now-cleared) composer with the
+    // unsent text so the user can retry.
+    run_send_prompt(
+        app,
+        connector,
         conversation_id,
         prompt,
         system_refinement,
-    }) = effects
-        .into_iter()
-        .find(|e| matches!(e, Effect::SendPrompt { .. }))
-    else {
-        // Rejected (still streaming / empty / no open conversation): the core
-        // already surfaced any status message and left the composer untouched.
+        ComposerRecovery::Always,
+    )
+    .await;
+}
+
+/// Extract the `SendPrompt` payload from an effect list, if one is present. The
+/// reducer emits at most one per dispatch (a direct send or a queue flush).
+fn take_send_prompt(effects: Vec<Effect>) -> Option<(String, String, Option<String>)> {
+    effects.into_iter().find_map(|e| match e {
+        Effect::SendPrompt {
+            conversation_id,
+            prompt,
+            system_refinement,
+        } => Some((conversation_id, prompt, system_refinement)),
+        _ => None,
+    })
+}
+
+/// How [`run_send_prompt`] should recover the unsent text into the live composer
+/// when the send RPC fails, decided by which path issued the send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerRecovery {
+    /// Direct keyboard submit: the composer was cleared before sending, so refill
+    /// it with the failed text unconditionally (the user retries without retyping).
+    Always,
+    /// Background queue flush: the composer may hold a fresh, not-yet-Entered draft
+    /// the reducer deliberately left in place, so recover the failed batch ONLY
+    /// when the composer is empty — never clobber that draft.
+    IfComposerEmpty,
+}
+
+/// Whether a failed send should refill the composer with the unsent `prompt`.
+/// Pure so the branch is unit-testable without a live transport (the RPC itself
+/// isn't). See [`ComposerRecovery`] for why the flush path is conditional.
+fn should_restore_composer(recovery: ComposerRecovery, composer_empty: bool) -> bool {
+    match recovery {
+        ComposerRecovery::Always => true,
+        ComposerRecovery::IfComposerEmpty => composer_empty,
+    }
+}
+
+/// Run the actual send RPC for one [`Effect::SendPrompt`], shared by the keyboard
+/// submit path and the queue flush a `StreamComplete`/`StreamError`/switch-back
+/// emits. Does NOT clear the live composer — the caller owns that (a direct submit
+/// clears it; a background flush must preserve a fresh, not-yet-Entered draft).
+/// `send_prompt_full` carries the staged model override (socket transports only);
+/// over D-Bus the refinement folds into the prompt, so the no-override voice path
+/// works everywhere. `system_refinement` is `None` when the conversation's `Adele:`
+/// level is Disabled. A failed send rolls the optimistic bubble back via
+/// `UiMessage::SendFailed`; whether it also refills the composer with the unsent
+/// text is governed by `recovery` — the direct path always does, the flush path
+/// only when the composer is empty so it can't destroy an unrelated draft.
+async fn run_send_prompt(
+    app: &mut App,
+    connector: &Option<Rc<Connector>>,
+    conversation_id: String,
+    prompt: String,
+    system_refinement: Option<String>,
+    recovery: ComposerRecovery,
+) {
+    let Some(connector) = connector.as_ref() else {
+        // Reachable only via a queue flush racing a disconnect (the keyboard
+        // submit gates the connector upstream). Roll the optimistic bubble back
+        // and surface it rather than silently dropping the queued text.
+        let _ = app.apply_core(UiMessage::SendFailed {
+            conversation_id,
+            prompt,
+        });
+        app.status_message = "Not connected — queued message not sent".into();
         return;
     };
-    // Accepted: the user bubble is drawn, so clear the composer and snap to the
-    // bottom, then run the RPC. `send_prompt_full` carries the staged model
-    // override (socket transports only); over D-Bus the refinement folds into the
-    // prompt, so the no-override voice path works everywhere. `system_refinement`
-    // is `None` when the conversation's `Adele:` level is Disabled.
-    app.clear_composer();
-    app.scroll_to_bottom();
     let client = connector.client();
     let refinement = system_refinement.as_deref().unwrap_or("");
     let result = match (app.take_pending_override(), client.as_commands()) {
@@ -2586,8 +2818,14 @@ async fn send_prompt_from_input(app: &mut App, connector: &Option<Rc<Connector>>
                 conversation_id,
                 prompt: prompt.clone(),
             });
-            app.set_composer(&prompt);
-            app.status_message = format!("Send error: {e} (your text is preserved)");
+            if should_restore_composer(recovery, app.textarea_content().is_empty()) {
+                app.set_composer(&prompt);
+                app.status_message = format!("Send error: {e} (your text is preserved)");
+            } else {
+                // A background flush failed while the user was mid-composing a
+                // new message; keep their draft and report the batch was not sent.
+                app.status_message = format!("Send error: {e} (queued messages not sent)");
+            }
         }
     }
 }
@@ -3104,5 +3342,34 @@ mod tests {
         // whole set, since it's set-replace, not a delta).
         app.load_conversation(detail("conv-2"));
         assert_eq!(open_conversation_ids(&app), vec!["conv-2".to_string()]);
+    }
+
+    // --- Failed-send composer recovery (feat/queue-messages, Finding 2) ---
+    //
+    // The send RPC itself needs a live transport, so its Err arm can't be driven
+    // in a unit test; the recovery *decision* is factored out into
+    // `should_restore_composer` and asserted here. The key case is a background
+    // flush failing while the user has a fresh draft in the composer.
+
+    #[test]
+    fn direct_submit_error_always_restores_the_composer() {
+        // The composer was cleared before a direct send, so restore unconditionally.
+        assert!(should_restore_composer(ComposerRecovery::Always, true));
+        assert!(should_restore_composer(ComposerRecovery::Always, false));
+    }
+
+    #[test]
+    fn flush_send_error_never_overwrites_a_non_empty_composer() {
+        // A background flush failing must NOT clobber a fresh, not-yet-Entered
+        // draft the reducer preserved through the flush.
+        assert!(
+            !should_restore_composer(ComposerRecovery::IfComposerEmpty, false),
+            "a non-empty draft must survive a failed flush send"
+        );
+        // With nothing typed, recover the failed batch so it isn't silently lost.
+        assert!(should_restore_composer(
+            ComposerRecovery::IfComposerEmpty,
+            true
+        ));
     }
 }

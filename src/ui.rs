@@ -549,6 +549,19 @@ fn draw_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     f.render_widget(messages, area);
 }
 
+/// The composer-title prefix for the message queue (feat/queue-messages):
+/// `"N queued · "` when messages await a flush, `"editing queued · "` while one
+/// is checked out into the composer, or empty when neither. Pure so the wording
+/// is unit-testable without a live frame.
+fn queue_title_prefix(queued_len: usize, editing: bool) -> String {
+    match (queued_len, editing) {
+        (0, false) => String::new(),
+        (0, true) => "editing queued · ".to_string(),
+        (n, true) => format!("editing queued (+{n}) · "),
+        (n, false) => format!("{n} queued · "),
+    }
+}
+
 fn draw_input(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let wrap_width = usize::from(area.width.saturating_sub(2)).max(1);
     // Display-only wrap (issue #84): render a throwaway wrapped copy so the
@@ -564,14 +577,24 @@ fn draw_input(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         ),
         InputMode::Renaming => ("Input", theme().input_border_idle),
     };
+    // Prepend the "N queued" indicator (feat/queue-messages) so a burst the user
+    // fired while Adele was replying is visible right where they type. Pulled from
+    // core state each frame (stateless draw); mirrors the `offline ·` tag shape.
+    let queue_prefix = queue_title_prefix(
+        app.queued_messages_for_view().len(),
+        app.editing_queued_index().is_some(),
+    );
     // When the daemon link is down the run loop projects `connected = false`;
     // surface it where the user types — a warn-colored border plus an `offline`
     // tag. The tag is text (not color-only) so it still reads under NO_COLOR,
     // where the recolor is a no-op; the status bar carries the backoff detail.
     let (title, border_color) = if app.connected {
-        (base_title.to_string(), mode_color)
+        (format!("{queue_prefix}{base_title}"), mode_color)
     } else {
-        (format!("offline · {base_title}"), theme().warn)
+        (
+            format!("{queue_prefix}offline · {base_title}"),
+            theme().warn,
+        )
     };
 
     display.set_block(
@@ -656,6 +679,18 @@ mod tests {
     use super::*;
     use crate::app::{ChatMessage, ConversationDetail, ConversationSummary};
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn queue_title_prefix_reflects_count_and_editing_state() {
+        assert_eq!(queue_title_prefix(0, false), "");
+        assert_eq!(queue_title_prefix(1, false), "1 queued · ");
+        assert_eq!(queue_title_prefix(3, false), "3 queued · ");
+        // Editing the sole queued item: nothing left in the outbox, but the edit
+        // is in progress.
+        assert_eq!(queue_title_prefix(0, true), "editing queued · ");
+        // Editing one while others remain queued.
+        assert_eq!(queue_title_prefix(2, true), "editing queued (+2) · ");
+    }
 
     #[test]
     fn context_usage_span_colours_track_thresholds() {

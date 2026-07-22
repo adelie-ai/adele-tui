@@ -139,6 +139,43 @@ pub enum ScreenRequest {
 /// paths keep resolving unchanged.
 pub use adele_voice_client_common::AdeleOutput;
 
+/// What a `Down`-key queue step resolves to given the outbox length and the
+/// currently checked-out edit slot. Keeps the walk decision pure and testable,
+/// separate from the `apply_core` dispatch it drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecallNext {
+    /// Check out the queued item at this index for editing.
+    Edit(usize),
+    /// Past the newest queued item: return the checked-out one and clear.
+    Cancel,
+    /// Not editing a queued message — nothing to step through.
+    None,
+}
+
+/// Target index for an `Up`-key recall: step one toward the oldest from the
+/// checked-out slot, or the newest queued item when composing fresh. `None` at
+/// the front of the queue (`Some(0)`) or when the queue is empty — a no-op that
+/// preserves any in-composer edits of the front item.
+fn recall_prev_index(queued_len: usize, editing: Option<usize>) -> Option<usize> {
+    match editing {
+        Some(0) => None,
+        Some(i) => Some(i - 1),
+        None => queued_len.checked_sub(1),
+    }
+}
+
+/// Resolve a `Down`-key queue step. Only meaningful while editing (`editing` is
+/// `Some`): step to the next queued item when one exists after the checked-out
+/// slot, otherwise cancel the edit (the checked-out message returns to the
+/// queue). `queued_len` is the outbox length *excluding* the checked-out item.
+fn recall_next_action(queued_len: usize, editing: Option<usize>) -> RecallNext {
+    match editing {
+        None => RecallNext::None,
+        Some(i) if i < queued_len => RecallNext::Edit(i + 1),
+        Some(_) => RecallNext::Cancel,
+    }
+}
+
 pub struct App {
     pub selected_conversation: Option<usize>,
     pub textarea: TextArea<'static>,
@@ -749,6 +786,25 @@ impl App {
                 self.assistant_status = None;
                 None
             }
+            // The reducer owns the composer for the message-queue flows: it
+            // clears it (`""`) when a submitted prompt is enqueued or an edit is
+            // cancelled, and loads a recalled queued message into it for editing.
+            // The live textarea is pure view state, so apply it here — routing it
+            // through `apply_core` means every dispatch (submit, recall, cancel,
+            // and the queue flush a StreamComplete emits) keeps the composer in
+            // sync without the caller having to special-case it.
+            Effect::SetComposerText(text) => {
+                if text.is_empty() {
+                    self.clear_composer();
+                } else {
+                    self.set_composer(&text);
+                }
+                None
+            }
+            // The TUI redraws the "N queued" indicator from `core` state each
+            // frame (`queued_messages_for_view` / `editing_queued_index`), so the
+            // render-ready snapshot carries no view-level work here.
+            Effect::SetQueuedMessages { .. } => None,
             Effect::SetContextUsage(usage) => {
                 self.context_usage = usage;
                 None
@@ -803,6 +859,59 @@ impl App {
     /// this so a second prompt can't be sent mid-stream (TUI-7).
     pub fn is_streaming(&self) -> bool {
         self.core.is_streaming()
+    }
+
+    /// The messages queued for the open conversation (submit order), read back
+    /// from the shared core. The draw path renders the "N queued" indicator from
+    /// this each frame; the key dispatch consults it to decide whether an empty
+    /// composer's `Up`/`Down` should recall a queued message.
+    pub fn queued_messages_for_view(&self) -> &[String] {
+        self.core.queued_messages_for_view()
+    }
+
+    /// The queue index currently checked out into the composer for editing, or
+    /// `None` when composing a fresh message. Drives the up/down queue walk.
+    pub fn editing_queued_index(&self) -> Option<usize> {
+        self.core.editing_queued_index()
+    }
+
+    /// Recall the previous queued message into the composer for editing (`Up`).
+    /// Walks one step toward the oldest from the checked-out item, or recalls the
+    /// newest when composing fresh. A no-op at the front of the queue or when the
+    /// queue is empty. The reducer loads the text via `SetComposerText`, applied
+    /// in `run_view_effect`.
+    pub fn recall_prev_queued(&mut self) {
+        let queued_len = self.core.queued_messages_for_view().len();
+        if let Some(index) = recall_prev_index(queued_len, self.core.editing_queued_index()) {
+            let _ = self.apply_core(UiMessage::EditQueued { index });
+        }
+    }
+
+    /// Step forward through the queue while editing (`Down`): recall the next
+    /// queued message, or — once past the newest — return the checked-out message
+    /// to the queue and clear the composer. A no-op when not editing a queued
+    /// message.
+    pub fn recall_next_queued(&mut self) {
+        let queued_len = self.core.queued_messages_for_view().len();
+        match recall_next_action(queued_len, self.core.editing_queued_index()) {
+            RecallNext::Edit(index) => {
+                let _ = self.apply_core(UiMessage::EditQueued { index });
+            }
+            RecallNext::Cancel => {
+                let _ = self.apply_core(UiMessage::CancelQueuedEdit);
+            }
+            RecallNext::None => {}
+        }
+    }
+
+    /// Return the currently checked-out queued message to the queue and clear the
+    /// composer, if an edit is in progress (`Esc` while editing a recalled item).
+    /// A no-op otherwise. Distinct from `enter_normal_mode`, which the caller runs
+    /// alongside this to leave edit mode.
+    pub fn cancel_queued_edit_if_active(&mut self) {
+        if self.core.editing_queued_index().is_some() {
+            let _ = self.apply_core(UiMessage::CancelQueuedEdit);
+        }
     }
 
     /// Record a `send_prompt` ack: register the in-flight turn (and its
@@ -882,7 +991,21 @@ impl App {
         }
     }
 
-    pub fn load_conversation(&mut self, detail: ConversationDetail) {
+    /// Open (or switch to) `detail`'s conversation, returning any controller-level
+    /// effects the caller must run — today the switch-back queue flush: when the
+    /// now-open conversation has messages the user queued while its reply streamed
+    /// in the background and that reply has since finished, they flush as ONE
+    /// combined [`Effect::SendPrompt`]. Empty on the common path (idle+empty
+    /// queue, still streaming, or mid-edit). The caller runs the returned effects
+    /// through `run_controller_effects` (the same executor a StreamComplete flush
+    /// uses), since the actual send RPC needs the connector this method doesn't
+    /// hold. Seeding detail directly via `open_conversation` bypasses the reducer's
+    /// `ConversationLoaded` switch-back flush, so this method re-supplies it.
+    ///
+    /// Not `#[must_use]`: many call sites (tests, and the reconnect resync where
+    /// the connector isn't yet live) legitimately have no backlog to flush and
+    /// drop the empty vec. The three real switch paths in `main` run it.
+    pub fn load_conversation(&mut self, detail: ConversationDetail) -> Vec<Effect> {
         let incoming_id = detail.id.clone();
         let outgoing_id = self.core.current_conversation().map(|c| c.id.clone());
         let switching = outgoing_id.as_deref() != Some(incoming_id.as_str());
@@ -907,6 +1030,12 @@ impl App {
             let draft = self.core.composer_draft(&incoming_id).to_string();
             self.set_composer(&draft);
         }
+        // Auto-send a finished-in-the-background conversation's queued backlog.
+        // A no-op unless the now-open conversation is idle with a pending queue,
+        // so it is safe to call after every open (switch or same-id reload). Runs
+        // last so it sees the restored composer draft and never clobbers it (the
+        // flush leaves the live composer alone).
+        self.core.flush_pending_queue()
     }
 
     /// Apply a live `TitleChanged` signal: the sidebar list rename flows through
@@ -1524,6 +1653,343 @@ mod tests {
     // no-conversation rejections moved to the shared core (`UiMessage::SubmitPrompt`,
     // Phase-2) and are spec'd by client-ui-common's reducer tests. The App tests
     // below cover only the TUI's own send-path wiring (composer text → effect).
+
+    // --- Message queuing (feat/queue-messages) ---
+    //
+    // These exercise the TUI's wiring of the queue reducer contract onto App's
+    // own composer widget + view accessors: enqueue-clears-composer, the
+    // stream-complete flush, and the up/down recall walk. The queue state machine
+    // itself is spec'd by client-ui-common's reducer tests; here we assert the
+    // `SetComposerText` effect reaches `App::textarea` and the recall index walk
+    // dispatches the right `EditQueued`/`CancelQueuedEdit`.
+
+    /// Enter a live stream on `c1` so a following `SubmitPrompt` queues (busy).
+    fn app_streaming_on_c1() -> App {
+        let mut app = App::new();
+        app.load_conversation(detail("c1"));
+        app.apply_prompt_ack("task-1".into(), "c1".into());
+        app
+    }
+
+    /// Type `text` into the composer and submit it through the shared core.
+    fn submit(app: &mut App, text: &str) -> Vec<Effect> {
+        app.textarea.insert_str(text);
+        let prompt = app.textarea_content();
+        app.apply_core(UiMessage::SubmitPrompt { prompt })
+    }
+
+    #[test]
+    fn submitting_while_streaming_queues_and_clears_the_composer() {
+        let mut app = app_streaming_on_c1();
+        let effects = submit(&mut app, "hello while busy");
+
+        assert!(
+            sent_prompt(&effects).is_none(),
+            "a busy submit must not send"
+        );
+        assert_eq!(
+            app.queued_messages_for_view(),
+            &["hello while busy".to_string()]
+        );
+        // The reducer cleared the live composer via SetComposerText, applied in
+        // run_view_effect.
+        assert!(
+            app.textarea_content().is_empty(),
+            "composer clears when a message is queued"
+        );
+    }
+
+    #[test]
+    fn queued_messages_flush_as_one_combined_send_on_stream_complete() {
+        let mut app = app_streaming_on_c1();
+        submit(&mut app, "first");
+        submit(&mut app, "second");
+        assert_eq!(app.queued_messages_for_view().len(), 2);
+
+        let effects = app.apply_core(UiMessage::StreamComplete {
+            request_id: "srv-1".into(),
+            full_response: "reply".into(),
+        });
+        assert_eq!(
+            sent_prompt(&effects).expect("stream completion flushes the queue as a send"),
+            "first\nsecond",
+            "the queued burst flushes as ONE combined turn joined with \\n"
+        );
+        assert!(
+            app.queued_messages_for_view().is_empty(),
+            "the queue drains on flush"
+        );
+    }
+
+    #[test]
+    fn recall_prev_loads_the_newest_queued_message_then_walks_to_the_front() {
+        let mut app = app_streaming_on_c1();
+        submit(&mut app, "alpha");
+        submit(&mut app, "bravo");
+
+        app.recall_prev_queued(); // Up -> newest
+        assert_eq!(app.textarea_content(), "bravo");
+        assert_eq!(app.editing_queued_index(), Some(1));
+        assert_eq!(app.queued_messages_for_view(), &["alpha".to_string()]);
+
+        app.recall_prev_queued(); // Up -> older
+        assert_eq!(app.textarea_content(), "alpha");
+        assert_eq!(app.editing_queued_index(), Some(0));
+
+        app.recall_prev_queued(); // Up at the front -> no-op, stays on alpha
+        assert_eq!(app.textarea_content(), "alpha");
+        assert_eq!(app.editing_queued_index(), Some(0));
+    }
+
+    #[test]
+    fn recall_next_steps_forward_then_cancels_past_the_newest() {
+        let mut app = app_streaming_on_c1();
+        submit(&mut app, "alpha");
+        submit(&mut app, "bravo");
+        app.recall_prev_queued(); // bravo
+        app.recall_prev_queued(); // alpha
+        assert_eq!(app.textarea_content(), "alpha");
+
+        app.recall_next_queued(); // Down -> bravo
+        assert_eq!(app.textarea_content(), "bravo");
+        assert_eq!(app.editing_queued_index(), Some(1));
+
+        app.recall_next_queued(); // Down past newest -> cancel, restore + clear
+        assert!(app.textarea_content().is_empty());
+        assert_eq!(app.editing_queued_index(), None);
+        assert_eq!(
+            app.queued_messages_for_view(),
+            &["alpha".to_string(), "bravo".to_string()]
+        );
+    }
+
+    #[test]
+    fn editing_a_recalled_message_reinserts_it_in_place_on_submit() {
+        let mut app = app_streaming_on_c1();
+        submit(&mut app, "alpha");
+        submit(&mut app, "bravo");
+        app.recall_prev_queued(); // check out bravo (slot 1)
+        app.clear_composer();
+        let effects = submit(&mut app, "bravo-edited");
+
+        assert!(
+            sent_prompt(&effects).is_none(),
+            "still streaming: the edited message re-queues, not sends"
+        );
+        assert!(app.textarea_content().is_empty());
+        assert_eq!(
+            app.queued_messages_for_view(),
+            &["alpha".to_string(), "bravo-edited".to_string()]
+        );
+        assert_eq!(app.editing_queued_index(), None);
+    }
+
+    #[test]
+    fn cancelling_a_recalled_edit_returns_the_message_and_clears_composer() {
+        let mut app = app_streaming_on_c1();
+        submit(&mut app, "solo");
+        app.recall_prev_queued();
+        assert_eq!(app.textarea_content(), "solo");
+        assert_eq!(app.editing_queued_index(), Some(0));
+
+        app.cancel_queued_edit_if_active(); // Esc while editing a queued item
+        assert!(app.textarea_content().is_empty());
+        assert_eq!(app.editing_queued_index(), None);
+        assert_eq!(app.queued_messages_for_view(), &["solo".to_string()]);
+    }
+
+    #[test]
+    fn cancel_queued_edit_is_a_no_op_when_not_editing() {
+        let mut app = app_streaming_on_c1();
+        submit(&mut app, "queued");
+        // Not checked out for editing: Esc must not disturb the queue.
+        app.cancel_queued_edit_if_active();
+        assert_eq!(app.queued_messages_for_view(), &["queued".to_string()]);
+        assert_eq!(app.editing_queued_index(), None);
+    }
+
+    #[test]
+    fn idle_send_emits_send_without_a_composer_effect() {
+        // The idle single-send path emits SendPrompt but NO SetComposerText, so
+        // apply_core leaves the live composer untouched — the submit path clears
+        // it itself for this case.
+        let mut app = App::new();
+        app.load_conversation(detail("c1"));
+        let effects = submit(&mut app, "just send it");
+        assert_eq!(sent_prompt(&effects).as_deref(), Some("just send it"));
+        assert_eq!(
+            app.textarea_content(),
+            "just send it",
+            "apply_core does not clear the composer on the idle-send path"
+        );
+    }
+
+    #[test]
+    fn recall_prev_index_walks_backward_and_stops_at_the_front() {
+        assert_eq!(
+            recall_prev_index(0, None),
+            None,
+            "empty queue: nothing to recall"
+        );
+        assert_eq!(
+            recall_prev_index(3, None),
+            Some(2),
+            "fresh compose -> newest"
+        );
+        assert_eq!(recall_prev_index(2, Some(2)), Some(1));
+        assert_eq!(recall_prev_index(2, Some(1)), Some(0));
+        assert_eq!(recall_prev_index(2, Some(0)), None, "at the front -> no-op");
+    }
+
+    #[test]
+    fn recall_next_action_steps_forward_then_cancels_at_the_end() {
+        assert_eq!(recall_next_action(2, None), RecallNext::None, "not editing");
+        assert_eq!(recall_next_action(2, Some(0)), RecallNext::Edit(1));
+        assert_eq!(recall_next_action(2, Some(1)), RecallNext::Edit(2));
+        assert_eq!(
+            recall_next_action(2, Some(2)),
+            RecallNext::Cancel,
+            "past newest"
+        );
+    }
+
+    #[test]
+    fn switching_back_flushes_a_finished_backgrounded_conversations_queue() {
+        // Queue two messages on c1 while its reply streams, switch away to c2, let
+        // c1's reply finish in the background (no flush — it's not in view), then
+        // switch back to c1: load_conversation must auto-send the backlog as one
+        // combined turn (the reducer's ConversationLoaded flush is bypassed when
+        // the TUI seeds detail directly via open_conversation).
+        let mut app = app_streaming_on_c1();
+        submit(&mut app, "first");
+        submit(&mut app, "second");
+
+        // Switch away — c1's stream keeps running in the background. (No backlog
+        // on c2, so this returns nothing.)
+        assert!(app.load_conversation(detail("c2")).is_empty());
+
+        // c1's reply completes while backgrounded: routed to c1 (the unique
+        // pending stream), but not the open conversation, so it does NOT flush.
+        let bg = app.apply_core(UiMessage::StreamComplete {
+            request_id: "srv-1".into(),
+            full_response: "reply".into(),
+        });
+        assert!(
+            sent_prompt(&bg).is_none(),
+            "a backgrounded completion must not flush the queue"
+        );
+
+        // Switch back to c1: NOW the idle backlog flushes as one combined send.
+        let effects = app.load_conversation(detail("c1"));
+        assert_eq!(
+            sent_prompt(&effects).expect("switch-back flushes the backlog as a send"),
+            "first\nsecond"
+        );
+        assert!(app.queued_messages_for_view().is_empty());
+    }
+
+    #[test]
+    fn switching_to_a_conversation_without_a_backlog_flushes_nothing() {
+        let mut app = App::new();
+        app.load_conversation(detail("c1"));
+        // A plain switch to an idle, empty conversation emits no send.
+        let effects = app.load_conversation(detail("c2"));
+        assert!(
+            sent_prompt(&effects).is_none() && effects.is_empty(),
+            "no backlog -> no flush: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn switch_back_flush_preserves_the_restored_composer_draft() {
+        // A fresh, not-yet-Entered draft saved for c1 must survive the switch-back
+        // flush: the backlog sends, the draft is restored into the live composer.
+        let mut app = app_streaming_on_c1();
+        submit(&mut app, "queued one");
+        // Leave a draft in the composer, then switch away (it gets saved for c1).
+        app.set_composer("half-typed draft");
+        assert!(app.load_conversation(detail("c2")).is_empty());
+        app.apply_core(UiMessage::StreamComplete {
+            request_id: "srv-1".into(),
+            full_response: "reply".into(),
+        });
+
+        let effects = app.load_conversation(detail("c1"));
+        assert_eq!(
+            sent_prompt(&effects).as_deref(),
+            Some("queued one"),
+            "the backlog flushes"
+        );
+        assert_eq!(
+            app.textarea_content(),
+            "half-typed draft",
+            "the restored draft must not be clobbered by the flush"
+        );
+    }
+
+    #[test]
+    fn in_view_stream_complete_flush_preserves_a_fresh_composer_draft() {
+        // AC9: a reply completing while the conversation is in view flushes the
+        // queued backlog as ONE combined send, but a fresh, not-yet-Entered draft
+        // the user has since typed into the live composer must survive untouched.
+        // The flush drains only the committed queue; it must never emit a
+        // `SetComposerText("")` that clears the in-progress composer.
+        let mut app = app_streaming_on_c1();
+        submit(&mut app, "q1"); // queued while busy; composer clears
+        app.set_composer("half-typed"); // user starts a fresh draft mid-stream
+
+        let effects = app.apply_core(UiMessage::StreamComplete {
+            request_id: "srv-1".into(),
+            full_response: "reply".into(),
+        });
+
+        assert_eq!(
+            sent_prompt(&effects).as_deref(),
+            Some("q1"),
+            "the in-view completion flushes the queued backlog as a send"
+        );
+        assert_eq!(
+            app.textarea_content(),
+            "half-typed",
+            "the fresh composer draft must survive the flush, not be cleared"
+        );
+    }
+
+    #[test]
+    fn stream_complete_while_editing_a_recalled_message_defers_the_flush() {
+        // AC8: if a reply completes while the user has a queued message checked
+        // out for editing, the flush is DEFERRED — flushing the partial queue now
+        // would send a stale burst and orphan the checked-out edit. No send fires;
+        // the edit and the remaining queue stay intact until the user finishes (or
+        // cancels) the edit.
+        let mut app = app_streaming_on_c1();
+        submit(&mut app, "a");
+        submit(&mut app, "b");
+        app.recall_prev_queued(); // check out "b" (index 1) into the composer
+        assert_eq!(app.editing_queued_index(), Some(1));
+        assert_eq!(app.textarea_content(), "b");
+        assert_eq!(app.queued_messages_for_view(), &["a".to_string()]);
+
+        let effects = app.apply_core(UiMessage::StreamComplete {
+            request_id: "srv-1".into(),
+            full_response: "reply".into(),
+        });
+
+        assert!(
+            sent_prompt(&effects).is_none(),
+            "the flush must be deferred while a queued item is checked out: {effects:?}"
+        );
+        assert_eq!(
+            app.editing_queued_index(),
+            Some(1),
+            "the checked-out edit is preserved across the deferred flush"
+        );
+        assert_eq!(
+            app.queued_messages_for_view(),
+            &["a".to_string()],
+            "the remaining queue stays intact — nothing sent, nothing orphaned"
+        );
+    }
 
     // --- Bracketed paste (TUI-3) ---
 
