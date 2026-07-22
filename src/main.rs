@@ -1276,10 +1276,11 @@ async fn run(
                         // exists daemon-side) and reselect it by ID — the
                         // sidebar selection is positional and the refreshed
                         // list may have reordered.
+                        let mut resync_flush: Vec<Effect> = Vec::new();
                         if let Some(open_id) = app.current_conversation().map(|c| c.id.clone()) {
                             app.select_conversation_by_id(&open_id);
                             match conn.client().get_conversation(&open_id).await {
-                                Ok(detail) => app.load_conversation(detail),
+                                Ok(detail) => resync_flush = app.load_conversation(detail),
                                 Err(e) => {
                                     app.status_message =
                                         format!("Error refreshing conversation: {e}");
@@ -1289,6 +1290,17 @@ async fn run(
                         finish_connection_init(&mut app, &conn).await;
                         reconnect = ReconnectState::Connected;
                         connector = Some(Rc::new(conn));
+                        // The connector is live again: flush any backlog the user
+                        // queued before the gap (a no-op unless idle with a queue).
+                        run_controller_effects(
+                            &mut app,
+                            &connector,
+                            resync_flush,
+                            &voice_daemon,
+                            &voice_session,
+                            &narration_tx,
+                        )
+                        .await;
                     }
                     Err(e) => {
                         reconnect = schedule_reconnect(prev_delay);
@@ -1351,11 +1363,23 @@ async fn run(
                 // daemon's live turn-event fan-out at the now-open conversation
                 // (#1 multi-client sync) so turns started elsewhere — another
                 // client, or the voice daemon — render live here.
-                if apply_rpc_outcome(&mut app, outcome)
+                let applied = apply_rpc_outcome(&mut app, outcome);
+                if applied.conversation_changed
                     && let Some(conn) = connector.as_ref()
                 {
                     subscribe_to_open_conversation(&mut app, conn).await;
                 }
+                // Run any switch-back queue flush the open surfaced. Subscribing
+                // first (above) means the flushed turn's live events route here.
+                run_controller_effects(
+                    &mut app,
+                    &connector,
+                    applied.effects,
+                    &voice_daemon,
+                    &voice_session,
+                    &narration_tx,
+                )
+                .await;
             }
         }
     }
@@ -1419,27 +1443,57 @@ enum RpcOutcome {
     TaskCancelFailed { task_id: String, error: String },
 }
 
+/// The result of applying an [`RpcOutcome`] to `App`: whether the open
+/// conversation changed (so the caller re-subscribes the live fan-out) and any
+/// controller-level effects the reducer bubbled up for the loop to run — today
+/// the switch-back queue flush's [`Effect::SendPrompt`], which needs the connector
+/// + narration handles this transport-free function deliberately does not hold.
+struct RpcApplied {
+    conversation_changed: bool,
+    effects: Vec<Effect>,
+}
+
+impl RpcApplied {
+    /// No conversation change and nothing to run — the common path.
+    fn inert() -> Self {
+        Self {
+            conversation_changed: false,
+            effects: Vec::new(),
+        }
+    }
+
+    /// A switch/open succeeded: re-subscribe, and run `effects` (a switch-back
+    /// flush's send, if any).
+    fn switched(effects: Vec<Effect>) -> Self {
+        Self {
+            conversation_changed: true,
+            effects,
+        }
+    }
+}
+
 /// Apply a completed [`RpcOutcome`] to `App` (TUI-5 / #83). This is the only
 /// place RPC results touch `App`; it runs on the event loop after the RPC has
 /// resolved off it.
 ///
-/// Returns `true` when the open conversation changed (an open/create succeeded),
-/// so the caller can (re)send `SubscribeConversations` for the now-open
-/// conversation (#1 live multi-client sync) — this function stays transport-free,
-/// so the actual command send happens on the event loop where the connector
-/// lives.
-fn apply_rpc_outcome(app: &mut App, outcome: RpcOutcome) -> bool {
+/// Returns an [`RpcApplied`]: `conversation_changed` is `true` when the open
+/// conversation changed (an open/create succeeded), so the caller can (re)send
+/// `SubscribeConversations` for the now-open conversation (#1 live multi-client
+/// sync); `effects` carries any switch-back queue flush to run. This function
+/// stays transport-free, so both the subscribe and the flush send happen on the
+/// event loop where the connector lives.
+fn apply_rpc_outcome(app: &mut App, outcome: RpcOutcome) -> RpcApplied {
     match outcome {
         RpcOutcome::ConversationOpened {
             result,
             enter_editing,
         } => match result {
             Ok(detail) => {
-                app.load_conversation(detail);
+                let flush = app.load_conversation(detail);
                 if enter_editing {
                     app.enter_editing_mode();
                 }
-                return true;
+                return RpcApplied::switched(flush);
             }
             Err(e) => app.status_message = format!("Error: {e}"),
         },
@@ -1452,7 +1506,7 @@ fn apply_rpc_outcome(app: &mut App, outcome: RpcOutcome) -> bool {
                 Ok(id) => id,
                 Err(e) => {
                     app.status_message = format!("Create error: {e}");
-                    return false;
+                    return RpcApplied::inert();
                 }
             };
             match list {
@@ -1468,9 +1522,11 @@ fn apply_rpc_outcome(app: &mut App, outcome: RpcOutcome) -> bool {
             }
             match detail {
                 Some(Ok(detail)) => {
-                    app.load_conversation(detail);
+                    // A freshly-created conversation has no backlog, so the flush
+                    // is empty; run it uniformly anyway.
+                    let flush = app.load_conversation(detail);
                     app.enter_editing_mode();
-                    return true;
+                    return RpcApplied::switched(flush);
                 }
                 Some(Err(e)) => app.status_message = format!("Error opening: {e}"),
                 None => {}
@@ -1524,7 +1580,7 @@ fn apply_rpc_outcome(app: &mut App, outcome: RpcOutcome) -> bool {
         }
     }
     // No open-conversation change on any path that reached here.
-    false
+    RpcApplied::inert()
 }
 
 /// What [`handle_signal`] asks its caller to do after handling a signal. Almost
@@ -1581,7 +1637,18 @@ async fn run_controller_effects(
                 prompt,
                 system_refinement,
             } => {
-                run_send_prompt(app, connector, conversation_id, prompt, system_refinement).await;
+                // Background queue flush: on failure, only recover the batch into
+                // the composer if it's empty — never clobber a fresh draft the
+                // reducer deliberately preserved through the flush.
+                run_send_prompt(
+                    app,
+                    connector,
+                    conversation_id,
+                    prompt,
+                    system_refinement,
+                    ComposerRecovery::IfComposerEmpty,
+                )
+                .await;
             }
             _ => {}
         }
@@ -2644,7 +2711,17 @@ async fn send_prompt_from_input(app: &mut App, connector: &Option<Rc<Connector>>
     // composer, so the clear lives here, not in `run_send_prompt`.
     app.clear_composer();
     app.scroll_to_bottom();
-    run_send_prompt(app, connector, conversation_id, prompt, system_refinement).await;
+    // Direct submit: on failure, refill the (now-cleared) composer with the
+    // unsent text so the user can retry.
+    run_send_prompt(
+        app,
+        connector,
+        conversation_id,
+        prompt,
+        system_refinement,
+        ComposerRecovery::Always,
+    )
+    .await;
 }
 
 /// Extract the `SendPrompt` payload from an effect list, if one is present. The
@@ -2660,21 +2737,47 @@ fn take_send_prompt(effects: Vec<Effect>) -> Option<(String, String, Option<Stri
     })
 }
 
+/// How [`run_send_prompt`] should recover the unsent text into the live composer
+/// when the send RPC fails, decided by which path issued the send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerRecovery {
+    /// Direct keyboard submit: the composer was cleared before sending, so refill
+    /// it with the failed text unconditionally (the user retries without retyping).
+    Always,
+    /// Background queue flush: the composer may hold a fresh, not-yet-Entered draft
+    /// the reducer deliberately left in place, so recover the failed batch ONLY
+    /// when the composer is empty — never clobber that draft.
+    IfComposerEmpty,
+}
+
+/// Whether a failed send should refill the composer with the unsent `prompt`.
+/// Pure so the branch is unit-testable without a live transport (the RPC itself
+/// isn't). See [`ComposerRecovery`] for why the flush path is conditional.
+fn should_restore_composer(recovery: ComposerRecovery, composer_empty: bool) -> bool {
+    match recovery {
+        ComposerRecovery::Always => true,
+        ComposerRecovery::IfComposerEmpty => composer_empty,
+    }
+}
+
 /// Run the actual send RPC for one [`Effect::SendPrompt`], shared by the keyboard
-/// submit path and the queue flush a `StreamComplete`/`StreamError` emits. Does
-/// NOT touch the live composer — the caller owns that (a direct submit clears it;
-/// a background flush must preserve a fresh, not-yet-Entered draft). `send_prompt_full`
-/// carries the staged model override (socket transports only); over D-Bus the
-/// refinement folds into the prompt, so the no-override voice path works
-/// everywhere. `system_refinement` is `None` when the conversation's `Adele:`
+/// submit path and the queue flush a `StreamComplete`/`StreamError`/switch-back
+/// emits. Does NOT clear the live composer — the caller owns that (a direct submit
+/// clears it; a background flush must preserve a fresh, not-yet-Entered draft).
+/// `send_prompt_full` carries the staged model override (socket transports only);
+/// over D-Bus the refinement folds into the prompt, so the no-override voice path
+/// works everywhere. `system_refinement` is `None` when the conversation's `Adele:`
 /// level is Disabled. A failed send rolls the optimistic bubble back via
-/// `UiMessage::SendFailed` and refills the composer with the unsent text.
+/// `UiMessage::SendFailed`; whether it also refills the composer with the unsent
+/// text is governed by `recovery` — the direct path always does, the flush path
+/// only when the composer is empty so it can't destroy an unrelated draft.
 async fn run_send_prompt(
     app: &mut App,
     connector: &Option<Rc<Connector>>,
     conversation_id: String,
     prompt: String,
     system_refinement: Option<String>,
+    recovery: ComposerRecovery,
 ) {
     let Some(connector) = connector.as_ref() else {
         // Reachable only via a queue flush racing a disconnect (the keyboard
@@ -2715,8 +2818,14 @@ async fn run_send_prompt(
                 conversation_id,
                 prompt: prompt.clone(),
             });
-            app.set_composer(&prompt);
-            app.status_message = format!("Send error: {e} (your text is preserved)");
+            if should_restore_composer(recovery, app.textarea_content().is_empty()) {
+                app.set_composer(&prompt);
+                app.status_message = format!("Send error: {e} (your text is preserved)");
+            } else {
+                // A background flush failed while the user was mid-composing a
+                // new message; keep their draft and report the batch was not sent.
+                app.status_message = format!("Send error: {e} (queued messages not sent)");
+            }
         }
     }
 }
@@ -3233,5 +3342,34 @@ mod tests {
         // whole set, since it's set-replace, not a delta).
         app.load_conversation(detail("conv-2"));
         assert_eq!(open_conversation_ids(&app), vec!["conv-2".to_string()]);
+    }
+
+    // --- Failed-send composer recovery (feat/queue-messages, Finding 2) ---
+    //
+    // The send RPC itself needs a live transport, so its Err arm can't be driven
+    // in a unit test; the recovery *decision* is factored out into
+    // `should_restore_composer` and asserted here. The key case is a background
+    // flush failing while the user has a fresh draft in the composer.
+
+    #[test]
+    fn direct_submit_error_always_restores_the_composer() {
+        // The composer was cleared before a direct send, so restore unconditionally.
+        assert!(should_restore_composer(ComposerRecovery::Always, true));
+        assert!(should_restore_composer(ComposerRecovery::Always, false));
+    }
+
+    #[test]
+    fn flush_send_error_never_overwrites_a_non_empty_composer() {
+        // A background flush failing must NOT clobber a fresh, not-yet-Entered
+        // draft the reducer preserved through the flush.
+        assert!(
+            !should_restore_composer(ComposerRecovery::IfComposerEmpty, false),
+            "a non-empty draft must survive a failed flush send"
+        );
+        // With nothing typed, recover the failed batch so it isn't silently lost.
+        assert!(should_restore_composer(
+            ComposerRecovery::IfComposerEmpty,
+            true
+        ));
     }
 }

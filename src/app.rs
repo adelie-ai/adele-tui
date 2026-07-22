@@ -991,7 +991,21 @@ impl App {
         }
     }
 
-    pub fn load_conversation(&mut self, detail: ConversationDetail) {
+    /// Open (or switch to) `detail`'s conversation, returning any controller-level
+    /// effects the caller must run — today the switch-back queue flush: when the
+    /// now-open conversation has messages the user queued while its reply streamed
+    /// in the background and that reply has since finished, they flush as ONE
+    /// combined [`Effect::SendPrompt`]. Empty on the common path (idle+empty
+    /// queue, still streaming, or mid-edit). The caller runs the returned effects
+    /// through `run_controller_effects` (the same executor a StreamComplete flush
+    /// uses), since the actual send RPC needs the connector this method doesn't
+    /// hold. Seeding detail directly via `open_conversation` bypasses the reducer's
+    /// `ConversationLoaded` switch-back flush, so this method re-supplies it.
+    ///
+    /// Not `#[must_use]`: many call sites (tests, and the reconnect resync where
+    /// the connector isn't yet live) legitimately have no backlog to flush and
+    /// drop the empty vec. The three real switch paths in `main` run it.
+    pub fn load_conversation(&mut self, detail: ConversationDetail) -> Vec<Effect> {
         let incoming_id = detail.id.clone();
         let outgoing_id = self.core.current_conversation().map(|c| c.id.clone());
         let switching = outgoing_id.as_deref() != Some(incoming_id.as_str());
@@ -1016,6 +1030,12 @@ impl App {
             let draft = self.core.composer_draft(&incoming_id).to_string();
             self.set_composer(&draft);
         }
+        // Auto-send a finished-in-the-background conversation's queued backlog.
+        // A no-op unless the now-open conversation is idle with a pending queue,
+        // so it is safe to call after every open (switch or same-id reload). Runs
+        // last so it sees the restored composer draft and never clobbers it (the
+        // flush leaves the live composer alone).
+        self.core.flush_pending_queue()
     }
 
     /// Apply a live `TitleChanged` signal: the sidebar list rename flows through
@@ -1830,6 +1850,80 @@ mod tests {
             recall_next_action(2, Some(2)),
             RecallNext::Cancel,
             "past newest"
+        );
+    }
+
+    #[test]
+    fn switching_back_flushes_a_finished_backgrounded_conversations_queue() {
+        // Queue two messages on c1 while its reply streams, switch away to c2, let
+        // c1's reply finish in the background (no flush — it's not in view), then
+        // switch back to c1: load_conversation must auto-send the backlog as one
+        // combined turn (the reducer's ConversationLoaded flush is bypassed when
+        // the TUI seeds detail directly via open_conversation).
+        let mut app = app_streaming_on_c1();
+        submit(&mut app, "first");
+        submit(&mut app, "second");
+
+        // Switch away — c1's stream keeps running in the background. (No backlog
+        // on c2, so this returns nothing.)
+        assert!(app.load_conversation(detail("c2")).is_empty());
+
+        // c1's reply completes while backgrounded: routed to c1 (the unique
+        // pending stream), but not the open conversation, so it does NOT flush.
+        let bg = app.apply_core(UiMessage::StreamComplete {
+            request_id: "srv-1".into(),
+            full_response: "reply".into(),
+        });
+        assert!(
+            sent_prompt(&bg).is_none(),
+            "a backgrounded completion must not flush the queue"
+        );
+
+        // Switch back to c1: NOW the idle backlog flushes as one combined send.
+        let effects = app.load_conversation(detail("c1"));
+        assert_eq!(
+            sent_prompt(&effects).expect("switch-back flushes the backlog as a send"),
+            "first\nsecond"
+        );
+        assert!(app.queued_messages_for_view().is_empty());
+    }
+
+    #[test]
+    fn switching_to_a_conversation_without_a_backlog_flushes_nothing() {
+        let mut app = App::new();
+        app.load_conversation(detail("c1"));
+        // A plain switch to an idle, empty conversation emits no send.
+        let effects = app.load_conversation(detail("c2"));
+        assert!(
+            sent_prompt(&effects).is_none() && effects.is_empty(),
+            "no backlog -> no flush: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn switch_back_flush_preserves_the_restored_composer_draft() {
+        // A fresh, not-yet-Entered draft saved for c1 must survive the switch-back
+        // flush: the backlog sends, the draft is restored into the live composer.
+        let mut app = app_streaming_on_c1();
+        submit(&mut app, "queued one");
+        // Leave a draft in the composer, then switch away (it gets saved for c1).
+        app.set_composer("half-typed draft");
+        assert!(app.load_conversation(detail("c2")).is_empty());
+        app.apply_core(UiMessage::StreamComplete {
+            request_id: "srv-1".into(),
+            full_response: "reply".into(),
+        });
+
+        let effects = app.load_conversation(detail("c1"));
+        assert_eq!(
+            sent_prompt(&effects).as_deref(),
+            Some("queued one"),
+            "the backlog flushes"
+        );
+        assert_eq!(
+            app.textarea_content(),
+            "half-typed draft",
+            "the restored draft must not be clobbered by the flush"
         );
     }
 
