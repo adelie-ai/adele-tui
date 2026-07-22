@@ -88,6 +88,38 @@ pub enum Action {
     ToggleVoiceIn,
     /// Toggle the keymap help overlay (`?` in Normal mode, or `F1` from anywhere).
     ToggleHelp,
+    /// Recall a queued message into the composer for editing, walking toward the
+    /// oldest (`Up` in edit mode when the composer is empty and a queue exists).
+    /// Dispatched only via [`editing_recall_action`]; the caller checks composer
+    /// emptiness + queue presence so an unmodified `Up` still moves the caret
+    /// when the user is mid-composing. The reducer owns the walk (`EditQueued`).
+    RecallQueued,
+    /// Step forward through the queued messages while editing one, or return the
+    /// checked-out message to the queue and clear the composer once past the
+    /// newest (`Down`, same gate as [`Action::RecallQueued`]).
+    RecallNext,
+}
+
+/// Decide whether an `Up`/`Down` key in edit mode should recall a queued message
+/// instead of moving the composer caret. Recall fires only when the composer is
+/// empty (so it does not fight caret movement while composing) AND there is a
+/// queue to walk (`has_queue`), and only for an unmodified arrow. Returns `None`
+/// to fall through to the normal keymap (which forwards a bare arrow to the
+/// textarea). Kept pure and separate from [`handle_key_event`] so the recall gate
+/// is unit-testable without threading composer state through the whole keymap.
+pub fn editing_recall_action(
+    key: KeyEvent,
+    composer_empty: bool,
+    has_queue: bool,
+) -> Option<Action> {
+    if !composer_empty || !has_queue || !key.modifiers.is_empty() {
+        return None;
+    }
+    match key.code {
+        KeyCode::Up => Some(Action::RecallQueued),
+        KeyCode::Down => Some(Action::RecallNext),
+        _ => None,
+    }
 }
 
 /// Handle key events that we intercept before passing to textarea.
@@ -588,6 +620,63 @@ mod tests {
             handle_key_event(key(KeyCode::Down), &InputMode::Editing, false),
             None
         );
+    }
+
+    // --- Queued-message recall gate (Up/Down in edit mode) ---
+
+    #[test]
+    fn up_recalls_queued_when_composer_empty_and_queue_present() {
+        assert_eq!(
+            editing_recall_action(key(KeyCode::Up), true, true),
+            Some(Action::RecallQueued)
+        );
+    }
+
+    #[test]
+    fn down_recalls_next_when_composer_empty_and_queue_present() {
+        assert_eq!(
+            editing_recall_action(key(KeyCode::Down), true, true),
+            Some(Action::RecallNext)
+        );
+    }
+
+    #[test]
+    fn up_does_not_recall_when_composer_non_empty() {
+        // A non-empty composer keeps Up as caret movement (forwarded to textarea).
+        assert_eq!(editing_recall_action(key(KeyCode::Up), false, true), None);
+        assert_eq!(editing_recall_action(key(KeyCode::Down), false, true), None);
+    }
+
+    #[test]
+    fn up_does_not_recall_when_queue_empty() {
+        assert_eq!(editing_recall_action(key(KeyCode::Up), true, false), None);
+        assert_eq!(editing_recall_action(key(KeyCode::Down), true, false), None);
+    }
+
+    #[test]
+    fn modified_arrows_never_recall() {
+        // Shift/Ctrl+Up must not hijack the queue walk (selection / scroll etc.).
+        assert_eq!(
+            editing_recall_action(key_with_mod(KeyCode::Up, KeyModifiers::SHIFT), true, true),
+            None
+        );
+        assert_eq!(
+            editing_recall_action(
+                key_with_mod(KeyCode::Down, KeyModifiers::CONTROL),
+                true,
+                true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn recall_gate_ignores_non_arrow_keys() {
+        assert_eq!(
+            editing_recall_action(key(KeyCode::Char('a')), true, true),
+            None
+        );
+        assert_eq!(editing_recall_action(key(KeyCode::Enter), true, true), None);
     }
 
     // --- Scroll tests (Ctrl+u/d/e work in all modes) ---
