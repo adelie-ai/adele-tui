@@ -186,6 +186,12 @@ pub struct App {
     /// When true, render tool/system/empty-assistant messages dimly inline
     /// instead of filtering them out. Persisted via `settings.json`.
     pub show_debug: bool,
+    /// When true, share basic device context (name, username, home folder,
+    /// hostname, timezone, OS) with the assistant at connect so it can
+    /// personalize. On by default; toggled with `Ctrl+O` and persisted via
+    /// `settings.json` (da#549). Read into the `ConnectionConfig` when the
+    /// connection is built, so a toggle applies on the next (re)connect.
+    pub share_client_context: bool,
     /// Transient indicator from AssistantStatus events ("Searching knowledge
     /// base…", tool-call progress). Cleared when streaming completes or
     /// errors. Distinct from `status_message`, which is sticky user-facing
@@ -262,6 +268,7 @@ impl App {
             rename_textarea: new_textarea(),
             renaming_id: None,
             show_debug: false,
+            share_client_context: true,
             assistant_status: None,
             context_usage: None,
             show_sidebar: true,

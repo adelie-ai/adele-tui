@@ -32,6 +32,11 @@ chat, tool calls, and background tasks.
 - **Debug view toggle** for tool and system messages, **conversation rename**,
   **auto-reconnect** with backoff, and a **keybind hint toolbar** at the
   bottom of the window.
+- **Share device info toggle** (`Ctrl+O`, on by default) - controls whether the
+  client tells the assistant your name, username, home folder, hostname,
+  timezone, and OS at connect so it can personalize; off means nothing about
+  your device is sent. Persisted in `settings.json`; applies on the next
+  (re)connect. Scriptable via `adele config set share-client-context on|off`.
 - **Embedded voice** (optional, off by default) — `Ctrl+G` dictates a prompt
   (mic → speech-to-text) straight into the composer and sends it; replies can
   be spoken back. Runs in-process with **no voice daemon and no wake word**.
@@ -113,7 +118,15 @@ adele config mcp add-server <NAME> --command <CMD> [--arg <A>]... \
 adele config mcp remove-server <NAME>
 adele config mcp enable  <NAME> [--surface tui]
 adele config mcp disable <NAME> [--surface tui]
+adele config get share-client-context           # print the current value
+adele config set share-client-context on|off    # share device info (default on)
 ```
+
+**Share device info** (`share-client-context`) is the scriptable twin of the
+`Ctrl+O` toggle: it persists to `settings.json`, and `off` stops the client from
+sending your name, username, home folder, hostname, timezone, and OS to the
+assistant at connect. Values are lenient (`on`/`off`, `true`/`false`, `yes`/`no`,
+`1`/`0`); the change applies on the next (re)connect.
 
 `config mcp list` also shows the compiled-in **built-in** servers (with tool
 counts) and their status: `disabled (config)` when you turned the built-in off

@@ -30,6 +30,11 @@ pub enum Action {
     SubmitRename,
     CancelRename,
     ToggleDebug,
+    /// Toggle the persisted "Share device info with the assistant" preference
+    /// (`Ctrl+O`, da#549 Phase 2b). Flips and saves
+    /// [`crate::settings::Settings::share_client_context`]; the new value shapes
+    /// the connect handshake on the next (re)connect.
+    ToggleShareClientContext,
     ToggleSidebar,
     SwitchConnection,
     OpenKnowledgeBase,
@@ -137,6 +142,10 @@ pub fn handle_key_event(
             KeyCode::Char('d') => Some(Action::ScrollDown),
             KeyCode::Char('e') => Some(Action::ScrollToBottom),
             KeyCode::Char('t') => Some(Action::ToggleDebug),
+            // Ctrl+O toggles the persisted "Share device info" preference
+            // (da#549). Like the other Ctrl toggles it shadows tui-textarea in
+            // Editing mode; Ctrl+O isn't a textarea binding, so nothing is lost.
+            KeyCode::Char('o') => Some(Action::ToggleShareClientContext),
             KeyCode::Char('b') => Some(Action::ToggleSidebar),
             KeyCode::Char('k') => Some(Action::OpenKnowledgeBase),
             KeyCode::Char('m') => Some(Action::OpenModelPicker),
@@ -289,6 +298,7 @@ pub fn help_sections() -> &'static [(&'static str, &'static [(&'static str, &'st
             &[
                 ("Ctrl+B", "toggle sidebar"),
                 ("Ctrl+T", "toggle debug messages"),
+                ("Ctrl+O", "share device info on/off"),
                 ("Ctrl+P", "tasks pane"),
             ],
         ),
@@ -742,6 +752,32 @@ mod tests {
                 false
             ),
             Some(Action::ToggleDebug)
+        );
+    }
+
+    // --- Share device info toggle (Ctrl+O, da#549 Phase 2b) ---
+
+    #[test]
+    fn ctrl_o_toggles_share_client_context_in_normal() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('o'), KeyModifiers::CONTROL),
+                &InputMode::Normal,
+                false
+            ),
+            Some(Action::ToggleShareClientContext)
+        );
+    }
+
+    #[test]
+    fn ctrl_o_toggles_share_client_context_in_editing() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('o'), KeyModifiers::CONTROL),
+                &InputMode::Editing,
+                false
+            ),
+            Some(Action::ToggleShareClientContext)
         );
     }
 
