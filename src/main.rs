@@ -41,7 +41,7 @@ use adele::in_flight::InFlight;
 use adele::keys::{Action, handle_key_event};
 use adele::picker::PickerOutcome;
 use adele::profile::ProfileStore;
-use adele::settings::Settings;
+use adele::settings::{Settings, default_settings_path};
 use adele::voice::{VoiceConfig, VoiceSession};
 use adele::voice_client::VoiceController;
 use adele::{
@@ -178,6 +178,22 @@ enum ConfigCommand {
     },
     /// Manage client-hosted MCP servers.
     Mcp(McpArgs),
+    /// Set a client-local preference in `settings.json`.
+    ///
+    /// Currently the only key is `share-client-context` (the "Share device info
+    /// with the assistant" off-switch, da#549), e.g.
+    /// `adele config set share-client-context off`.
+    Set {
+        /// Setting key (e.g. `share-client-context`).
+        key: String,
+        /// New value: `on`/`off` (also `true`/`false`, `yes`/`no`, `1`/`0`).
+        value: String,
+    },
+    /// Print a client-local preference's current value from `settings.json`.
+    Get {
+        /// Setting key (e.g. `share-client-context`).
+        key: String,
+    },
 }
 
 /// `config mcp` subcommand group.
@@ -310,6 +326,18 @@ fn run_config(command: &ConfigCommand) -> Result<()> {
         ConfigCommand::Path => cc::config_path(&path, &mut out),
         ConfigCommand::Show { section } => cc::config_show(&path, section.as_deref(), &mut out),
         ConfigCommand::Mcp(mcp) => run_config_mcp(&path, &mcp.command, &mut out),
+        ConfigCommand::Set { key, value } => {
+            let settings_path = default_settings_path().ok_or_else(|| {
+                anyhow::anyhow!("could not resolve the settings path (set HOME or XDG_CONFIG_HOME)")
+            })?;
+            cc::config_set(&settings_path, key, value, &mut out)
+        }
+        ConfigCommand::Get { key } => {
+            let settings_path = default_settings_path().ok_or_else(|| {
+                anyhow::anyhow!("could not resolve the settings path (set HOME or XDG_CONFIG_HOME)")
+            })?;
+            cc::config_get(&settings_path, key, &mut out)
+        }
     }
 }
 
@@ -469,7 +497,10 @@ async fn main() -> Result<()> {
         _ => cli.global.prompt.clone(),
     };
     if let Some(prompt) = exec_prompt {
-        let config: ConnectionConfig = cli.global.into();
+        let mut config: ConnectionConfig = cli.global.into();
+        // Honor the persisted device-info off-switch in headless mode too, so a
+        // scripted `exec` shares (or withholds) the same context the TUI would.
+        Settings::load().apply_to_connection(&mut config);
         return run_headless(&config, prompt).await;
     }
 
@@ -695,6 +726,11 @@ async fn run_app(
             }
         }
     };
+    // Overlay the persisted client-local preferences (da#549: the device-info
+    // off-switch). `ConnectionConfig` defaults sharing on, so this only changes
+    // the handshake when the user opted out. Loaded fresh so a `config set` (or a
+    // prior session's `Ctrl+O`) is honored on this connect.
+    Settings::load().apply_to_connection(&mut config);
 
     loop {
         match run(terminal, &config).await? {
@@ -707,11 +743,25 @@ async fn run_app(
                 match picker::run(terminal, store).await?.0 {
                     PickerOutcome::Selected(profile) => {
                         config = profile.to_connection_config();
+                        // Re-apply on switch so a mid-session `Ctrl+O` toggle
+                        // takes effect on the newly selected connection.
+                        Settings::load().apply_to_connection(&mut config);
                     }
                     PickerOutcome::Cancelled => return Ok(()),
                 }
             }
         }
+    }
+}
+
+/// Snapshot the persisted preferences off live [`App`] state into a [`Settings`]
+/// for saving. Both preference toggles (`Ctrl+T` debug, `Ctrl+O` share-device-
+/// info) write through this so flipping one never clobbers another's on-disk
+/// value.
+fn settings_from_app(app: &App) -> Settings {
+    Settings {
+        show_debug: app.show_debug,
+        share_client_context: app.share_client_context,
     }
 }
 
@@ -722,6 +772,7 @@ async fn run(
     let mut app = App::new();
     let settings = Settings::load();
     app.show_debug = settings.show_debug;
+    app.share_client_context = settings.share_client_context;
 
     // Start any client-side MCP servers configured for the `tui` surface and hold
     // the host in `App` so its tools are advertised (register) and routed
@@ -2020,9 +2071,7 @@ async fn handle_action(
         Action::CancelRename => app.cancel_rename(),
         Action::ToggleDebug => {
             app.show_debug = !app.show_debug;
-            let settings = Settings {
-                show_debug: app.show_debug,
-            };
+            let settings = settings_from_app(app);
             if let Err(e) = settings.save() {
                 app.status_message = format!("Settings save failed: {e}");
             } else {
@@ -2030,6 +2079,26 @@ async fn handle_action(
                     "Debug view ON (showing tool/system messages)".into()
                 } else {
                     "Debug view OFF".into()
+                };
+            }
+        }
+        Action::ToggleShareClientContext => {
+            app.share_client_context = !app.share_client_context;
+            let settings = settings_from_app(app);
+            if let Err(e) = settings.save() {
+                app.status_message = format!("Settings save failed: {e}");
+            } else {
+                // "Share device info with the assistant": name, username, home
+                // folder, hostname, timezone, OS. Off = nothing about your
+                // device is sent. Applies on the next (re)connect.
+                app.status_message = if app.share_client_context {
+                    "Share device info: ON - name, username, home folder, hostname, \
+                     timezone, OS (applies on next reconnect)"
+                        .into()
+                } else {
+                    "Share device info: OFF - nothing about your device is sent \
+                     (applies on next reconnect)"
+                        .into()
                 };
             }
         }
@@ -2904,9 +2973,8 @@ mod tests {
 
     #[test]
     fn config_set_share_client_context_parses() {
-        let cli =
-            CliArgs::try_parse_from(args(&["config", "set", "share-client-context", "off"]))
-                .unwrap();
+        let cli = CliArgs::try_parse_from(args(&["config", "set", "share-client-context", "off"]))
+            .unwrap();
         match cli.command {
             Some(Command::Config(ConfigArgs {
                 command: ConfigCommand::Set { key, value },

@@ -11,9 +11,12 @@
 //! unit-testable against a tempfile and an in-memory buffer with no real daemon,
 //! filesystem-global state, or terminal.
 //!
-//! Scope: this manages the **client-side** MCP config only. Daemon-hosted MCP
-//! servers are out of this first cut (they need a live connection + the typed
-//! command channel the `F5` panel uses); [`mcp_list`] says so in its output.
+//! Scope: this manages the **client-side** MCP config (`client-mcp.toml`) and,
+//! via [`config_set`] / [`config_get`], the client-local preferences in
+//! `settings.json` (currently the `share-client-context` device-info off-switch,
+//! da#549). Daemon-hosted MCP servers are out of this cut (they need a live
+//! connection + the typed command channel the `F5` panel uses); [`mcp_list`]
+//! says so in its output.
 //!
 //! [`default_client_mcp_path`]: desktop_assistant_client_common::mcp_host::default_client_mcp_path
 
@@ -23,6 +26,8 @@ use std::path::Path;
 
 use anyhow::{Result, anyhow, bail};
 use desktop_assistant_client_common::mcp_host::{ClientMcpConfig, McpServerConfig};
+
+use crate::settings::Settings;
 
 /// The default client surface the `config mcp` subcommands act on when none is
 /// given — the TUI's own surface. Mirrors the `"tui"` surface string the
@@ -302,6 +307,70 @@ pub fn mcp_set_enabled(
         bail!("no such client-MCP server: '{name}'");
     }
     Ok(())
+}
+
+/// The `config set`/`config get` key for the "Share device info with the
+/// assistant" preference ([`Settings::share_client_context`], da#549).
+pub const SHARE_CLIENT_CONTEXT_KEY: &str = "share-client-context";
+
+/// `config set <KEY> <VALUE>`: persist a client-local preference to the
+/// `settings.json` at `path`.
+///
+/// Only [`SHARE_CLIENT_CONTEXT_KEY`] is recognized today; any other key is a
+/// clear error naming the known key rather than a silent no-op. The value is
+/// parsed leniently (`on`/`off`, `true`/`false`, `yes`/`no`, `1`/`0`, any case)
+/// but strictly rejects anything else -- an unparseable value never touches the
+/// file. Other settings in the file are preserved (load, mutate one field,
+/// save).
+pub fn config_set(path: &Path, key: &str, value: &str, out: &mut impl Write) -> Result<()> {
+    match key {
+        SHARE_CLIENT_CONTEXT_KEY => {
+            // Parse BEFORE loading/saving so a bad value leaves the file untouched.
+            let on = parse_on_off(value)?;
+            let mut settings = Settings::load_from(path);
+            settings.share_client_context = on;
+            settings
+                .save_to(path)
+                .map_err(|e| anyhow!("saving settings to {}: {e}", path.display()))?;
+            writeln!(out, "{SHARE_CLIENT_CONTEXT_KEY} = {}", on_off(on))?;
+            Ok(())
+        }
+        other => bail!("unknown setting '{other}'; known keys: {SHARE_CLIENT_CONTEXT_KEY}"),
+    }
+}
+
+/// `config get <KEY>`: print a client-local preference's current value from the
+/// `settings.json` at `path` (an absent file reports the default). Unknown keys
+/// error the same way [`config_set`] does.
+pub fn config_get(path: &Path, key: &str, out: &mut impl Write) -> Result<()> {
+    match key {
+        SHARE_CLIENT_CONTEXT_KEY => {
+            let settings = Settings::load_from(path);
+            writeln!(
+                out,
+                "{SHARE_CLIENT_CONTEXT_KEY} = {}",
+                on_off(settings.share_client_context)
+            )?;
+            Ok(())
+        }
+        other => bail!("unknown setting '{other}'; known keys: {SHARE_CLIENT_CONTEXT_KEY}"),
+    }
+}
+
+/// Render a boolean preference as the `on`/`off` token the CLI reads and writes.
+fn on_off(value: bool) -> &'static str {
+    if value { "on" } else { "off" }
+}
+
+/// Parse a human on/off value. Lenient in encoding (accepts `on`/`off`,
+/// `true`/`false`, `yes`/`no`, `1`/`0`, any case, surrounding whitespace),
+/// strict in value (anything else is a clear error, never a silent default).
+fn parse_on_off(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Ok(true),
+        "off" | "false" | "no" | "0" => Ok(false),
+        other => bail!("invalid value '{other}'; use on/off (also true/false, yes/no, 1/0)"),
+    }
 }
 
 #[cfg(test)]
@@ -733,7 +802,10 @@ mod tests {
         .expect("seed");
         config_set(&path, SHARE_CLIENT_CONTEXT_KEY, "off", &mut Vec::new()).expect("set");
         let back = Settings::load_from(&path);
-        assert!(back.show_debug, "flipping one setting must not clobber another");
+        assert!(
+            back.show_debug,
+            "flipping one setting must not clobber another"
+        );
         assert!(!back.share_client_context);
     }
 
@@ -742,11 +814,17 @@ mod tests {
         let (_dir, path) = temp_settings();
         for on in ["on", "true", "yes", "1", "ON", "True"] {
             config_set(&path, SHARE_CLIENT_CONTEXT_KEY, on, &mut Vec::new()).expect("on-ish");
-            assert!(Settings::load_from(&path).share_client_context, "{on} => true");
+            assert!(
+                Settings::load_from(&path).share_client_context,
+                "{on} => true"
+            );
         }
         for off in ["off", "false", "no", "0", "OFF", "False"] {
             config_set(&path, SHARE_CLIENT_CONTEXT_KEY, off, &mut Vec::new()).expect("off-ish");
-            assert!(!Settings::load_from(&path).share_client_context, "{off} => false");
+            assert!(
+                !Settings::load_from(&path).share_client_context,
+                "{off} => false"
+            );
         }
     }
 
@@ -760,7 +838,10 @@ mod tests {
             "the error explains the accepted values: {err}"
         );
         // A rejected value must not have written the file.
-        assert!(!path.exists(), "a rejected set must not create the settings file");
+        assert!(
+            !path.exists(),
+            "a rejected set must not create the settings file"
+        );
     }
 
     #[test]
@@ -783,7 +864,10 @@ mod tests {
         assert!(on.contains("on"), "get reports the default (on): {on}");
         config_set(&path, SHARE_CLIENT_CONTEXT_KEY, "off", &mut Vec::new()).expect("off");
         let off = out_string(|o| config_get(&path, SHARE_CLIENT_CONTEXT_KEY, o));
-        assert!(off.contains("off"), "get reflects the persisted value: {off}");
+        assert!(
+            off.contains("off"),
+            "get reflects the persisted value: {off}"
+        );
     }
 
     #[test]
