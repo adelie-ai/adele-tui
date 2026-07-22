@@ -745,6 +745,32 @@ mod tests {
         );
     }
 
+    // --- Share device info toggle (Ctrl+O, da#549 Phase 2b) ---
+
+    #[test]
+    fn ctrl_o_toggles_share_client_context_in_normal() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('o'), KeyModifiers::CONTROL),
+                &InputMode::Normal,
+                false
+            ),
+            Some(Action::ToggleShareClientContext)
+        );
+    }
+
+    #[test]
+    fn ctrl_o_toggles_share_client_context_in_editing() {
+        assert_eq!(
+            handle_key_event(
+                key_with_mod(KeyCode::Char('o'), KeyModifiers::CONTROL),
+                &InputMode::Editing,
+                false
+            ),
+            Some(Action::ToggleShareClientContext)
+        );
+    }
+
     // --- Sidebar toggle (Ctrl+B) ---
 
     #[test]

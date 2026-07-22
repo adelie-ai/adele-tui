@@ -2902,6 +2902,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn config_set_share_client_context_parses() {
+        let cli =
+            CliArgs::try_parse_from(args(&["config", "set", "share-client-context", "off"]))
+                .unwrap();
+        match cli.command {
+            Some(Command::Config(ConfigArgs {
+                command: ConfigCommand::Set { key, value },
+            })) => {
+                assert_eq!(key, "share-client-context");
+                assert_eq!(value, "off");
+            }
+            other => panic!("expected config set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_get_share_client_context_parses() {
+        let cli =
+            CliArgs::try_parse_from(args(&["config", "get", "share-client-context"])).unwrap();
+        match cli.command {
+            Some(Command::Config(ConfigArgs {
+                command: ConfigCommand::Get { key },
+            })) => assert_eq!(key, "share-client-context"),
+            other => panic!("expected config get, got {other:?}"),
+        }
+    }
+
     // --- Panic hook (TUI-1) ---
 
     #[test]

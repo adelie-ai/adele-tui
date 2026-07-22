@@ -691,4 +691,106 @@ mod tests {
             "path prints the config location: {printed}"
         );
     }
+
+    // --- Client preferences: share-client-context (da#549 Phase 2b) ---
+
+    /// A fresh tempdir + a settings.json path inside it (the file does not yet
+    /// exist, exercising the load-absent-as-default path).
+    fn temp_settings() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        (dir, path)
+    }
+
+    #[test]
+    fn set_share_client_context_off_persists_and_reloads() {
+        let (_dir, path) = temp_settings();
+        let out = out_string(|o| config_set(&path, SHARE_CLIENT_CONTEXT_KEY, "off", o));
+        assert!(out.contains("off"), "set echoes the new value: {out}");
+        // The change survives a reload (and nothing else in the file matters).
+        assert!(!Settings::load_from(&path).share_client_context);
+    }
+
+    #[test]
+    fn set_share_client_context_on_persists_and_reloads() {
+        let (_dir, path) = temp_settings();
+        // Turn it off, then back on, to prove `on` actually writes true.
+        config_set(&path, SHARE_CLIENT_CONTEXT_KEY, "off", &mut Vec::new()).expect("off");
+        let out = out_string(|o| config_set(&path, SHARE_CLIENT_CONTEXT_KEY, "on", o));
+        assert!(out.contains("on"), "set echoes the new value: {out}");
+        assert!(Settings::load_from(&path).share_client_context);
+    }
+
+    #[test]
+    fn set_preserves_other_settings() {
+        let (_dir, path) = temp_settings();
+        // Seed a non-default show_debug, then flip share-client-context.
+        Settings {
+            show_debug: true,
+            share_client_context: true,
+        }
+        .save_to(&path)
+        .expect("seed");
+        config_set(&path, SHARE_CLIENT_CONTEXT_KEY, "off", &mut Vec::new()).expect("set");
+        let back = Settings::load_from(&path);
+        assert!(back.show_debug, "flipping one setting must not clobber another");
+        assert!(!back.share_client_context);
+    }
+
+    #[test]
+    fn set_accepts_true_false_yes_no_one_zero() {
+        let (_dir, path) = temp_settings();
+        for on in ["on", "true", "yes", "1", "ON", "True"] {
+            config_set(&path, SHARE_CLIENT_CONTEXT_KEY, on, &mut Vec::new()).expect("on-ish");
+            assert!(Settings::load_from(&path).share_client_context, "{on} => true");
+        }
+        for off in ["off", "false", "no", "0", "OFF", "False"] {
+            config_set(&path, SHARE_CLIENT_CONTEXT_KEY, off, &mut Vec::new()).expect("off-ish");
+            assert!(!Settings::load_from(&path).share_client_context, "{off} => false");
+        }
+    }
+
+    #[test]
+    fn set_rejects_invalid_value() {
+        let (_dir, path) = temp_settings();
+        let err = config_set(&path, SHARE_CLIENT_CONTEXT_KEY, "maybe", &mut Vec::new())
+            .expect_err("an unparseable value is rejected");
+        assert!(
+            err.to_string().contains("maybe") || err.to_string().contains("on/off"),
+            "the error explains the accepted values: {err}"
+        );
+        // A rejected value must not have written the file.
+        assert!(!path.exists(), "a rejected set must not create the settings file");
+    }
+
+    #[test]
+    fn set_rejects_unknown_key() {
+        let (_dir, path) = temp_settings();
+        let err = config_set(&path, "no-such-setting", "on", &mut Vec::new())
+            .expect_err("an unknown key is rejected");
+        assert!(
+            err.to_string().contains("no-such-setting")
+                || err.to_string().contains(SHARE_CLIENT_CONTEXT_KEY),
+            "the error names the offending/known key: {err}"
+        );
+    }
+
+    #[test]
+    fn get_reports_current_value() {
+        let (_dir, path) = temp_settings();
+        // Absent file => default on.
+        let on = out_string(|o| config_get(&path, SHARE_CLIENT_CONTEXT_KEY, o));
+        assert!(on.contains("on"), "get reports the default (on): {on}");
+        config_set(&path, SHARE_CLIENT_CONTEXT_KEY, "off", &mut Vec::new()).expect("off");
+        let off = out_string(|o| config_get(&path, SHARE_CLIENT_CONTEXT_KEY, o));
+        assert!(off.contains("off"), "get reflects the persisted value: {off}");
+    }
+
+    #[test]
+    fn get_rejects_unknown_key() {
+        let (_dir, path) = temp_settings();
+        let err = config_get(&path, "no-such-setting", &mut Vec::new())
+            .expect_err("an unknown key is rejected");
+        assert!(err.to_string().contains("no-such-setting") || err.to_string().contains("known"));
+    }
 }
