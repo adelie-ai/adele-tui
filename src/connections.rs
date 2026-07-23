@@ -55,18 +55,31 @@ use crate::theme::theme;
 pub enum ConnectorKind {
     Anthropic,
     OpenAi,
+    OpenRouter,
+    Azure,
+    Google,
     Bedrock,
     Ollama,
 }
 
 impl ConnectorKind {
-    const ALL: &'static [ConnectorKind] =
-        &[Self::Anthropic, Self::OpenAi, Self::Bedrock, Self::Ollama];
+    const ALL: &'static [ConnectorKind] = &[
+        Self::Anthropic,
+        Self::OpenAi,
+        Self::OpenRouter,
+        Self::Azure,
+        Self::Google,
+        Self::Bedrock,
+        Self::Ollama,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Anthropic => "Anthropic",
             Self::OpenAi => "OpenAI",
+            Self::OpenRouter => "OpenRouter",
+            Self::Azure => "Azure",
+            Self::Google => "Google",
             Self::Bedrock => "Bedrock",
             Self::Ollama => "Ollama",
         }
@@ -77,6 +90,9 @@ impl ConnectorKind {
         match self {
             Self::Anthropic => "anthropic",
             Self::OpenAi => "openai",
+            Self::OpenRouter => "openrouter",
+            Self::Azure => "azure",
+            Self::Google => "google",
             Self::Bedrock => "bedrock",
             Self::Ollama => "ollama",
         }
@@ -113,6 +129,16 @@ enum Field {
     BaseUrl,
     AwsProfile,
     Region,
+    // Azure-specific knobs.
+    ApiSurface,
+    ApiVersion,
+    // Google (Vertex / Gemini) specific knobs.
+    Project,
+    Location,
+    CredentialsPath,
+    // Shared by Azure (api_key|entra) and Google (vertex|api_key); the
+    // allowed-value hint is rendered per-kind.
+    AuthMode,
 }
 
 struct EditForm {
@@ -126,6 +152,12 @@ struct EditForm {
     base_url: TextArea<'static>,
     aws_profile: TextArea<'static>,
     region: TextArea<'static>,
+    api_surface: TextArea<'static>,
+    auth_mode: TextArea<'static>,
+    api_version: TextArea<'static>,
+    project: TextArea<'static>,
+    location: TextArea<'static>,
+    credentials_path: TextArea<'static>,
 }
 
 impl EditForm {
@@ -139,6 +171,12 @@ impl EditForm {
             base_url: single_line_textarea(),
             aws_profile: single_line_textarea(),
             region: single_line_textarea(),
+            api_surface: single_line_textarea(),
+            auth_mode: single_line_textarea(),
+            api_version: single_line_textarea(),
+            project: single_line_textarea(),
+            location: single_line_textarea(),
+            credentials_path: single_line_textarea(),
         }
     }
 
@@ -149,19 +187,124 @@ impl EditForm {
         form.id.move_cursor(CursorMove::End);
         form.kind =
             ConnectorKind::from_tag(&view.connector_type).unwrap_or(ConnectorKind::Anthropic);
-        // Note: the daemon's `ConnectionView` doesn't echo the config back
-        // (no secrets at rest, nothing to repopulate). The form starts blank
-        // for the type-specific fields; if the user saves without filling
-        // them in, the daemon's UpdateConnection accepts None for optional
-        // fields and falls back to defaults.
+        // Pre-fill the type-specific fields from the daemon's echoed non-secret
+        // config so editing a connection doesn't blank its stored endpoint,
+        // region, project, or credential env-var *name*. The view never carries
+        // a raw secret value (only the api_key_env name), so this repopulates
+        // exactly what CreateConnection / UpdateConnection would accept. When
+        // the daemon omits `config` (older daemon), the fields stay blank and
+        // the daemon keeps its stored values on save.
+        if let Some(config) = &view.config {
+            form.prefill_from_config(config);
+        }
         form
+    }
+
+    /// Populate the per-kind text fields from an echoed [`ConnectionConfigView`].
+    /// Each variant is handled explicitly so a newly-added connector can't be
+    /// silently swallowed by a wildcard and lose its fields on edit.
+    fn prefill_from_config(&mut self, config: &ConnectionConfigView) {
+        fn set(ta: &mut TextArea<'static>, value: &Option<String>) {
+            if let Some(s) = value {
+                ta.insert_str(s.as_str());
+                ta.move_cursor(CursorMove::End);
+            }
+        }
+        match config {
+            ConnectionConfigView::Anthropic {
+                base_url,
+                api_key_env,
+                ..
+            }
+            | ConnectionConfigView::OpenAi {
+                base_url,
+                api_key_env,
+                ..
+            }
+            | ConnectionConfigView::OpenRouter {
+                base_url,
+                api_key_env,
+                ..
+            } => {
+                set(&mut self.api_key_env, api_key_env);
+                set(&mut self.base_url, base_url);
+            }
+            ConnectionConfigView::Azure {
+                base_url,
+                api_key_env,
+                api_surface,
+                auth_mode,
+                api_version,
+                ..
+            } => {
+                set(&mut self.base_url, base_url);
+                set(&mut self.api_key_env, api_key_env);
+                set(&mut self.api_surface, api_surface);
+                set(&mut self.auth_mode, auth_mode);
+                set(&mut self.api_version, api_version);
+            }
+            ConnectionConfigView::Google {
+                base_url,
+                api_key_env,
+                project,
+                location,
+                auth_mode,
+                credentials_path,
+                ..
+            } => {
+                set(&mut self.api_key_env, api_key_env);
+                set(&mut self.project, project);
+                set(&mut self.location, location);
+                set(&mut self.auth_mode, auth_mode);
+                set(&mut self.credentials_path, credentials_path);
+                set(&mut self.base_url, base_url);
+            }
+            ConnectionConfigView::Bedrock {
+                aws_profile,
+                region,
+                base_url,
+                ..
+            } => {
+                set(&mut self.aws_profile, aws_profile);
+                set(&mut self.region, region);
+                set(&mut self.base_url, base_url);
+            }
+            ConnectionConfigView::Ollama { base_url, .. } => {
+                set(&mut self.base_url, base_url);
+            }
+        }
     }
 
     fn fields_for_kind(kind: ConnectorKind) -> &'static [Field] {
         match kind {
-            ConnectorKind::Anthropic | ConnectorKind::OpenAi => {
+            ConnectorKind::Anthropic | ConnectorKind::OpenAi | ConnectorKind::OpenRouter => {
                 &[Field::Id, Field::Type, Field::ApiKeyEnv, Field::BaseUrl]
             }
+            // Azure OpenAI: the resource endpoint (base_url) is effectively
+            // required, so it leads; api_version only applies to the classic
+            // surface but is always offered (the daemon ignores it under v1).
+            ConnectorKind::Azure => &[
+                Field::Id,
+                Field::Type,
+                Field::BaseUrl,
+                Field::ApiKeyEnv,
+                Field::ApiSurface,
+                Field::AuthMode,
+                Field::ApiVersion,
+            ],
+            // Google Vertex / Gemini: project + location drive Vertex;
+            // credentials_path is the SA JSON for Vertex; base_url is usually
+            // blank (Gemini API variant), so it trails.
+            ConnectorKind::Google => &[
+                Field::Id,
+                Field::Type,
+                Field::ApiKeyEnv,
+                Field::Project,
+                Field::Location,
+                Field::AuthMode,
+                Field::CredentialsPath,
+                Field::BaseUrl,
+            ],
             ConnectorKind::Bedrock => &[
                 Field::Id,
                 Field::Type,
@@ -212,6 +355,39 @@ impl EditForm {
             ConnectorKind::OpenAi => ConnectionConfigView::OpenAi {
                 base_url: opt(&self.base_url),
                 api_key_env: opt(&self.api_key_env),
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
+            },
+            ConnectorKind::OpenRouter => ConnectionConfigView::OpenRouter {
+                base_url: opt(&self.base_url),
+                api_key_env: opt(&self.api_key_env),
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
+            },
+            ConnectorKind::Azure => ConnectionConfigView::Azure {
+                base_url: opt(&self.base_url),
+                api_key_env: opt(&self.api_key_env),
+                // Enum knobs: a blank field becomes `None`, letting the daemon
+                // apply its primary default (api_surface = v1, auth_mode =
+                // api_key). A typed value rides through verbatim for the daemon
+                // to validate.
+                api_surface: opt(&self.api_surface),
+                auth_mode: opt(&self.auth_mode),
+                api_version: opt(&self.api_version),
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
+            },
+            ConnectorKind::Google => ConnectionConfigView::Google {
+                base_url: opt(&self.base_url),
+                api_key_env: opt(&self.api_key_env),
+                project: opt(&self.project),
+                location: opt(&self.location),
+                // Blank auth_mode becomes `None` -> daemon default `vertex`.
+                auth_mode: opt(&self.auth_mode),
+                credentials_path: opt(&self.credentials_path),
                 connect_timeout_secs: None,
                 stream_timeout_secs: None,
                 max_context_tokens: None,
@@ -440,6 +616,24 @@ fn handle_edit_key<'a>(
                 }
                 Field::Region => {
                     state.form.region.input(key);
+                }
+                Field::ApiSurface => {
+                    state.form.api_surface.input(key);
+                }
+                Field::AuthMode => {
+                    state.form.auth_mode.input(key);
+                }
+                Field::ApiVersion => {
+                    state.form.api_version.input(key);
+                }
+                Field::Project => {
+                    state.form.project.input(key);
+                }
+                Field::Location => {
+                    state.form.location.input(key);
+                }
+                Field::CredentialsPath => {
+                    state.form.credentials_path.input(key);
                 }
                 Field::Type => {}
             }
@@ -800,17 +994,35 @@ fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
                 draw_type_toggle(f, input_row, state, focused);
             }
             Field::ApiKeyEnv => {
+                // The default env-var name is connector-specific; hint the one
+                // the daemon assumes for this kind so an empty field is clear.
+                let example = match state.form.kind {
+                    ConnectorKind::Azure => "AZURE_OPENAI_API_KEY",
+                    ConnectorKind::Google => "GOOGLE_API_KEY",
+                    ConnectorKind::OpenAi => "OPENAI_API_KEY",
+                    ConnectorKind::OpenRouter => "OPENROUTER_API_KEY",
+                    _ => "ANTHROPIC_API_KEY",
+                };
                 draw_field_label(
                     f,
                     label_row,
-                    "API key env var name (e.g. ANTHROPIC_API_KEY)",
+                    &format!("API key env var name (e.g. {example})"),
                     focused,
                 );
-                draw_text_field(f, input_row, &state.form.api_key_env, focused);
+                draw_text_field_hinted(f, input_row, &state.form.api_key_env, focused, example);
             }
             Field::BaseUrl => {
-                draw_field_label(f, label_row, "Base URL (optional)", focused);
-                draw_text_field(f, input_row, &state.form.base_url, focused);
+                // Azure's base_url is the resource endpoint and effectively
+                // required; for everyone else it's an optional override.
+                let (label, placeholder) = match state.form.kind {
+                    ConnectorKind::Azure => (
+                        "Resource endpoint (required)",
+                        "https://<resource>.openai.azure.com",
+                    ),
+                    _ => ("Base URL (optional)", ""),
+                };
+                draw_field_label(f, label_row, label, focused);
+                draw_text_field_hinted(f, input_row, &state.form.base_url, focused, placeholder);
             }
             Field::AwsProfile => {
                 draw_field_label(f, label_row, "AWS profile (optional)", focused);
@@ -819,6 +1031,70 @@ fn draw_edit_form(f: &mut Frame, state: &State, area: Rect) {
             Field::Region => {
                 draw_field_label(f, label_row, "AWS region (e.g. us-east-1)", focused);
                 draw_text_field(f, input_row, &state.form.region, focused);
+            }
+            Field::ApiSurface => {
+                draw_field_label(f, label_row, "API surface", focused);
+                draw_text_field_hinted(
+                    f,
+                    input_row,
+                    &state.form.api_surface,
+                    focused,
+                    "v1 | classic  (default: v1)",
+                );
+            }
+            Field::AuthMode => {
+                // Allowed values differ by kind; show the right set + default.
+                let placeholder = match state.form.kind {
+                    ConnectorKind::Google => "vertex | api_key  (default: vertex)",
+                    _ => "api_key | entra  (default: api_key)",
+                };
+                draw_field_label(f, label_row, "Auth mode", focused);
+                draw_text_field_hinted(f, input_row, &state.form.auth_mode, focused, placeholder);
+            }
+            Field::ApiVersion => {
+                draw_field_label(f, label_row, "API version (classic surface only)", focused);
+                draw_text_field_hinted(
+                    f,
+                    input_row,
+                    &state.form.api_version,
+                    focused,
+                    "e.g. 2024-10-21",
+                );
+            }
+            Field::Project => {
+                draw_field_label(f, label_row, "GCP project (Vertex)", focused);
+                draw_text_field_hinted(
+                    f,
+                    input_row,
+                    &state.form.project,
+                    focused,
+                    "my-gcp-project",
+                );
+            }
+            Field::Location => {
+                draw_field_label(f, label_row, "Location / region (Vertex)", focused);
+                draw_text_field_hinted(
+                    f,
+                    input_row,
+                    &state.form.location,
+                    focused,
+                    "e.g. us-central1",
+                );
+            }
+            Field::CredentialsPath => {
+                draw_field_label(
+                    f,
+                    label_row,
+                    "Service-account JSON path (Vertex, optional)",
+                    focused,
+                );
+                draw_text_field_hinted(
+                    f,
+                    input_row,
+                    &state.form.credentials_path,
+                    focused,
+                    "/path/to/service-account.json",
+                );
             }
         }
     }
@@ -871,7 +1147,23 @@ fn draw_field_label(f: &mut Frame, area: Rect, label: &str, focused: bool) {
 }
 
 fn draw_text_field(f: &mut Frame, area: Rect, textarea: &TextArea<'static>, focused: bool) {
+    draw_text_field_hinted(f, area, textarea, focused, "");
+}
+
+/// Like [`draw_text_field`] but shows `placeholder` (dimmed) while the field is
+/// empty. Used for the enum knobs (api_surface / auth_mode) and other
+/// free-text-but-constrained fields to list allowed values / examples inline.
+fn draw_text_field_hinted(
+    f: &mut Frame,
+    area: Rect,
+    textarea: &TextArea<'static>,
+    focused: bool,
+    placeholder: &str,
+) {
     let mut ta = textarea.clone();
+    if !placeholder.is_empty() {
+        ta.set_placeholder_text(placeholder);
+    }
     let border_color = if focused {
         theme().border_active
     } else {
@@ -1002,9 +1294,17 @@ mod tests {
 
     #[test]
     fn connector_kind_next_prev_cycle() {
+        // Picker order: Anthropic, OpenAI, OpenRouter, Azure, Google, Bedrock,
+        // Ollama. Azure and Google slot between OpenRouter and Bedrock.
         assert_eq!(ConnectorKind::Anthropic.next(), ConnectorKind::OpenAi);
+        assert_eq!(ConnectorKind::OpenAi.next(), ConnectorKind::OpenRouter);
+        assert_eq!(ConnectorKind::OpenRouter.next(), ConnectorKind::Azure);
+        assert_eq!(ConnectorKind::Azure.next(), ConnectorKind::Google);
+        assert_eq!(ConnectorKind::Google.next(), ConnectorKind::Bedrock);
         assert_eq!(ConnectorKind::Ollama.next(), ConnectorKind::Anthropic);
         assert_eq!(ConnectorKind::Anthropic.prev(), ConnectorKind::Ollama);
+        assert_eq!(ConnectorKind::Google.prev(), ConnectorKind::Azure);
+        assert_eq!(ConnectorKind::Azure.prev(), ConnectorKind::OpenRouter);
     }
 
     #[test]
@@ -1021,6 +1321,31 @@ mod tests {
         let anthropic_fields = EditForm::fields_for_kind(ConnectorKind::Anthropic);
         assert!(anthropic_fields.contains(&Field::ApiKeyEnv));
         assert!(!anthropic_fields.contains(&Field::Region));
+
+        let openrouter_fields = EditForm::fields_for_kind(ConnectorKind::OpenRouter);
+        assert!(openrouter_fields.contains(&Field::ApiKeyEnv));
+        assert!(openrouter_fields.contains(&Field::BaseUrl));
+        assert!(!openrouter_fields.contains(&Field::Region));
+
+        let azure_fields = EditForm::fields_for_kind(ConnectorKind::Azure);
+        assert!(azure_fields.contains(&Field::ApiKeyEnv));
+        assert!(azure_fields.contains(&Field::BaseUrl));
+        assert!(azure_fields.contains(&Field::ApiSurface));
+        assert!(azure_fields.contains(&Field::AuthMode));
+        assert!(azure_fields.contains(&Field::ApiVersion));
+        // Azure must not surface Google/Bedrock-only fields.
+        assert!(!azure_fields.contains(&Field::Project));
+        assert!(!azure_fields.contains(&Field::Region));
+
+        let google_fields = EditForm::fields_for_kind(ConnectorKind::Google);
+        assert!(google_fields.contains(&Field::ApiKeyEnv));
+        assert!(google_fields.contains(&Field::Project));
+        assert!(google_fields.contains(&Field::Location));
+        assert!(google_fields.contains(&Field::AuthMode));
+        assert!(google_fields.contains(&Field::CredentialsPath));
+        // Google must not surface Azure/Bedrock-only fields.
+        assert!(!google_fields.contains(&Field::ApiSurface));
+        assert!(!google_fields.contains(&Field::Region));
     }
 
     #[test]
@@ -1059,6 +1384,177 @@ mod tests {
             }
             other => panic!("expected Anthropic, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn submit_openrouter_emits_correct_variant() {
+        let mut form = EditForm::empty();
+        form.id.insert_str("router");
+        form.api_key_env.insert_str("OPENROUTER_API_KEY");
+        form.base_url.insert_str("https://openrouter.ai/api/v1");
+        form.kind = ConnectorKind::OpenRouter;
+        let (id, config) = form.submit().unwrap();
+        assert_eq!(id, "router");
+        match config {
+            ConnectionConfigView::OpenRouter {
+                api_key_env,
+                base_url,
+                ..
+            } => {
+                assert_eq!(api_key_env.as_deref(), Some("OPENROUTER_API_KEY"));
+                assert_eq!(base_url.as_deref(), Some("https://openrouter.ai/api/v1"));
+            }
+            other => panic!("expected OpenRouter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submit_azure_emits_correct_variant() {
+        let mut form = EditForm::empty();
+        form.id.insert_str("azure-gpt");
+        form.base_url
+            .insert_str("https://my-resource.openai.azure.com");
+        form.api_key_env.insert_str("AZURE_OPENAI_API_KEY");
+        form.api_surface.insert_str("classic");
+        form.auth_mode.insert_str("entra");
+        form.api_version.insert_str("2024-10-21");
+        form.kind = ConnectorKind::Azure;
+        let (id, config) = form.submit().unwrap();
+        assert_eq!(id, "azure-gpt");
+        match config {
+            ConnectionConfigView::Azure {
+                base_url,
+                api_key_env,
+                api_surface,
+                auth_mode,
+                api_version,
+                ..
+            } => {
+                assert_eq!(
+                    base_url.as_deref(),
+                    Some("https://my-resource.openai.azure.com")
+                );
+                assert_eq!(api_key_env.as_deref(), Some("AZURE_OPENAI_API_KEY"));
+                assert_eq!(api_surface.as_deref(), Some("classic"));
+                assert_eq!(auth_mode.as_deref(), Some("entra"));
+                assert_eq!(api_version.as_deref(), Some("2024-10-21"));
+            }
+            other => panic!("expected Azure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submit_azure_blank_enums_default_to_none() {
+        // An untouched api_surface / auth_mode must submit as `None` so the
+        // daemon applies its primary defaults (v1 / api_key) rather than an
+        // empty string the daemon would reject.
+        let mut form = EditForm::empty();
+        form.id.insert_str("azure-min");
+        form.base_url
+            .insert_str("https://my-resource.openai.azure.com");
+        form.kind = ConnectorKind::Azure;
+        let (_id, config) = form.submit().unwrap();
+        match config {
+            ConnectionConfigView::Azure {
+                api_surface,
+                auth_mode,
+                api_version,
+                ..
+            } => {
+                assert!(api_surface.is_none());
+                assert!(auth_mode.is_none());
+                assert!(api_version.is_none());
+            }
+            other => panic!("expected Azure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submit_google_emits_correct_variant() {
+        let mut form = EditForm::empty();
+        form.id.insert_str("vertex");
+        form.api_key_env.insert_str("GOOGLE_API_KEY");
+        form.project.insert_str("my-gcp-project");
+        form.location.insert_str("us-central1");
+        form.auth_mode.insert_str("vertex");
+        form.credentials_path.insert_str("/etc/adele/sa.json");
+        form.kind = ConnectorKind::Google;
+        let (id, config) = form.submit().unwrap();
+        assert_eq!(id, "vertex");
+        match config {
+            ConnectionConfigView::Google {
+                project,
+                location,
+                auth_mode,
+                credentials_path,
+                api_key_env,
+                ..
+            } => {
+                assert_eq!(project.as_deref(), Some("my-gcp-project"));
+                assert_eq!(location.as_deref(), Some("us-central1"));
+                assert_eq!(auth_mode.as_deref(), Some("vertex"));
+                assert_eq!(credentials_path.as_deref(), Some("/etc/adele/sa.json"));
+                assert_eq!(api_key_env.as_deref(), Some("GOOGLE_API_KEY"));
+            }
+            other => panic!("expected Google, got {other:?}"),
+        }
+    }
+
+    /// create -> save (daemon echoes it back as `view.config`) -> from_view ->
+    /// re-submit must preserve every non-secret Azure field. Guards the
+    /// explicit `prefill_from_config` Azure arm against a wildcard regression.
+    #[test]
+    fn azure_config_survives_edit_round_trip() {
+        let mut form = EditForm::empty();
+        form.id.insert_str("azure-gpt");
+        form.base_url
+            .insert_str("https://my-resource.openai.azure.com");
+        form.api_key_env.insert_str("AZURE_OPENAI_API_KEY");
+        form.api_surface.insert_str("v1");
+        form.auth_mode.insert_str("api_key");
+        form.kind = ConnectorKind::Azure;
+        let (id, config) = form.submit().unwrap();
+
+        let view = ConnectionView {
+            id: id.clone(),
+            connector_type: "azure".into(),
+            display_label: format!("{id} (azure)"),
+            availability: ConnectionAvailability::Ok,
+            has_credentials: true,
+            config: Some(config.clone()),
+        };
+        let reloaded = EditForm::from_view(&view);
+        assert_eq!(reloaded.kind, ConnectorKind::Azure);
+        let (id2, config2) = reloaded.submit().unwrap();
+        assert_eq!(id, id2);
+        assert_eq!(config, config2);
+    }
+
+    /// Same round-trip guarantee for Google's project/location/auth_mode.
+    #[test]
+    fn google_config_survives_edit_round_trip() {
+        let mut form = EditForm::empty();
+        form.id.insert_str("vertex");
+        form.project.insert_str("my-gcp-project");
+        form.location.insert_str("us-central1");
+        form.auth_mode.insert_str("vertex");
+        form.credentials_path.insert_str("/etc/adele/sa.json");
+        form.kind = ConnectorKind::Google;
+        let (id, config) = form.submit().unwrap();
+
+        let view = ConnectionView {
+            id: id.clone(),
+            connector_type: "google".into(),
+            display_label: format!("{id} (google)"),
+            availability: ConnectionAvailability::Ok,
+            has_credentials: true,
+            config: Some(config.clone()),
+        };
+        let reloaded = EditForm::from_view(&view);
+        assert_eq!(reloaded.kind, ConnectorKind::Google);
+        let (id2, config2) = reloaded.submit().unwrap();
+        assert_eq!(id, id2);
+        assert_eq!(config, config2);
     }
 
     #[test]
