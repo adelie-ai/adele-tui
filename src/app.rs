@@ -476,6 +476,8 @@ impl App {
             role: "assistant".to_string(),
             content: text.to_string(),
             kind,
+            // Client-local line, never an idempotent user send (#570).
+            idempotency_key: None,
         });
         self.scroll_offset = 0;
         true
@@ -865,7 +867,7 @@ impl App {
     /// from the shared core. The draw path renders the "N queued" indicator from
     /// this each frame; the key dispatch consults it to decide whether an empty
     /// composer's `Up`/`Down` should recall a queued message.
-    pub fn queued_messages_for_view(&self) -> &[String] {
+    pub fn queued_messages_for_view(&self) -> Vec<String> {
         self.core.queued_messages_for_view()
     }
 
@@ -1587,7 +1589,10 @@ mod tests {
         // The prompt that reaches the send effect is the logical (unwrapped) text,
         // not the display-wrapped copy.
         let prompt = app.textarea_content();
-        let effects = app.apply_core(UiMessage::SubmitPrompt { prompt });
+        let effects = app.apply_core(UiMessage::SubmitPrompt {
+            prompt,
+            idempotency_key: None,
+        });
         let sent = sent_prompt(&effects).expect("an accepted send emits SendPrompt");
         assert_eq!(sent, typed);
         assert!(!sent.contains('\n'));
@@ -1626,7 +1631,10 @@ mod tests {
         let _ = app.wrapped_display_textarea(8);
 
         let prompt = app.textarea_content();
-        let effects = app.apply_core(UiMessage::SubmitPrompt { prompt });
+        let effects = app.apply_core(UiMessage::SubmitPrompt {
+            prompt,
+            idempotency_key: None,
+        });
         assert_eq!(
             sent_prompt(&effects).expect("an accepted send emits SendPrompt"),
             typed
@@ -1675,7 +1683,10 @@ mod tests {
     fn submit(app: &mut App, text: &str) -> Vec<Effect> {
         app.textarea.insert_str(text);
         let prompt = app.textarea_content();
-        app.apply_core(UiMessage::SubmitPrompt { prompt })
+        app.apply_core(UiMessage::SubmitPrompt {
+            prompt,
+            idempotency_key: None,
+        })
     }
 
     #[test]
@@ -1712,8 +1723,8 @@ mod tests {
         });
         assert_eq!(
             sent_prompt(&effects).expect("stream completion flushes the queue as a send"),
-            "first\nsecond",
-            "the queued burst flushes as ONE combined turn joined with \\n"
+            "first\n\nsecond",
+            "the queued burst flushes as ONE combined turn, blank-line joined"
         );
         assert!(
             app.queued_messages_for_view().is_empty(),
@@ -1883,7 +1894,7 @@ mod tests {
         let effects = app.load_conversation(detail("c1"));
         assert_eq!(
             sent_prompt(&effects).expect("switch-back flushes the backlog as a send"),
-            "first\nsecond"
+            "first\n\nsecond"
         );
         assert!(app.queued_messages_for_view().is_empty());
     }
@@ -2026,7 +2037,10 @@ mod tests {
         app.enter_editing_mode();
         app.apply_paste("first\nsecond\nthird");
         let prompt = app.textarea_content();
-        let effects = app.apply_core(UiMessage::SubmitPrompt { prompt });
+        let effects = app.apply_core(UiMessage::SubmitPrompt {
+            prompt,
+            idempotency_key: None,
+        });
         assert_eq!(
             sent_prompt(&effects).expect("an accepted send emits SendPrompt"),
             "first\nsecond\nthird"
@@ -2286,6 +2300,8 @@ mod tests {
             conversation_id: "c1".into(),
             request_id: "voice-req".into(),
             content: "what's the weather?".into(),
+            // External turn (voice / another client): no key minted here.
+            idempotency_key: None,
         });
         assert!(
             controller.is_empty(),
@@ -2322,6 +2338,7 @@ mod tests {
             conversation_id: "c1".into(),
             request_id: "voice-req".into(),
             content: "a question".into(),
+            idempotency_key: None,
         });
         let controller = app.apply_core(UiMessage::StreamComplete {
             request_id: "voice-req".into(),
@@ -2468,12 +2485,14 @@ mod tests {
                     role: "user".into(),
                     content: "hello".into(),
                     kind: crate::app::MessageKind::Normal,
+                    idempotency_key: None,
                 },
                 ChatMessage {
                     id: "m2".into(),
                     role: "assistant".into(),
                     content: "hi there".into(),
                     kind: crate::app::MessageKind::Normal,
+                    idempotency_key: None,
                 },
             ],
             model_selection: None,

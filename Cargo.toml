@@ -29,6 +29,11 @@ unicode-width = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 url = "2"
 toml = "0.9"
+# Per-send idempotency keys (#570): the client mints a v4 UUID for each user
+# submit and threads it to the idempotent send so a retry re-attaches to the
+# live turn instead of re-running it. The reducer stays wasm-clean — the key is
+# minted host-side and passed in.
+uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Direct zbus client for the standalone voice daemon (`org.desktopAssistant.Voice`),
@@ -118,6 +123,10 @@ mcp-core = { path = "../mcp-core" }
 # Tempfile config paths for the `config_cmd` unit tests, so they mutate/save
 # `ClientMcpConfig` against a throwaway file instead of the user's real config.
 tempfile = "3"
+# The shared `AssistantCommands` trait is `#[async_trait]`, so the send-path
+# test's fake recorder (asserting the minted key rides the wire `SendMessage`)
+# must impl it with the same macro.
+async-trait = "0.1"
 
 [features]
 # The core built-in MCP set is compiled in and hosted in-process by default, so

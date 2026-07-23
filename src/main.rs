@@ -1636,16 +1636,20 @@ async fn run_controller_effects(
                 conversation_id,
                 prompt,
                 system_refinement,
+                idempotency_key,
             } => {
                 // Background queue flush: on failure, only recover the batch into
                 // the composer if it's empty — never clobber a fresh draft the
-                // reducer deliberately preserved through the flush.
+                // reducer deliberately preserved through the flush. The key is
+                // whatever the reducer set for the combined turn (the first
+                // queued message's key, or `None` if that message was keyless).
                 run_send_prompt(
                     app,
                     connector,
                     conversation_id,
                     prompt,
                     system_refinement,
+                    idempotency_key,
                     ComposerRecovery::IfComposerEmpty,
                 )
                 .await;
@@ -1688,11 +1692,16 @@ async fn handle_signal(
             conversation_id,
             request_id,
             content,
+            idempotency_key,
         } => {
             let effects = app.apply_core(UiMessage::UserMessageAdded {
                 conversation_id,
                 request_id,
                 content,
+                // Echo the daemon's key back into the reducer so the initiator's
+                // optimistic bubble dedupes by exact match (#570); `None` on a
+                // keyless turn falls back to the request-id / content dedupe.
+                idempotency_key,
             });
             run_controller_effects(
                 app,
@@ -2698,8 +2707,19 @@ async fn send_prompt_from_input(app: &mut App, connector: &Option<Rc<Connector>>
         return;
     }
     let prompt = app.textarea_content();
-    let effects = app.apply_core(UiMessage::SubmitPrompt { prompt });
-    let Some((conversation_id, prompt, system_refinement)) = take_send_prompt(effects) else {
+    // Mint a per-send idempotency key (#570) for this user submit. The reducer
+    // stamps it on the optimistic user bubble and echoes it on the
+    // `Effect::SendPrompt`, so a retry re-attaches to the live turn and the
+    // daemon's `UserMessageAdded` echo dedupes by exact key. Minting lives here
+    // (not the reducer, which stays wasm-clean); the key is passed in.
+    let idempotency_key = Some(uuid::Uuid::new_v4().to_string());
+    let effects = app.apply_core(UiMessage::SubmitPrompt {
+        prompt,
+        idempotency_key,
+    });
+    let Some((conversation_id, prompt, system_refinement, idempotency_key)) =
+        take_send_prompt(effects)
+    else {
         // Queued / edit-reinsert / empty: the reducer already cleared the live
         // composer (via SetComposerText, applied in apply_core) for the queue
         // paths, or left a fresh draft untouched. Nothing to send right now.
@@ -2719,20 +2739,27 @@ async fn send_prompt_from_input(app: &mut App, connector: &Option<Rc<Connector>>
         conversation_id,
         prompt,
         system_refinement,
+        idempotency_key,
         ComposerRecovery::Always,
     )
     .await;
 }
 
 /// Extract the `SendPrompt` payload from an effect list, if one is present. The
-/// reducer emits at most one per dispatch (a direct send or a queue flush).
-fn take_send_prompt(effects: Vec<Effect>) -> Option<(String, String, Option<String>)> {
+/// reducer emits at most one per dispatch (a direct send or a queue flush). The
+/// fourth element is the per-send idempotency key (#570) the reducer echoed from
+/// the initiating `SubmitPrompt` (or `None` for a keyless send, e.g. a queue
+/// flush whose first message carried no key).
+fn take_send_prompt(
+    effects: Vec<Effect>,
+) -> Option<(String, String, Option<String>, Option<String>)> {
     effects.into_iter().find_map(|e| match e {
         Effect::SendPrompt {
             conversation_id,
             prompt,
             system_refinement,
-        } => Some((conversation_id, prompt, system_refinement)),
+            idempotency_key,
+        } => Some((conversation_id, prompt, system_refinement, idempotency_key)),
         _ => None,
     })
 }
@@ -2777,6 +2804,7 @@ async fn run_send_prompt(
     conversation_id: String,
     prompt: String,
     system_refinement: Option<String>,
+    idempotency_key: Option<String>,
     recovery: ComposerRecovery,
 ) {
     let Some(connector) = connector.as_ref() else {
@@ -2795,19 +2823,35 @@ async fn run_send_prompt(
     let result = match (app.take_pending_override(), client.as_commands()) {
         (Some(ovr), Some(commands)) => {
             commands
-                .send_prompt_full(&conversation_id, &prompt, Some(ovr), refinement.to_string())
+                .send_prompt_idempotent(
+                    &conversation_id,
+                    &prompt,
+                    Some(ovr),
+                    refinement.to_string(),
+                    idempotency_key,
+                )
                 .await
         }
         (Some(_), None) => {
             app.status_message =
                 "Model override isn't supported over D-Bus — sent without override".into();
             connector
-                .send_prompt_with_system_refinement(&conversation_id, &prompt, refinement)
+                .send_prompt_with_system_refinement_idempotent(
+                    &conversation_id,
+                    &prompt,
+                    refinement,
+                    idempotency_key,
+                )
                 .await
         }
         (None, _) => {
             connector
-                .send_prompt_with_system_refinement(&conversation_id, &prompt, refinement)
+                .send_prompt_with_system_refinement_idempotent(
+                    &conversation_id,
+                    &prompt,
+                    refinement,
+                    idempotency_key,
+                )
                 .await
         }
     };
@@ -3371,5 +3415,127 @@ mod tests {
             ComposerRecovery::IfComposerEmpty,
             true
         ));
+    }
+
+    // --- Per-send idempotency key threading (#570) ---
+    //
+    // The reducer emits the client-minted key on `Effect::SendPrompt`; the host
+    // extracts it (`take_send_prompt`) and hands it to `run_send_prompt`, which
+    // forwards it on the `*_idempotent` wire call. The RPC itself needs a live
+    // transport, so the extraction (pure) and the wire threading (a fake
+    // recorder) are asserted separately — mirroring the pattern already used for
+    // `should_restore_composer`.
+
+    #[test]
+    fn take_send_prompt_returns_idempotency_key() {
+        let effects = vec![Effect::SendPrompt {
+            conversation_id: "conv-1".to_string(),
+            prompt: "hello".to_string(),
+            system_refinement: Some("brief".to_string()),
+            idempotency_key: Some("turn-key-1".to_string()),
+        }];
+        assert_eq!(
+            take_send_prompt(effects),
+            Some((
+                "conv-1".to_string(),
+                "hello".to_string(),
+                Some("brief".to_string()),
+                Some("turn-key-1".to_string()),
+            ))
+        );
+    }
+
+    #[test]
+    fn take_send_prompt_preserves_a_keyless_send() {
+        // Backward-compat: a keyless `SendPrompt` (e.g. a queue flush whose first
+        // message carried no key) extracts a `None` key, not a fabricated one.
+        let effects = vec![Effect::SendPrompt {
+            conversation_id: "c".to_string(),
+            prompt: "p".to_string(),
+            system_refinement: None,
+            idempotency_key: None,
+        }];
+        let (_, _, _, key) = take_send_prompt(effects).expect("SendPrompt present");
+        assert!(key.is_none(), "a keyless send must not gain a key");
+    }
+
+    #[test]
+    fn take_send_prompt_none_when_no_send_effect() {
+        // Queue / edit-reinsert / empty dispatches emit no `SendPrompt`.
+        assert_eq!(
+            take_send_prompt(vec![Effect::Speak("narration".to_string())]),
+            None
+        );
+    }
+
+    // A minimal `AssistantCommands` recorder: captures the wire `Command` the
+    // idempotent send emits so we can assert the minted key rides through on the
+    // `SendMessage.idempotency_key` field — the same shape as client-common's
+    // own `send_prompt_idempotent_emits_send_message_with_key` test, but pinned
+    // here so a regression in the tui's chosen send method is caught locally.
+    struct RecordingCommands {
+        last: std::sync::Mutex<Option<desktop_assistant_api_model::Command>>,
+    }
+
+    #[async_trait::async_trait]
+    impl desktop_assistant_client_common::AssistantCommands for RecordingCommands {
+        async fn send_command(
+            &self,
+            command: desktop_assistant_api_model::Command,
+        ) -> Result<desktop_assistant_api_model::CommandResult> {
+            *self.last.lock().unwrap() = Some(command);
+            Ok(desktop_assistant_api_model::CommandResult::SendMessageAck {
+                request_id: "req-1".to_string(),
+                task_id: "task-1".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_send_prompt_threads_minted_key_to_idempotent_send() {
+        use desktop_assistant_client_common::AssistantCommands;
+
+        // Mint a key the way `send_prompt_from_input` does, and thread it through
+        // the exact wire call `run_send_prompt` makes on the send path.
+        let minted = uuid::Uuid::new_v4().to_string();
+        let client = RecordingCommands {
+            last: std::sync::Mutex::new(None),
+        };
+        client
+            .send_prompt_idempotent("conv-1", "hello", None, String::new(), Some(minted.clone()))
+            .await
+            .unwrap();
+
+        match client
+            .last
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("no command sent")
+        {
+            desktop_assistant_api_model::Command::SendMessage {
+                conversation_id,
+                content,
+                idempotency_key,
+                ..
+            } => {
+                assert_eq!(conversation_id, "conv-1");
+                assert_eq!(content, "hello");
+                assert_eq!(
+                    idempotency_key.as_deref(),
+                    Some(minted.as_str()),
+                    "the minted key must ride the wire SendMessage"
+                );
+            }
+            other => panic!("expected Command::SendMessage, got {other:?}"),
+        }
+
+        // The minted key must be a v4 (random) UUID.
+        let parsed = uuid::Uuid::parse_str(&minted).expect("minted key parses as a UUID");
+        assert_eq!(
+            parsed.get_version(),
+            Some(uuid::Version::Random),
+            "each user submit mints a v4 UUID"
+        );
     }
 }
