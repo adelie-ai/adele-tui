@@ -126,6 +126,9 @@ pub enum ScreenRequest {
     McpServers,
     ModelPicker,
     PersonalityPicker,
+    /// The client-local settings screen (`F6`, #135). Unlike its siblings this
+    /// one needs no connection — every setting it edits is stored locally.
+    Settings,
 }
 
 /// The `Adele:` voice-output level for a conversation. Decides reply narration
@@ -478,6 +481,7 @@ impl App {
             kind,
             // Client-local line, never an idempotent user send (#570).
             idempotency_key: None,
+            created_at_ms: None,
         });
         self.scroll_offset = 0;
         true
@@ -2486,6 +2490,7 @@ mod tests {
                     content: "hello".into(),
                     kind: crate::app::MessageKind::Normal,
                     idempotency_key: None,
+                    created_at_ms: None,
                 },
                 ChatMessage {
                     id: "m2".into(),
@@ -2493,6 +2498,7 @@ mod tests {
                     content: "hi there".into(),
                     kind: crate::app::MessageKind::Normal,
                     idempotency_key: None,
+                    created_at_ms: None,
                 },
             ],
             model_selection: None,
@@ -2938,6 +2944,8 @@ mod tests {
             children: Vec::new(),
             title: title.into(),
             progress_hint: None,
+            owner_todo: String::new(),
+            spawn_marker: None,
         }
     }
 

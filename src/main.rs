@@ -42,6 +42,7 @@ use adele::keys::{Action, editing_recall_action, handle_key_event};
 use adele::picker::PickerOutcome;
 use adele::profile::ProfileStore;
 use adele::settings::{Settings, default_settings_path};
+use adele::settings_screen;
 use adele::voice::{VoiceConfig, VoiceSession};
 use adele::voice_client::VoiceController;
 use adele::{
@@ -755,9 +756,8 @@ async fn run_app(
 }
 
 /// Snapshot the persisted preferences off live [`App`] state into a [`Settings`]
-/// for saving. Both preference toggles (`Ctrl+T` debug, `Ctrl+O` share-device-
-/// info) write through this so flipping one never clobbers another's on-disk
-/// value.
+/// for saving. The settings screen (`F6`, #135) writes through this so a change
+/// there never clobbers a value it does not edit.
 fn settings_from_app(app: &App) -> Settings {
     Settings {
         show_debug: app.show_debug,
@@ -1040,6 +1040,39 @@ async fn run(
                         let label = format!("{} · {}", picked.connection_id, picked.model_id);
                         app.apply_model_override(picked);
                         app.status_message = format!("Model: {label} (applies to next message)");
+                    }
+                }
+                ScreenRequest::Settings => {
+                    // No connector needed — every setting here is client-local.
+                    let mut changed = None;
+                    {
+                        let current = settings_from_app(&app);
+                        let mut sink = SubScreenSink {
+                            app: &mut app,
+                            connector: &connector,
+                            voice_daemon: &voice_daemon,
+                            voice_session: &voice_session,
+                            narration_tx: &narration_tx,
+                            disconnect: &mut disconnect,
+                        };
+                        match settings_screen::run(terminal, current, &mut signal_rx, &mut sink)
+                            .await
+                        {
+                            Ok(settings_screen::Outcome::Changed(next)) => changed = Some(next),
+                            Ok(settings_screen::Outcome::Unchanged) => {}
+                            Err(e) => sink.app.status_message = format!("Settings error: {e}"),
+                        }
+                    }
+                    // Apply + persist AFTER the sink's borrow of `app` ends.
+                    // `Unchanged` skips the write entirely, so merely opening the
+                    // screen never rewrites settings.json.
+                    if let Some(next) = changed {
+                        app.show_debug = next.show_debug;
+                        app.share_client_context = next.share_client_context;
+                        match next.save() {
+                            Ok(()) => app.status_message = "Settings saved".into(),
+                            Err(e) => app.status_message = format!("Settings not saved: {e}"),
+                        }
                     }
                 }
                 ScreenRequest::PersonalityPicker => {
@@ -2311,6 +2344,10 @@ async fn handle_action(
                 app.status_message = "Not connected — MCP servers manager unavailable".into();
             }
         }
+        // No `client.is_some()` gate, unlike every screen above: these settings
+        // are client-local, so the screen is just as useful (arguably more so)
+        // while disconnected.
+        Action::OpenSettings => app.request_screen(ScreenRequest::Settings),
         Action::OpenModelPicker => {
             if client.is_some() {
                 app.request_screen(ScreenRequest::ModelPicker);

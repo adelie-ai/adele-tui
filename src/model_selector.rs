@@ -413,6 +413,7 @@ mod tests {
         ModelListing {
             connection_id: connection.into(),
             connection_label: format!("{connection} (test)"),
+            notices: Vec::new(),
             model: ModelInfoView {
                 id: model.into(),
                 display_name: model.into(),

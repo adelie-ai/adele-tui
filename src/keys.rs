@@ -31,7 +31,7 @@ pub enum Action {
     CancelRename,
     ToggleDebug,
     /// Toggle the persisted "Share device info with the assistant" preference
-    /// (`Ctrl+O`, da#549 Phase 2b). Flips and saves
+    /// (da#549 Phase 2b), edited on the settings screen (`F6`, #135). Saves
     /// [`crate::settings::Settings::share_client_context`]; the new value shapes
     /// the connect handshake on the next (re)connect.
     ToggleShareClientContext,
@@ -44,14 +44,18 @@ pub enum Action {
     /// `OpenConnections`/`OpenPurposes`: a modal manager over the daemon's MCP
     /// server config.
     OpenMcpServers,
+    /// Open the settings screen (`F6`, #135): the client-local global
+    /// preferences, previously reachable only as the `Ctrl+T` / `Ctrl+O` chords.
+    /// Unlike the other screens this one needs no connection — the settings are
+    /// local, so it opens whether or not a daemon is reachable.
+    OpenSettings,
     OpenModelPicker,
     /// Open the per-conversation personality picker (`Ctrl+R`, "peRsonality").
     /// Mirrors `OpenModelPicker`; pins/clears the Expressive-7 traits for the
     /// active conversation via `set_conversation_personality`.
     OpenPersonalityPicker,
     /// Toggle the process-manager (tasks) overlay. Currently bound to
-    /// `Ctrl+P` ("process manager") since `Ctrl+T` is already used for
-    /// the debug-view toggle and a chord-style `g t` would require a
+    /// `Ctrl+P` ("process manager"), and a chord-style `g t` would require a
     /// new key-state machine that none of the existing bindings use.
     ToggleTasksPane,
     /// Tasks-pane navigation: move highlighted task selection. Only
@@ -70,9 +74,9 @@ pub enum Action {
     /// unless voice is in `embedded` mode. Available when `You == Enabled`.
     Dictate,
     /// Cycle the per-conversation `Adele:` voice-output level (adele-tui#77),
-    /// `Disabled → On Demand → Always → Disabled`. Bound to `Ctrl+S` ("Speech";
-    /// Adele's speech). The keyboard-enhancement flags pushed at startup deliver
-    /// Ctrl+S as a real key event (not terminal XOFF flow control). `Always`
+    /// `Disabled → On Demand → Always → Disabled`. Bound to `Alt+S` ("Speech";
+    /// Adele's speech) — moved off `Ctrl+S`, which is XOFF/terminal-freeze on some
+    /// setups (#137). `Always`
     /// reads every reply aloud in full (made speakable); `On Demand` reads
     /// replies only while `You == Enabled`, kept brief, and always speaks
     /// `say_this` asides; `Disabled` never speaks. Also set by the model via
@@ -80,8 +84,8 @@ pub enum Action {
     /// `Disabled` per conversation.
     CycleAdeleOutput,
     /// Toggle the per-conversation `You:` voice-input control (adele-tui#77),
-    /// `Disabled ↔ Enabled`. Bound to `Ctrl+V` ("Voice"; your voice), delivered
-    /// as a real key event by the same keyboard-enhancement flags. When Enabled,
+    /// `Disabled ↔ Enabled`. Bound to `Alt+V` ("Voice"; your voice) — moved off
+    /// `Ctrl+V`, which collides with paste muscle memory (#137). When Enabled,
     /// push-to-talk dictation is available (Ctrl+G) and — combined with
     /// `Adele == On Demand` — reply narration is on. Defaults `Disabled` (type
     /// only); text input is always available.
@@ -154,6 +158,14 @@ pub fn handle_key_event(
     if key.code == KeyCode::F(5) && key.modifiers.is_empty() {
         return Some(Action::OpenMcpServers);
     }
+    // F6 opens the settings screen (#135). The global preferences used to be
+    // reachable only as chords (Ctrl+T / Ctrl+O), so they were invisible unless
+    // you already knew them — and every new preference cost another binding in
+    // an already-crowded keymap. F6 rather than Ctrl+, because comma-with-
+    // modifier is not reliably distinguishable across terminals.
+    if key.code == KeyCode::F(6) && key.modifiers.is_empty() {
+        return Some(Action::OpenSettings);
+    }
     // F1 toggles the keymap help overlay from any mode (`?` also opens it in
     // Normal mode; F1 is offered too since `?` is a literal character in the
     // composer).
@@ -173,11 +185,12 @@ pub fn handle_key_event(
             KeyCode::Char('u') => Some(Action::ScrollUp),
             KeyCode::Char('d') => Some(Action::ScrollDown),
             KeyCode::Char('e') => Some(Action::ScrollToBottom),
-            KeyCode::Char('t') => Some(Action::ToggleDebug),
-            // Ctrl+O toggles the persisted "Share device info" preference
-            // (da#549). Like the other Ctrl toggles it shadows tui-textarea in
-            // Editing mode; Ctrl+O isn't a textarea binding, so nothing is lost.
-            KeyCode::Char('o') => Some(Action::ToggleShareClientContext),
+            // Ctrl+T (debug messages) and Ctrl+O (share device info) are
+            // deliberately GONE (#135): both are persisted global preferences —
+            // set once, then forgotten — so they live on the settings screen
+            // (F6) where they are visible and self-describing. A binding is for
+            // something you do on the fly, fairly regularly; these are not, and
+            // spending scarce keys on them is what crowded the keymap.
             KeyCode::Char('b') => Some(Action::ToggleSidebar),
             KeyCode::Char('k') => Some(Action::OpenKnowledgeBase),
             KeyCode::Char('m') => Some(Action::OpenModelPicker),
@@ -191,13 +204,27 @@ pub fn handle_key_event(
             // Ctrl+G starts embedded dictation (mic → prompt). A no-op when
             // voice isn't in embedded mode; main.rs gates on the session.
             KeyCode::Char('g') => Some(Action::Dictate),
-            // Ctrl+S cycles the per-conversation Adele output level
-            // (adele-tui#77). A no-op status hint when no conversation is open;
-            // main.rs gates.
+            // The voice toggles moved to Alt+S / Alt+V (#137). They stay
+            // bindings — they are per-conversation, so switching voice on for
+            // *this* chat is exactly an on-the-fly action — but their old Ctrl
+            // homes were both inherited-convention collisions: Ctrl+V is paste
+            // in most GUI apps (and readline's quoted-insert), and Ctrl+S is
+            // XOFF/terminal-freeze on some setups. Rebinding rather than
+            // rehoming, because no uncolliding Ctrl letter was left.
+            _ => None,
+        };
+    }
+
+    // Alt combos. Nearly untouched by this keymap, which is why the voice
+    // toggles moved here: no terminal or readline convention to collide with,
+    // and the V-for-voice / S-for-sound mnemonics survive intact (#137).
+    if alt && !matches!(mode, InputMode::Renaming) {
+        return match key.code {
+            // Cycle the per-conversation Adele output level (adele-tui#77). A
+            // no-op status hint when no conversation is open; main.rs gates.
             KeyCode::Char('s') => Some(Action::CycleAdeleOutput),
-            // Ctrl+V toggles the per-conversation You (voice-input) control
-            // (adele-tui#77). Like Ctrl+S it is delivered as a real key by the
-            // enhancement flags.
+            // Toggle the per-conversation You (voice-input) control
+            // (adele-tui#77). Delivered as a real key by the enhancement flags.
             KeyCode::Char('v') => Some(Action::ToggleVoiceIn),
             _ => None,
         };
@@ -327,12 +354,7 @@ pub fn help_sections() -> &'static [(&'static str, &'static [(&'static str, &'st
         ),
         (
             "View",
-            &[
-                ("Ctrl+B", "toggle sidebar"),
-                ("Ctrl+T", "toggle debug messages"),
-                ("Ctrl+O", "share device info on/off"),
-                ("Ctrl+P", "tasks pane"),
-            ],
+            &[("Ctrl+B", "toggle sidebar"), ("Ctrl+P", "tasks pane")],
         ),
         (
             "Open",
@@ -341,6 +363,7 @@ pub fn help_sections() -> &'static [(&'static str, &'static [(&'static str, &'st
                 ("F3", "connections manager"),
                 ("F4", "purposes"),
                 ("F5", "MCP servers"),
+                ("F6", "settings"),
                 ("Ctrl+K", "knowledge base"),
                 ("Ctrl+M", "model picker"),
                 ("Ctrl+R", "personality"),
@@ -350,8 +373,8 @@ pub fn help_sections() -> &'static [(&'static str, &'static [(&'static str, &'st
             "Voice",
             &[
                 ("Ctrl+G", "push-to-talk dictation"),
-                ("Ctrl+S", "cycle Adele voice output"),
-                ("Ctrl+V", "toggle You (voice input)"),
+                ("Alt+S", "cycle Adele voice output"),
+                ("Alt+V", "toggle You (voice input)"),
             ],
         ),
         (
@@ -818,56 +841,37 @@ mod tests {
         );
     }
 
-    // --- Debug toggle (Ctrl+T) ---
+    // --- Retired toggles now living on the settings screen (#135) ---
 
+    /// `Ctrl+T` and `Ctrl+O` are deliberately unbound: both edited persisted
+    /// GLOBAL preferences (debug messages, share-device-info), so they moved to
+    /// the settings screen where they are visible and explained. Asserting they
+    /// map to `None` is what stops someone quietly reinstating them and
+    /// re-crowding the keymap.
     #[test]
-    fn ctrl_t_toggles_debug_in_normal() {
-        assert_eq!(
-            handle_key_event(
-                key_with_mod(KeyCode::Char('t'), KeyModifiers::CONTROL),
-                &InputMode::Normal,
-                false
-            ),
-            Some(Action::ToggleDebug)
-        );
+    fn retired_preference_chords_are_unbound() {
+        for code in [KeyCode::Char('t'), KeyCode::Char('o')] {
+            for mode in [InputMode::Normal, InputMode::Editing] {
+                assert_eq!(
+                    handle_key_event(key_with_mod(code, KeyModifiers::CONTROL), &mode, false),
+                    None,
+                    "Ctrl+{code:?} must be unbound in {mode:?} — it lives on the settings screen"
+                );
+            }
+        }
     }
 
+    /// F6 opens the settings screen from both modes, so the preferences above
+    /// are still reachable — just from one discoverable place.
     #[test]
-    fn ctrl_t_toggles_debug_in_editing() {
-        assert_eq!(
-            handle_key_event(
-                key_with_mod(KeyCode::Char('t'), KeyModifiers::CONTROL),
-                &InputMode::Editing,
-                false
-            ),
-            Some(Action::ToggleDebug)
-        );
-    }
-
-    // --- Share device info toggle (Ctrl+O, da#549 Phase 2b) ---
-
-    #[test]
-    fn ctrl_o_toggles_share_client_context_in_normal() {
-        assert_eq!(
-            handle_key_event(
-                key_with_mod(KeyCode::Char('o'), KeyModifiers::CONTROL),
-                &InputMode::Normal,
-                false
-            ),
-            Some(Action::ToggleShareClientContext)
-        );
-    }
-
-    #[test]
-    fn ctrl_o_toggles_share_client_context_in_editing() {
-        assert_eq!(
-            handle_key_event(
-                key_with_mod(KeyCode::Char('o'), KeyModifiers::CONTROL),
-                &InputMode::Editing,
-                false
-            ),
-            Some(Action::ToggleShareClientContext)
-        );
+    fn f6_opens_settings_in_both_modes() {
+        for mode in [InputMode::Normal, InputMode::Editing] {
+            assert_eq!(
+                handle_key_event(key(KeyCode::F(6)), &mode, false),
+                Some(Action::OpenSettings),
+                "F6 must open settings in {mode:?}"
+            );
+        }
     }
 
     // --- Sidebar toggle (Ctrl+B) ---
@@ -1054,13 +1058,13 @@ mod tests {
         );
     }
 
-    // --- Ctrl+S cycles the Adele output level (adele-tui#77) ---
+    // --- Alt+S cycles the Adele output level (adele-tui#77, rebound #137) ---
 
     #[test]
-    fn ctrl_s_cycles_adele_output_in_normal() {
+    fn alt_s_cycles_adele_output_in_normal() {
         assert_eq!(
             handle_key_event(
-                key_with_mod(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                key_with_mod(KeyCode::Char('s'), KeyModifiers::ALT),
                 &InputMode::Normal,
                 false
             ),
@@ -1069,17 +1073,35 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_s_cycles_adele_output_in_editing() {
+    fn alt_s_cycles_adele_output_in_editing() {
         // Adele output is a per-conversation control the user will change while
         // composing, so it must be reachable from editing mode too.
         assert_eq!(
             handle_key_event(
-                key_with_mod(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                key_with_mod(KeyCode::Char('s'), KeyModifiers::ALT),
                 &InputMode::Editing,
                 false
             ),
             Some(Action::CycleAdeleOutput)
         );
+    }
+
+    /// The collisions #137 was filed for must stay gone: `Ctrl+V` is paste in
+    /// most GUI apps (and readline's quoted-insert), `Ctrl+S` is XOFF on some
+    /// terminals. Rebinding voice to Alt only fixes that for as long as nobody
+    /// reinstates the Ctrl chords, so assert their absence rather than trusting
+    /// the rebind to stick.
+    #[test]
+    fn colliding_ctrl_voice_chords_stay_unbound() {
+        for code in [KeyCode::Char('v'), KeyCode::Char('s')] {
+            for mode in [InputMode::Normal, InputMode::Editing] {
+                assert_eq!(
+                    handle_key_event(key_with_mod(code, KeyModifiers::CONTROL), &mode, false),
+                    None,
+                    "Ctrl+{code:?} must stay unbound in {mode:?} (see #137)"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1113,10 +1135,10 @@ mod tests {
     // --- Ctrl+V toggles the You (voice-input) control (adele-tui#77) ---
 
     #[test]
-    fn ctrl_v_toggles_voice_in_in_normal() {
+    fn alt_v_toggles_voice_in_in_normal() {
         assert_eq!(
             handle_key_event(
-                key_with_mod(KeyCode::Char('v'), KeyModifiers::CONTROL),
+                key_with_mod(KeyCode::Char('v'), KeyModifiers::ALT),
                 &InputMode::Normal,
                 false
             ),
@@ -1125,12 +1147,12 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_v_toggles_voice_in_in_editing() {
+    fn alt_v_toggles_voice_in_in_editing() {
         // The You control is a per-conversation control the user will flip while
         // composing, so it must be reachable from editing mode too.
         assert_eq!(
             handle_key_event(
-                key_with_mod(KeyCode::Char('v'), KeyModifiers::CONTROL),
+                key_with_mod(KeyCode::Char('v'), KeyModifiers::ALT),
                 &InputMode::Editing,
                 false
             ),
