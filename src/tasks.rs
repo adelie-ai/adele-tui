@@ -555,6 +555,8 @@ mod tests {
             children: Vec::new(),
             title: title.into(),
             progress_hint: None,
+            owner_todo: String::new(),
+            spawn_marker: None,
         }
     }
 
@@ -805,6 +807,7 @@ mod tests {
         let v = TaskView {
             id: TaskId("t-1".into()),
             kind: TaskKind::Subagent {
+                session_conversation_id: String::new(),
                 parent_task_id: TaskId("parent".into()),
                 conversation_id: "subagent-conv".into(),
                 name: "child".into(),
@@ -817,6 +820,8 @@ mod tests {
             children: Vec::new(),
             title: "child".into(),
             progress_hint: None,
+            owner_todo: String::new(),
+            spawn_marker: None,
         };
         let row = TaskRow::from_view(&v);
         assert_eq!(row.conversation_id.as_deref(), Some("subagent-conv"));
@@ -843,6 +848,8 @@ mod tests {
             children: Vec::new(),
             title: "Chatting".into(),
             progress_hint: None,
+            owner_todo: String::new(),
+            spawn_marker: None,
         };
         assert_eq!(TaskRow::from_view(&conv).kind_label, "Chat");
 
@@ -850,6 +857,7 @@ mod tests {
         let sub = TaskView {
             id: TaskId("t-3".into()),
             kind: TaskKind::Subagent {
+                session_conversation_id: String::new(),
                 parent_task_id: TaskId("parent".into()),
                 conversation_id: "sub-conv".into(),
                 name: "child".into(),
@@ -862,6 +870,8 @@ mod tests {
             children: Vec::new(),
             title: "child".into(),
             progress_hint: None,
+            owner_todo: String::new(),
+            spawn_marker: None,
         };
         assert_eq!(TaskRow::from_view(&sub).kind_label, "Subagent");
     }

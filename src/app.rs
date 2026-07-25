@@ -2938,6 +2938,8 @@ mod tests {
             children: Vec::new(),
             title: title.into(),
             progress_hint: None,
+            owner_todo: String::new(),
+            spawn_marker: None,
         }
     }
 
