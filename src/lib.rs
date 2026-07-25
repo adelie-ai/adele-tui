@@ -24,6 +24,7 @@ pub mod profile;
 pub mod purposes;
 pub mod screen;
 pub mod settings;
+pub mod settings_screen;
 pub mod tasks;
 pub mod theme;
 pub mod toolbar;
