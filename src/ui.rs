@@ -785,6 +785,7 @@ mod tests {
                     content: "Hello".into(),
                     kind: crate::app::MessageKind::Normal,
                     idempotency_key: None,
+                    created_at_ms: None,
                 },
                 ChatMessage {
                     id: String::new(),
@@ -792,6 +793,7 @@ mod tests {
                     content: "Hi there!".into(),
                     kind: crate::app::MessageKind::Normal,
                     idempotency_key: None,
+                    created_at_ms: None,
                 },
             ],
             model_selection: None,
@@ -1121,6 +1123,7 @@ mod tests {
                     content: "Hello".into(),
                     kind: crate::app::MessageKind::Normal,
                     idempotency_key: None,
+                    created_at_ms: None,
                 },
                 ChatMessage {
                     id: String::new(),
@@ -1128,6 +1131,7 @@ mod tests {
                     content: "ran search(foo)".into(),
                     kind: crate::app::MessageKind::Normal,
                     idempotency_key: None,
+                    created_at_ms: None,
                 },
                 ChatMessage {
                     id: String::new(),
@@ -1135,6 +1139,7 @@ mod tests {
                     content: "context updated".into(),
                     kind: crate::app::MessageKind::Normal,
                     idempotency_key: None,
+                    created_at_ms: None,
                 },
                 ChatMessage {
                     id: String::new(),
@@ -1142,6 +1147,7 @@ mod tests {
                     content: "".into(), // empty — only shown in debug
                     kind: crate::app::MessageKind::Normal,
                     idempotency_key: None,
+                    created_at_ms: None,
                 },
                 ChatMessage {
                     id: String::new(),
@@ -1149,6 +1155,7 @@ mod tests {
                     content: "Hi there!".into(),
                     kind: crate::app::MessageKind::Normal,
                     idempotency_key: None,
+                    created_at_ms: None,
                 },
             ],
             model_selection: None,
@@ -1262,6 +1269,7 @@ mod tests {
                 content: "answer with **strong** word".into(),
                 kind: crate::app::MessageKind::Normal,
                 idempotency_key: None,
+                created_at_ms: None,
             }],
             model_selection: None,
             conversation_personality: None,

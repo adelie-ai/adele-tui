@@ -13,7 +13,22 @@
 //! The state machine below is pure: no terminal, no IO. [`State`] is what the
 //! tests drive; the [`Screen`] impl is a thin shell over it.
 
+use std::io;
+
+use crossterm::event::{KeyCode, KeyEvent};
+use desktop_assistant_client_common::SignalEvent;
+use ratatui::{
+    Frame, Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+};
+
+use crate::screen::Screen;
 use crate::settings::Settings;
+use crate::theme::theme;
 
 /// Which global setting a row edits.
 ///
@@ -73,11 +88,16 @@ impl SettingId {
 }
 
 /// What the screen hands back when it closes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Default` is `Unchanged` because [`crate::screen::run_screen`] requires it:
+/// if the driver ever has to bail without the screen settling (a terminal error),
+/// the safe reading is "the user changed nothing", which skips the write.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Outcome {
     /// The user changed something; the caller should apply + persist these.
     Changed(Settings),
     /// Nothing changed — the caller can skip the write entirely.
+    #[default]
     Unchanged,
 }
 
@@ -163,9 +183,185 @@ impl State {
     }
 }
 
+/// Apply one key press to the screen state.
+///
+/// Pure and synchronous — no RPC, because every setting here is client-local.
+/// Split out from the [`Screen`] impl so the tests drive real key events rather
+/// than the state API.
+pub fn handle_key(state: &mut State, key: KeyEvent) {
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j') => state.move_down(),
+        KeyCode::Up | KeyCode::Char('k') => state.move_up(),
+        // Both, because muscle memory splits: Space reads as "tick a checkbox",
+        // Enter as "activate the thing".
+        KeyCode::Char(' ') | KeyCode::Enter => state.toggle_selected(),
+        KeyCode::Esc | KeyCode::Char('q') => state.close(),
+        _ => {}
+    }
+}
+
+/// The settings screen as a [`Screen`]. No client and no `pending`: unlike the
+/// other screens this one issues no RPCs, so it never needs the off-loop
+/// machinery.
+struct SettingsScreen {
+    state: State,
+}
+
+impl Screen for SettingsScreen {
+    type Outcome = Outcome;
+
+    fn draw(&mut self, frame: &mut Frame) {
+        draw(frame, &self.state);
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> impl std::future::Future<Output = ()> {
+        handle_key(&mut self.state, key);
+        std::future::ready(())
+    }
+
+    fn take_outcome(&mut self) -> Option<Outcome> {
+        State::take_outcome(&mut self.state)
+    }
+}
+
+/// Run the settings screen until the user closes it.
+///
+/// Takes the current settings by value and returns whether they changed; the
+/// caller owns persisting the result (there is one write path, in the run loop).
+pub async fn run(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    settings: Settings,
+    signal_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SignalEvent>,
+    sink: &mut impl crate::screen::SignalSink,
+) -> anyhow::Result<Outcome> {
+    let mut screen = SettingsScreen {
+        state: State::new(settings),
+    };
+    crate::screen::run_screen(terminal, &mut screen, signal_rx, sink).await
+}
+
+fn draw(f: &mut Frame, state: &State) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            // Help for the highlighted row: the reason this screen beats a
+            // keybinding, so it gets fixed space rather than whatever is left.
+            Constraint::Length(5),
+            Constraint::Length(1),
+        ])
+        .split(f.area());
+
+    draw_header(f, chunks[0]);
+    draw_list(f, state, chunks[1]);
+    draw_help(f, state, chunks[2]);
+    draw_footer(f, chunks[3]);
+}
+
+fn draw_header(f: &mut Frame, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme().border));
+    let text = Line::from(vec![Span::styled(
+        "Settings",
+        Style::default()
+            .fg(theme().title)
+            .add_modifier(Modifier::BOLD),
+    )]);
+    f.render_widget(Paragraph::new(text).block(block), area);
+}
+
+fn draw_list(f: &mut Frame, state: &State, area: Rect) {
+    let label_w = ALL.iter().map(|s| s.label().len()).max().unwrap_or(0);
+    let items: Vec<ListItem> = ALL
+        .iter()
+        .map(|&id| {
+            let on = id.get(state.settings());
+            // A filled/empty box reads at a glance; the on/off word disambiguates
+            // it for anyone whose terminal renders the glyphs poorly.
+            let (mark, word, style) = if on {
+                (
+                    "[x]",
+                    "on",
+                    Style::default()
+                        .fg(theme().pinned)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ("[ ]", "off", Style::default().fg(theme().text_dim))
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{mark} "), style),
+                Span::styled(
+                    format!("{:<width$}", id.label(), width = label_w),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("   ", Style::default()),
+                Span::styled(word, style),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme().border)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(theme().list_highlight)
+                .fg(theme().list_highlight_fg)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▸ ");
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.selected()));
+    f.render_stateful_widget(list, area, &mut list_state);
+}
+
+fn draw_help(f: &mut Frame, state: &State, area: Rect) {
+    let help = ALL.get(state.selected()).map(|id| id.help()).unwrap_or("");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme().border))
+        .title(Line::from(Span::styled(
+            "What this does",
+            Style::default().fg(theme().title),
+        )));
+    f.render_widget(
+        Paragraph::new(help)
+            .style(Style::default().fg(theme().text_dim))
+            .wrap(Wrap { trim: true })
+            .block(block),
+        area,
+    );
+}
+
+fn draw_footer(f: &mut Frame, area: Rect) {
+    let hints = [("↑/↓", "move"), ("Space/Enter", "toggle"), ("Esc", "close")];
+    let mut spans = Vec::new();
+    for (i, (key, desc)) in hints.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ·  ", Style::default().fg(theme().hint_sep)));
+        }
+        spans.push(Span::styled(*key, Style::default().fg(theme().hint_key)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(*desc, Style::default().fg(theme().text_dim)));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
 
     fn state() -> State {
         State::new(Settings::default())
@@ -298,6 +494,119 @@ mod tests {
                 "row {target} must be toggleable"
             );
         }
+    }
+
+    /// Both toggle keys work. Space and Enter are both bound because muscle
+    /// memory splits between "tick the checkbox" and "activate the row"; a
+    /// screen that honoured only one would feel broken to half its users.
+    #[test]
+    fn space_and_enter_both_toggle() {
+        for code in [KeyCode::Char(' '), KeyCode::Enter] {
+            let mut s = state();
+            let before = s.value_at(0).unwrap();
+            handle_key(&mut s, key(code));
+            assert_eq!(
+                s.value_at(0).unwrap(),
+                !before,
+                "{code:?} must toggle the selected row"
+            );
+        }
+    }
+
+    /// Arrow keys and vim keys both navigate, matching the rest of the TUI.
+    #[test]
+    fn arrows_and_vim_keys_both_navigate() {
+        for (down, up) in [
+            (KeyCode::Down, KeyCode::Up),
+            (KeyCode::Char('j'), KeyCode::Char('k')),
+        ] {
+            let mut s = state();
+            handle_key(&mut s, key(down));
+            assert_eq!(s.selected(), 1, "{down:?} must move down");
+            handle_key(&mut s, key(up));
+            assert_eq!(s.selected(), 0, "{up:?} must move up");
+        }
+    }
+
+    /// Esc and q both close.
+    #[test]
+    fn esc_and_q_both_close() {
+        for code in [KeyCode::Esc, KeyCode::Char('q')] {
+            let mut s = state();
+            handle_key(&mut s, key(code));
+            assert!(
+                State::take_outcome(&mut s).is_some(),
+                "{code:?} must close the screen"
+            );
+        }
+    }
+
+    /// An unbound key is inert — it must not toggle, move, or close. The screen
+    /// mutates persisted user settings, so a stray keystroke silently flipping
+    /// something is the failure mode worth pinning.
+    #[test]
+    fn unbound_keys_do_nothing() {
+        let mut s = state();
+        let before = s.settings().clone();
+        for code in [KeyCode::Char('x'), KeyCode::Tab, KeyCode::Backspace] {
+            handle_key(&mut s, key(code));
+        }
+        assert_eq!(s.selected(), 0, "an unbound key must not move the cursor");
+        assert_eq!(
+            s.settings(),
+            &before,
+            "an unbound key must not change values"
+        );
+        assert!(
+            State::take_outcome(&mut s).is_none(),
+            "an unbound key must not close the screen"
+        );
+    }
+
+    /// The screen renders without panicking, at a normal size and squeezed down
+    /// to a height where the fixed-size sections cannot all fit — the classic
+    /// ratatui layout panic.
+    #[test]
+    fn draw_does_not_panic_at_any_size() {
+        for (w, h) in [(80u16, 24u16), (40, 12), (20, 6), (10, 3)] {
+            let backend = ratatui::backend::TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            let s = state();
+            terminal
+                .draw(|f| draw(f, &s))
+                .unwrap_or_else(|e| panic!("draw failed at {w}x{h}: {e}"));
+        }
+    }
+
+    /// The rendered screen actually shows each setting's label and its on/off
+    /// state — a draw that silently rendered an empty list would still pass a
+    /// no-panic test.
+    #[test]
+    fn draw_shows_labels_and_values() {
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let s = state();
+        terminal.draw(|f| draw(f, &s)).expect("draw");
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        for &id in ALL {
+            assert!(
+                rendered.contains(id.label()),
+                "rendered screen is missing the label {:?}",
+                id.label()
+            );
+        }
+        assert!(
+            rendered.contains("[x]") || rendered.contains("[ ]"),
+            "rendered screen shows no on/off markers"
+        );
     }
 
     /// The screen's settings round-trip through the on-disk format, so a toggle
