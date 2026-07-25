@@ -28,7 +28,7 @@ const HINTS_NORMAL: &[(&str, &str)] = &[
     ("F3", "connections"),
     ("F4", "purposes"),
     ("Ctrl+B", "sidebar"),
-    ("Ctrl+T", "debug"),
+    ("F6", "settings"),
 ];
 
 const HINTS_EDITING: &[(&str, &str)] = &[
@@ -141,5 +141,62 @@ mod tests {
         let (spans, _) = render_hints(&InputMode::Normal, 6);
         // First span is the key span; verify it's "n".
         assert!(spans.first().is_some_and(|s| s.content == "n"));
+    }
+
+    /// Every key the toolbar advertises must actually be bound.
+    ///
+    /// This exists because the toolbar keeps its OWN hint list, separate from
+    /// `keys::help_sections()`. When `Ctrl+T` was retired to the settings screen
+    /// (#135) the help table was updated and this list was not, so the toolbar
+    /// went on advertising a dead chord — a lying UI, and exactly the drift
+    /// adele-tui#136 flags. A rendered hint is a promise; this checks we keep it.
+    ///
+    /// Keys are parsed back into the `KeyEvent` the keymap expects, so the
+    /// assertion is against real dispatch rather than a second hardcoded list.
+    #[test]
+    fn every_toolbar_hint_is_a_live_binding() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        fn parse(label: &str) -> Option<KeyEvent> {
+            let (mods, key) = match label.split_once('+') {
+                Some(("Ctrl", rest)) => (KeyModifiers::CONTROL, rest),
+                Some(("Alt", rest)) => (KeyModifiers::ALT, rest),
+                // "S+Enter" (shift) and any other compound label: the keymap
+                // handles those on paths this simple parser does not model.
+                Some(_) => return None,
+                None => (KeyModifiers::NONE, label),
+            };
+            let code = match key {
+                "Enter" => KeyCode::Enter,
+                "Esc" => KeyCode::Esc,
+                f if f.starts_with('F') && f[1..].parse::<u8>().is_ok() => {
+                    KeyCode::F(f[1..].parse().expect("checked above"))
+                }
+                c if c.chars().count() == 1 => {
+                    let ch = c.chars().next().expect("length checked");
+                    // Modifier combos are LABELLED uppercase ("Ctrl+M") but the
+                    // keymap matches the lowercase char the terminal actually
+                    // delivers. Bare keys keep their case — `A` (archive) and
+                    // `a` (show archived) are different bindings.
+                    if mods.is_empty() {
+                        KeyCode::Char(ch)
+                    } else {
+                        KeyCode::Char(ch.to_ascii_lowercase())
+                    }
+                }
+                _ => return None,
+            };
+            Some(KeyEvent::new(code, mods))
+        }
+
+        for mode in [InputMode::Normal, InputMode::Editing, InputMode::Renaming] {
+            for (label, desc) in hints_for(&mode) {
+                let Some(key) = parse(label) else { continue };
+                assert!(
+                    crate::keys::handle_key_event(key, &mode, false).is_some(),
+                    "the toolbar advertises {label:?} ({desc}) in {mode:?}, but it is not bound"
+                );
+            }
+        }
     }
 }
