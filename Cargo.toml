@@ -96,6 +96,26 @@ path = "../voice/crates/client-voice"
 [dependencies.adele-voice-vad-silero]
 path = "../voice/crates/vad-silero"
 
+# macOS: resolve ONNX Runtime at runtime instead of linking it at build time.
+#
+# `ort` ships no prebuilt ONNX Runtime for `x86_64-apple-darwin`, and because
+# `adele-voice-module` depends on vad-silero unconditionally, the link-time path
+# fails the WHOLE crate — `cargo build`/`test`/`clippy` are unavailable on an
+# Intel Mac even for work nowhere near voice. `load-dynamic` restores them.
+#
+# Target-scoped so Linux is completely untouched: cargo unifies features per
+# build, so a Linux build never sees this and keeps linking exactly as before.
+# Opting in here (rather than defaulting it on in vad-silero) keeps the blast
+# radius to this one target.
+#
+# Runtime cost of the opt-in: macOS needs `libonnxruntime` available
+# (`brew install onnxruntime`, or point `ORT_DYLIB_PATH` at it). Absent it, voice
+# input fails when first used instead of at build time — an acceptable trade for
+# a platform whose voice backend is unfinished anyway (adelie-ai/voice#133).
+[target.'cfg(target_os = "macos")'.dependencies.adele-voice-vad-silero]
+path = "../voice/crates/vad-silero"
+features = ["load-dynamic"]
+
 [dependencies.adele-voice-stt-whisper]
 path = "../voice/crates/stt-whisper"
 

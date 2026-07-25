@@ -200,10 +200,10 @@ mod tests {
             !before[0],
             "the selected row must flip"
         );
-        for i in 1..ALL.len() {
+        for (i, &was) in before.iter().enumerate().skip(1) {
             assert_eq!(
                 s.value_at(i).unwrap(),
-                before[i],
+                was,
                 "row {i} must be untouched when row 0 is toggled"
             );
         }
