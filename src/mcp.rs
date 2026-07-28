@@ -299,6 +299,23 @@ pub fn sanitize(s: &str) -> String {
         .collect()
 }
 
+/// Trim a server-declared string and clamp it to
+/// [`MAX_DESCRIPTION_CHARS`](client_ui_common::MAX_DESCRIPTION_CHARS), the same
+/// cap the shared row model applies.
+///
+/// Why here as well: this list renders `McpServerView` directly rather than the
+/// sanitized `ServerRow`, so the cap has to be applied on the draw path. The
+/// constant is imported rather than redefined so the two surfaces cannot drift.
+/// Pair it with [`sanitize`], which handles the control characters.
+fn clamp_declared(s: &str) -> String {
+    s.trim()
+        .chars()
+        .take(client_ui_common::MAX_DESCRIPTION_CHARS)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
 /// Validate a server name on create: non-empty and only letters, digits, `-`,
 /// `_` (mirrors the connections slug contract — the name is a config table key
 /// and a tool-namespace prefix).
@@ -1451,19 +1468,38 @@ fn server_item(server: &McpServerView) -> ListItem<'static> {
     let (tone, status_label) = status_display(&server.status);
     let chip = transport_chip(&server.transport);
 
+    // A server may declare its own display title (SEP-973). Keep the configured
+    // name visible beside it: the name is the identity used in config,
+    // namespacing and errors, so a server must not be able to hide it.
+    let declared_title = server
+        .title
+        .as_deref()
+        .map(sanitize)
+        .filter(|t| !t.trim().is_empty());
+
     let mut head: Vec<Span<'static>> = vec![
         Span::styled("●", Style::default().fg(tone.color())),
         Span::raw(" "),
         Span::styled(
-            sanitize(&server.name),
+            declared_title
+                .clone()
+                .unwrap_or_else(|| sanitize(&server.name)),
             Style::default().add_modifier(Modifier::BOLD),
         ),
+    ];
+    if declared_title.is_some() {
+        head.push(Span::styled(
+            format!("  {}", sanitize(&server.name)),
+            Style::default().fg(theme().text_dim),
+        ));
+    }
+    head.extend([
         Span::styled(format!("  [{chip}]"), Style::default().fg(theme().text_dim)),
         Span::styled(
             format!("  {status_label}"),
             Style::default().fg(tone.color()),
         ),
-    ];
+    ]);
     if server.status == "running" && server.tool_count > 0 {
         let n = server.tool_count;
         head.push(Span::styled(
@@ -1473,6 +1509,18 @@ fn server_item(server: &McpServerView) -> ListItem<'static> {
     }
 
     let mut lines = vec![Line::from(head)];
+    // What the server says it offers (SEP-973). Clamped to the same cap the
+    // shared row model uses, so one server cannot flood the list; `sanitize`
+    // already strips the control characters that would corrupt the terminal.
+    if let Some(description) = server.description.as_deref() {
+        let clamped = clamp_declared(&sanitize(description));
+        if !clamped.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("    {clamped}"),
+                Style::default().fg(theme().text_dim),
+            )));
+        }
+    }
     if !server.target.is_empty() {
         lines.push(Line::from(Span::styled(
             format!("    {}", sanitize(&server.target)),
@@ -2537,7 +2585,40 @@ mod tests {
             detail: None,
             kind: client_ui_common::ServerKind::BuiltIn,
             disabled_reason: reason.map(Into::into),
+            // A built-in has no `initialize` handshake, so it declares nothing.
+            title: None,
+            description: None,
+            website_url: None,
         }
+    }
+
+    /// A server-declared description must not be able to flood the list: it is
+    /// clamped to the same cap the shared row model uses.
+    #[test]
+    fn clamp_declared_caps_a_long_description() {
+        let clamped = clamp_declared(&"x".repeat(5_000));
+        assert_eq!(
+            clamped.chars().count(),
+            client_ui_common::MAX_DESCRIPTION_CHARS
+        );
+    }
+
+    /// `sanitize` handles the control characters that would corrupt the
+    /// terminal; this pins that the two are used together on the draw path.
+    #[test]
+    fn clamp_declared_after_sanitize_has_no_control_characters() {
+        let hostile = "line\u{1b}[2Jone\nline\ttwo";
+        let rendered = clamp_declared(&sanitize(hostile));
+        assert!(
+            !rendered.chars().any(char::is_control),
+            "control characters must not reach the terminal: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn clamp_declared_trims_and_drops_blank() {
+        assert_eq!(clamp_declared("   spaced   "), "spaced");
+        assert!(clamp_declared("      ").is_empty());
     }
 
     #[test]
