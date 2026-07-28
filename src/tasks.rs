@@ -808,6 +808,7 @@ mod tests {
             id: TaskId("t-1".into()),
             kind: TaskKind::Subagent {
                 session_conversation_id: String::new(),
+                notify_parent: false,
                 parent_task_id: TaskId("parent".into()),
                 conversation_id: "subagent-conv".into(),
                 name: "child".into(),
@@ -858,6 +859,7 @@ mod tests {
             id: TaskId("t-3".into()),
             kind: TaskKind::Subagent {
                 session_conversation_id: String::new(),
+                notify_parent: false,
                 parent_task_id: TaskId("parent".into()),
                 conversation_id: "sub-conv".into(),
                 name: "child".into(),
