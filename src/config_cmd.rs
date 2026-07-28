@@ -216,6 +216,13 @@ pub fn mcp_add_server(
     // The definition is always enabled at the definition level (the surface
     // enable list is the on/off switch the `enable`/`disable` subcommands drive);
     // `--enabled` decides whether it is turned on for the given surface(s) now.
+    //
+    // `env`, `env_secrets`, and `inherit_env` are empty because this subcommand
+    // takes no flag for any of them. `inherit_env` names the host-environment
+    // variables one server may inherit, so an empty list is also the value that
+    // keeps the spawned child isolated: it receives only the small global
+    // allowlist. An operator who needs a wider environment edits
+    // `client-mcp.toml` directly, the same way they must for `env`.
     let server = McpServerConfig {
         name: name.to_string(),
         command: command.to_string(),
@@ -224,6 +231,7 @@ pub fn mcp_add_server(
         enabled: true,
         env: HashMap::new(),
         env_secrets: HashMap::new(),
+        inherit_env: Vec::new(),
         http: None,
         description: None,
     };
@@ -430,6 +438,44 @@ mod tests {
         assert!(
             listed.contains("enabled"),
             "an added+enabled server lists as enabled: {listed}"
+        );
+    }
+
+    /// `add-server` takes no environment flag, so the definition it writes must
+    /// grant the spawned child nothing beyond the host's global allowlist. An
+    /// empty `inherit_env` is what keeps that isolation; a later edit that fills
+    /// it in by default would widen every CLI-created server at once.
+    #[test]
+    fn add_server_grants_no_environment_inheritance() {
+        let (_dir, path) = temp_cfg();
+        mcp_add_server(
+            &path,
+            "notes",
+            "notes-mcp",
+            &[],
+            None,
+            &["tui".to_string()],
+            true,
+            &mut Vec::new(),
+        )
+        .expect("add");
+
+        let cfg = ClientMcpConfig::load(&path);
+        let server = cfg
+            .list_defined_servers()
+            .iter()
+            .find(|s| s.name == "notes")
+            .expect("notes server defined after add")
+            .clone();
+        assert!(
+            server.inherit_env.is_empty(),
+            "add-server grants no host-environment inheritance, got {:?}",
+            server.inherit_env
+        );
+        assert!(server.env.is_empty(), "add-server sets no env");
+        assert!(
+            server.env_secrets.is_empty(),
+            "add-server sets no env secrets"
         );
     }
 
