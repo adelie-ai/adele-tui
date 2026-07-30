@@ -3394,6 +3394,7 @@ mod tests {
             messages: vec![],
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         }
     }
 

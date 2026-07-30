@@ -798,6 +798,7 @@ mod tests {
             ],
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         });
         terminal.draw(|f| draw(f, &mut app)).unwrap();
     }
@@ -827,6 +828,7 @@ mod tests {
             messages: vec![],
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         });
 
         // Disabled (default): no "Adele:" cue in the title.
@@ -860,6 +862,7 @@ mod tests {
             messages: vec![],
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         });
 
         // Disabled (default): no "You:" cue in the title.
@@ -885,6 +888,7 @@ mod tests {
             messages: vec![],
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         });
         app.apply_prompt_ack("task1".into(), "1".into());
         app.apply_core(UiMessage::StreamChunk {
@@ -1160,6 +1164,7 @@ mod tests {
             ],
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         });
         app
     }
@@ -1205,6 +1210,7 @@ mod tests {
             messages: vec![],
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         });
         app.set_assistant_status("Searching knowledge base...");
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -1273,6 +1279,7 @@ mod tests {
             }],
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         });
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer().clone();
