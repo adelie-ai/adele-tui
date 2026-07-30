@@ -1583,6 +1583,7 @@ mod tests {
             messages: vec![],
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         });
         let typed = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
         app.textarea.insert_str(typed);
@@ -1628,6 +1629,7 @@ mod tests {
             messages: vec![],
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         });
         let typed = "first paragraph here\nsecond paragraph here";
         app.textarea.insert_str(typed);
@@ -2037,6 +2039,7 @@ mod tests {
             messages: vec![],
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         });
         app.enter_editing_mode();
         app.apply_paste("first\nsecond\nthird");
@@ -2101,6 +2104,7 @@ mod tests {
             messages: vec![],
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         }
     }
 
@@ -2415,6 +2419,7 @@ mod tests {
             messages: vec![],
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         });
         app.apply_prompt_ack("t-1".into(), "c1".into());
         assert_eq!(app.assistant_status.as_deref(), Some("Adele is thinking…"));
@@ -2503,6 +2508,7 @@ mod tests {
             ],
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         });
 
         // Refetched list: "1" was renamed and "3" was deleted elsewhere; "2"
@@ -2557,6 +2563,7 @@ mod tests {
             messages: vec![],
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         });
 
         let deleted = app.delete_selected_conversation();
@@ -2659,6 +2666,7 @@ mod tests {
             messages: vec![],
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         });
 
         app.apply_rename("2", "Renamed Second");
@@ -2789,6 +2797,7 @@ mod tests {
             messages: vec![],
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         });
         app.apply_rename("2", "Renamed");
         assert_eq!(app.conversations()[1].title, "Renamed");
@@ -2838,6 +2847,7 @@ mod tests {
             messages: vec![],
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         });
         let ovr = desktop_assistant_api_model::SendPromptOverride {
             connection_id: "work".into(),
@@ -3058,6 +3068,7 @@ mod tests {
             messages: vec![],
             model_selection: None,
             conversation_personality: None,
+            tool_gate_disabled: false,
         });
         app
     }
