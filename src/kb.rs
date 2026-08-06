@@ -35,7 +35,7 @@
 use std::{io, time::Duration};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use desktop_assistant_api_model::{KnowledgeEntryView, MaintenanceOp, SUMMARY_MAX_CHARS};
+use desktop_assistant_api_model::{KnowledgeEntryView, MaintenanceOp};
 use desktop_assistant_client_common::{AssistantClient, SignalEvent, TransportClient};
 use ratatui::{
     Frame, Terminal,
@@ -1104,6 +1104,7 @@ fn draw_recalc_overlay(f: &mut Frame, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use desktop_assistant_api_model::SUMMARY_MAX_CHARS;
     use serde_json::json;
 
     /// The one place in this crate that names every field of the upstream
