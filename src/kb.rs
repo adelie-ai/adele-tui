@@ -35,7 +35,7 @@
 use std::{io, time::Duration};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use desktop_assistant_api_model::{KnowledgeEntryView, MaintenanceOp};
+use desktop_assistant_api_model::{KnowledgeEntryView, MaintenanceOp, SUMMARY_MAX_CHARS};
 use desktop_assistant_client_common::{AssistantClient, SignalEvent, TransportClient};
 use ratatui::{
     Frame, Terminal,
@@ -53,6 +53,15 @@ use crate::screen::Screen;
 const LIST_LIMIT: u32 = 100;
 const SEARCH_LIMIT: u32 = 50;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// How much of the entry line the delete-confirm popup can show. The popup is
+/// 64 columns wide and 3 lines tall inside its border, and it must still fit
+/// the key hint under the question, so the label gets one line of it.
+const DELETE_LABEL_MAX_CHARS: usize = 60;
+
+/// What ends a label the popup had to cut, matching the marker the shared
+/// display line uses.
+const TRUNCATION_MARKER: &str = "...";
 
 use crate::theme::theme;
 
@@ -757,6 +766,36 @@ fn draw_search_bar(f: &mut Frame, state: &State, area: Rect) {
     f.render_widget(&ta, area);
 }
 
+/// One list row for an entry: the line that stands for it, then its tags.
+///
+/// The line comes from [`KnowledgeEntryView::display_line`] - the entry's
+/// written summary where there is one, otherwise a bounded, marked prefix of
+/// the content. That rule lives with the wire type, so this browser, the other
+/// clients and the daemon all show the same line for the same entry.
+fn entry_row(entry: &KnowledgeEntryView) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(entry.display_line(), Style::default())];
+    if !entry.tags.is_empty() {
+        spans.push(Span::styled(
+            format!("  [{}]", entry.tags.join(", ")),
+            Style::default().fg(theme().text_dim),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// The entry name the delete-confirm popup shows: the same line the list row
+/// shows, cut again to what the popup can hold.
+fn delete_label(entry: &KnowledgeEntryView) -> String {
+    let line = entry.display_line();
+    if line.chars().count() <= DELETE_LABEL_MAX_CHARS {
+        return line;
+    }
+    let keep = DELETE_LABEL_MAX_CHARS - TRUNCATION_MARKER.chars().count();
+    let mut out: String = line.chars().take(keep).collect();
+    out.push_str(TRUNCATION_MARKER);
+    out
+}
+
 fn draw_list(f: &mut Frame, state: &State, area: Rect) {
     let items: Vec<ListItem> = if state.entries.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
@@ -767,25 +806,7 @@ fn draw_list(f: &mut Frame, state: &State, area: Rect) {
         state
             .entries
             .iter()
-            .map(|entry| {
-                let summary = entry.content.lines().next().unwrap_or("").to_string();
-                let trimmed = if summary.chars().count() > 80 {
-                    let mut s: String = summary.chars().take(80).collect();
-                    s.push('…');
-                    s
-                } else {
-                    summary
-                };
-                let mut spans: Vec<Span<'static>> = Vec::new();
-                spans.push(Span::styled(trimmed, Style::default()));
-                if !entry.tags.is_empty() {
-                    spans.push(Span::styled(
-                        format!("  [{}]", entry.tags.join(", ")),
-                        Style::default().fg(theme().text_dim),
-                    ));
-                }
-                ListItem::new(Line::from(spans))
-            })
+            .map(|entry| ListItem::new(entry_row(entry)))
             .collect()
     };
 
@@ -1009,16 +1030,7 @@ fn draw_delete_overlay(f: &mut Frame, state: &State, area: Rect) {
     let label = state
         .entries
         .get(state.selected)
-        .map(|e| {
-            let summary = e.content.lines().next().unwrap_or("").to_string();
-            if summary.chars().count() > 60 {
-                let mut s: String = summary.chars().take(60).collect();
-                s.push('…');
-                s
-            } else {
-                summary
-            }
-        })
+        .map(delete_label)
         .unwrap_or_else(|| "this entry".into());
     let popup_width = 64.min(area.width.saturating_sub(4));
     let popup_height = 5.min(area.height.saturating_sub(2));
