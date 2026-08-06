@@ -678,6 +678,7 @@ fn context_usage_span(usage: crate::app::ContextUsageView) -> (String, Color) {
 mod tests {
     use super::*;
     use crate::app::{ChatMessage, ConversationDetail, ConversationSummary};
+    use crate::test_fixtures::{chat_message, conversation_detail, conversation_summary};
     use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
@@ -754,16 +755,13 @@ mod tests {
         let mut app = App::new();
         app.set_conversations(vec![
             ConversationSummary {
-                id: "1".into(),
                 title: "Chat 1".into(),
                 message_count: 3,
-                archived: false,
+                ..conversation_summary("1")
             },
             ConversationSummary {
-                id: "2".into(),
                 title: "Chat 2".into(),
-                message_count: 0,
-                archived: false,
+                ..conversation_summary("2")
             },
         ]);
         app.selected_conversation = Some(0);
@@ -776,29 +774,20 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
         app.load_conversation(ConversationDetail {
-            id: "1".into(),
             title: "Test".into(),
             messages: vec![
                 ChatMessage {
-                    id: String::new(),
                     role: "user".into(),
                     content: "Hello".into(),
-                    kind: crate::app::MessageKind::Normal,
-                    idempotency_key: None,
-                    created_at_ms: None,
+                    ..chat_message()
                 },
                 ChatMessage {
-                    id: String::new(),
                     role: "assistant".into(),
                     content: "Hi there!".into(),
-                    kind: crate::app::MessageKind::Normal,
-                    idempotency_key: None,
-                    created_at_ms: None,
+                    ..chat_message()
                 },
             ],
-            model_selection: None,
-            conversation_personality: None,
-            tool_gate_disabled: false,
+            ..conversation_detail("1")
         });
         terminal.draw(|f| draw(f, &mut app)).unwrap();
     }
@@ -823,12 +812,8 @@ mod tests {
         // and reflects the current level label.
         let mut app = App::new();
         app.load_conversation(ConversationDetail {
-            id: "c1".into(),
             title: "ChatProbe".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-            tool_gate_disabled: false,
+            ..conversation_detail("c1")
         });
 
         // Disabled (default): no "Adele:" cue in the title.
@@ -857,12 +842,8 @@ mod tests {
         // is distinct from the Adele cue.
         let mut app = App::new();
         app.load_conversation(ConversationDetail {
-            id: "c1".into(),
             title: "ChatProbe".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-            tool_gate_disabled: false,
+            ..conversation_detail("c1")
         });
 
         // Disabled (default): no "You:" cue in the title.
@@ -883,12 +864,8 @@ mod tests {
         // the in-flight stream is active for the view; the chunk then buffers and
         // paints through the same render guard production uses.
         app.load_conversation(ConversationDetail {
-            id: "1".into(),
             title: "Test".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-            tool_gate_disabled: false,
+            ..conversation_detail("1")
         });
         app.apply_prompt_ack("task1".into(), "1".into());
         app.apply_core(UiMessage::StreamChunk {
@@ -1068,10 +1045,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
         app.set_conversations(vec![ConversationSummary {
-            id: "1".into(),
             title: "Chat 1".into(),
-            message_count: 0,
-            archived: false,
+            ..conversation_summary("1")
         }]);
         app.selected_conversation = Some(0);
         app.begin_rename();
@@ -1084,10 +1059,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
         app.set_conversations(vec![ConversationSummary {
-            id: "1".into(),
             title: "Sidebar Title Probe".into(),
-            message_count: 0,
-            archived: false,
+            ..conversation_summary("1")
         }]);
         app.show_sidebar = false;
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -1103,10 +1076,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
         app.set_conversations(vec![ConversationSummary {
-            id: "1".into(),
             title: "Visible Probe".into(),
-            message_count: 0,
-            archived: false,
+            ..conversation_summary("1")
         }]);
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -1118,53 +1089,35 @@ mod tests {
         let mut app = App::new();
         app.show_debug = show_debug;
         app.load_conversation(ConversationDetail {
-            id: "1".into(),
             title: "Test".into(),
             messages: vec![
                 ChatMessage {
-                    id: String::new(),
                     role: "user".into(),
                     content: "Hello".into(),
-                    kind: crate::app::MessageKind::Normal,
-                    idempotency_key: None,
-                    created_at_ms: None,
+                    ..chat_message()
                 },
                 ChatMessage {
-                    id: String::new(),
                     role: "tool".into(),
                     content: "ran search(foo)".into(),
-                    kind: crate::app::MessageKind::Normal,
-                    idempotency_key: None,
-                    created_at_ms: None,
+                    ..chat_message()
                 },
                 ChatMessage {
-                    id: String::new(),
                     role: "system".into(),
                     content: "context updated".into(),
-                    kind: crate::app::MessageKind::Normal,
-                    idempotency_key: None,
-                    created_at_ms: None,
+                    ..chat_message()
                 },
                 ChatMessage {
-                    id: String::new(),
                     role: "assistant".into(),
                     content: "".into(), // empty — only shown in debug
-                    kind: crate::app::MessageKind::Normal,
-                    idempotency_key: None,
-                    created_at_ms: None,
+                    ..chat_message()
                 },
                 ChatMessage {
-                    id: String::new(),
                     role: "assistant".into(),
                     content: "Hi there!".into(),
-                    kind: crate::app::MessageKind::Normal,
-                    idempotency_key: None,
-                    created_at_ms: None,
+                    ..chat_message()
                 },
             ],
-            model_selection: None,
-            conversation_personality: None,
-            tool_gate_disabled: false,
+            ..conversation_detail("1")
         });
         app
     }
@@ -1205,12 +1158,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
         app.load_conversation(ConversationDetail {
-            id: "1".into(),
             title: "Test".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-            tool_gate_disabled: false,
+            ..conversation_detail("1")
         });
         app.set_assistant_status("Searching knowledge base...");
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -1267,19 +1216,13 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
         app.load_conversation(ConversationDetail {
-            id: "1".into(),
             title: "Test".into(),
             messages: vec![ChatMessage {
-                id: String::new(),
                 role: "assistant".into(),
                 content: "answer with **strong** word".into(),
-                kind: crate::app::MessageKind::Normal,
-                idempotency_key: None,
-                created_at_ms: None,
+                ..chat_message()
             }],
-            model_selection: None,
-            conversation_personality: None,
-            tool_gate_disabled: false,
+            ..conversation_detail("1")
         });
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer().clone();

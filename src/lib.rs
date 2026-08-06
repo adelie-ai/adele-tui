@@ -26,6 +26,8 @@ pub mod screen;
 pub mod settings;
 pub mod settings_screen;
 pub mod tasks;
+#[cfg(test)]
+pub mod test_fixtures;
 pub mod theme;
 pub mod toolbar;
 pub mod ui;

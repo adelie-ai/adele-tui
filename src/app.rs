@@ -1207,6 +1207,7 @@ impl Default for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_fixtures::{chat_message, conversation_detail, conversation_summary};
 
     // --- Context-usage indicator (#341) ---
 
@@ -1378,22 +1379,18 @@ mod tests {
     fn sample_conversations() -> Vec<ConversationSummary> {
         vec![
             ConversationSummary {
-                id: "1".into(),
                 title: "First".into(),
                 message_count: 2,
-                archived: false,
+                ..conversation_summary("1")
             },
             ConversationSummary {
-                id: "2".into(),
                 title: "Second".into(),
-                message_count: 0,
-                archived: false,
+                ..conversation_summary("2")
             },
             ConversationSummary {
-                id: "3".into(),
                 title: "Third".into(),
                 message_count: 5,
-                archived: false,
+                ..conversation_summary("3")
             },
         ]
     }
@@ -1470,10 +1467,8 @@ mod tests {
     fn single_item_next_stays() {
         let mut app = App::new();
         app.set_conversations(vec![ConversationSummary {
-            id: "1".into(),
             title: "Only".into(),
-            message_count: 0,
-            archived: false,
+            ..conversation_summary("1")
         }]);
         app.selected_conversation = Some(0);
         app.next_conversation();
@@ -1578,12 +1573,8 @@ mod tests {
     fn submit_prompt_sends_unwrapped_text_after_display_wrap() {
         let mut app = App::new();
         app.load_conversation(ConversationDetail {
-            id: "c1".into(),
             title: "t".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-            tool_gate_disabled: false,
+            ..conversation_detail("c1")
         });
         let typed = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
         app.textarea.insert_str(typed);
@@ -1624,12 +1615,8 @@ mod tests {
     fn submit_prompt_preserves_explicit_user_newlines() {
         let mut app = App::new();
         app.load_conversation(ConversationDetail {
-            id: "c1".into(),
             title: "t".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-            tool_gate_disabled: false,
+            ..conversation_detail("c1")
         });
         let typed = "first paragraph here\nsecond paragraph here";
         app.textarea.insert_str(typed);
@@ -2034,12 +2021,8 @@ mod tests {
         // the newlines intact, not three partial prompts.
         let mut app = App::new();
         app.load_conversation(ConversationDetail {
-            id: "c1".into(),
             title: "Test".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-            tool_gate_disabled: false,
+            ..conversation_detail("c1")
         });
         app.enter_editing_mode();
         app.apply_paste("first\nsecond\nthird");
@@ -2097,16 +2080,7 @@ mod tests {
 
     // --- Conversation-id threading (TUI-4) + disconnect reset (TUI-8) ---
 
-    fn detail(id: &str) -> ConversationDetail {
-        ConversationDetail {
-            id: id.into(),
-            title: format!("Conv {id}"),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-            tool_gate_disabled: false,
-        }
-    }
+    use crate::test_fixtures::conversation_detail as detail;
 
     // These exercise the TUI's *integration* with the shared core — that
     // `apply_core` applies the reducer's streaming effects onto `App`'s own
@@ -2414,12 +2388,8 @@ mod tests {
         // "thinking" cue so there's no dead air after pressing Enter.
         let mut app = App::new();
         app.load_conversation(ConversationDetail {
-            id: "c1".into(),
             title: "Test".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-            tool_gate_disabled: false,
+            ..conversation_detail("c1")
         });
         app.apply_prompt_ack("t-1".into(), "c1".into());
         assert_eq!(app.assistant_status.as_deref(), Some("Adele is thinking…"));
@@ -2460,10 +2430,8 @@ mod tests {
         let mut app = app_with_conversations();
         app.selected_conversation = Some(2);
         app.set_conversations(vec![ConversationSummary {
-            id: "1".into(),
             title: "Only".into(),
-            message_count: 0,
-            archived: false,
+            ..conversation_summary("1")
         }]);
         assert_eq!(app.selected_conversation, Some(0));
     }
@@ -2486,45 +2454,36 @@ mod tests {
         let mut app = app_with_conversations();
         app.selected_conversation = Some(1);
         app.load_conversation(ConversationDetail {
-            id: "2".into(),
             title: "Second".into(),
             messages: vec![
                 ChatMessage {
                     id: "m1".into(),
                     role: "user".into(),
                     content: "hello".into(),
-                    kind: crate::app::MessageKind::Normal,
-                    idempotency_key: None,
-                    created_at_ms: None,
+                    ..chat_message()
                 },
                 ChatMessage {
                     id: "m2".into(),
                     role: "assistant".into(),
                     content: "hi there".into(),
-                    kind: crate::app::MessageKind::Normal,
-                    idempotency_key: None,
-                    created_at_ms: None,
+                    ..chat_message()
                 },
             ],
-            model_selection: None,
-            conversation_personality: None,
-            tool_gate_disabled: false,
+            ..conversation_detail("2")
         });
 
         // Refetched list: "1" was renamed and "3" was deleted elsewhere; "2"
         // (the open one) survives.
         let effects = app.apply_core(UiMessage::ConversationListRefetched(vec![
             ConversationSummary {
-                id: "1".into(),
                 title: "First (renamed elsewhere)".into(),
                 message_count: 3,
-                archived: false,
+                ..conversation_summary("1")
             },
             ConversationSummary {
-                id: "2".into(),
                 title: "Second".into(),
                 message_count: 2,
-                archived: false,
+                ..conversation_summary("2")
             },
         ]));
         assert!(
@@ -2558,12 +2517,8 @@ mod tests {
         // `load_conversation` (not a raw field write) so core's open-conversation
         // id is set — the reducer's delete keys its "clear the open chat" on it.
         app.load_conversation(ConversationDetail {
-            id: "2".into(),
             title: "Second".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-            tool_gate_disabled: false,
+            ..conversation_detail("2")
         });
 
         let deleted = app.delete_selected_conversation();
@@ -2661,12 +2616,8 @@ mod tests {
     fn rename_routes_through_core_and_refreshes_the_open_title() {
         let mut app = app_with_conversations();
         app.load_conversation(ConversationDetail {
-            id: "2".into(),
             title: "Second".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-            tool_gate_disabled: false,
+            ..conversation_detail("2")
         });
 
         app.apply_rename("2", "Renamed Second");
@@ -2692,10 +2643,8 @@ mod tests {
     fn delete_only_item_clears_selection() {
         let mut app = App::new();
         app.set_conversations(vec![ConversationSummary {
-            id: "1".into(),
             title: "Only".into(),
-            message_count: 0,
-            archived: false,
+            ..conversation_summary("1")
         }]);
         app.selected_conversation = Some(0);
 
@@ -2792,12 +2741,8 @@ mod tests {
     fn apply_rename_updates_sidebar_and_current() {
         let mut app = app_with_conversations();
         app.load_conversation(ConversationDetail {
-            id: "2".into(),
             title: "Second".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-            tool_gate_disabled: false,
+            ..conversation_detail("2")
         });
         app.apply_rename("2", "Renamed");
         assert_eq!(app.conversations()[1].title, "Renamed");
@@ -2842,12 +2787,8 @@ mod tests {
     fn apply_model_override_updates_current_conversation_and_stages_pending() {
         let mut app = App::new();
         app.load_conversation(ConversationDetail {
-            id: "c1".into(),
             title: "Chat".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-            tool_gate_disabled: false,
+            ..conversation_detail("c1")
         });
         let ovr = desktop_assistant_api_model::SendPromptOverride {
             connection_id: "work".into(),
@@ -2974,16 +2915,12 @@ mod tests {
         let mut app = App::new();
         app.set_conversations(vec![
             ConversationSummary {
-                id: "conv-1".into(),
                 title: "Other".into(),
-                message_count: 0,
-                archived: false,
+                ..conversation_summary("conv-1")
             },
             ConversationSummary {
-                id: "conv-x".into(),
                 title: "Linked".into(),
-                message_count: 0,
-                archived: false,
+                ..conversation_summary("conv-x")
             },
         ]);
         app.tasks
@@ -3063,12 +3000,8 @@ mod tests {
         let mut app = App::new();
         // Via `load_conversation` so core's open-conversation id is dual-written.
         app.load_conversation(ConversationDetail {
-            id: id.into(),
             title: "Chat".into(),
-            messages: vec![],
-            model_selection: None,
-            conversation_personality: None,
-            tool_gate_disabled: false,
+            ..detail(id)
         });
         app
     }
