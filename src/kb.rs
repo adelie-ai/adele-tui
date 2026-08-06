@@ -1094,6 +1094,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The one place in this crate that names every field of the upstream
+    /// `KnowledgeEntryView`. Every other fixture starts from this one with
+    /// functional update syntax, so a field added upstream is a single edit
+    /// here rather than an edit per test.
     fn entry(id: &str, content: &str) -> KnowledgeEntryView {
         KnowledgeEntryView {
             id: id.into(),
@@ -1102,6 +1106,14 @@ mod tests {
             metadata: json!({"source": "manual"}),
             created_at: "2026-05-01T00:00:00Z".into(),
             updated_at: "2026-05-02T12:34:56Z".into(),
+            summary: None,
+        }
+    }
+
+    fn entry_with_summary(id: &str, content: &str, summary: &str) -> KnowledgeEntryView {
+        KnowledgeEntryView {
+            summary: Some(summary.into()),
+            ..entry(id, content)
         }
     }
 
@@ -1148,6 +1160,95 @@ mod tests {
         assert!(form.updated_at.is_some());
         assert_eq!(form.content.lines().join("\n"), "first line\nsecond line");
         assert_eq!(form.tags.lines().join(""), "preference");
+    }
+
+    /// The row's leading span: the one line that stands for the entry, before
+    /// the tag chip.
+    fn row_line(entry: &KnowledgeEntryView) -> String {
+        entry_row(entry).spans[0].content.to_string()
+    }
+
+    #[test]
+    fn a_list_row_shows_the_stored_summary_when_there_is_one() {
+        let e = entry_with_summary(
+            "kb-1",
+            "A long body that a reader should never meet in a list row.",
+            "Prefers dark themes",
+        );
+
+        assert_eq!(row_line(&e), "Prefers dark themes");
+    }
+
+    #[test]
+    fn a_list_row_falls_back_to_the_content_when_there_is_no_summary() {
+        // Nothing writes a summary yet, so this is the common path today.
+        let e = entry("kb-1", "User prefers dark mode");
+
+        assert_eq!(row_line(&e), "User prefers dark mode");
+    }
+
+    #[test]
+    fn a_list_row_marks_a_cut_line_so_it_never_reads_as_complete() {
+        let e = entry("kb-1", &"x".repeat(SUMMARY_MAX_CHARS + 1));
+
+        let line = row_line(&e);
+
+        assert!(line.ends_with("..."), "a cut row must say so: {line}");
+    }
+
+    #[test]
+    fn a_list_row_leaves_a_short_line_unmarked() {
+        let e = entry("kb-1", "short body");
+
+        assert!(!row_line(&e).ends_with("..."));
+    }
+
+    #[test]
+    fn a_list_row_never_exceeds_the_shared_cap_for_multibyte_content() {
+        // Each of these is two bytes, so a byte-indexed cut lands inside one
+        // and panics. The count that bounds the row is characters.
+        let e = entry("kb-1", &"\u{00e9}".repeat(SUMMARY_MAX_CHARS * 2));
+
+        let line = row_line(&e);
+
+        assert_eq!(line.chars().count(), SUMMARY_MAX_CHARS);
+        assert!(line.ends_with("..."));
+    }
+
+    #[test]
+    fn a_list_row_is_one_physical_line() {
+        // A row is one line of a terminal grid. An embedded newline renders as
+        // nothing there, so a body that spans lines must arrive collapsed.
+        let e = entry("kb-1", "first line\n\n  second   line\t");
+
+        assert_eq!(row_line(&e), "first line second line");
+    }
+
+    #[test]
+    fn a_list_row_still_carries_the_tag_chip() {
+        let e = entry_with_summary("kb-1", "body", "Prefers dark themes");
+
+        let row = entry_row(&e);
+
+        assert_eq!(row.spans.len(), 2);
+        assert!(row.spans[1].content.contains("preference"));
+    }
+
+    #[test]
+    fn the_delete_prompt_names_the_entry_by_the_line_the_row_shows() {
+        let e = entry_with_summary("kb-1", "a long body", "Prefers dark themes");
+
+        assert_eq!(delete_label(&e), "Prefers dark themes");
+    }
+
+    #[test]
+    fn the_delete_prompt_fits_its_popup() {
+        let e = entry("kb-1", &"x".repeat(SUMMARY_MAX_CHARS * 2));
+
+        let label = delete_label(&e);
+
+        assert!(label.chars().count() <= DELETE_LABEL_MAX_CHARS);
+        assert!(label.ends_with("..."), "a cut label must say so: {label}");
     }
 
     #[test]
