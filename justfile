@@ -34,11 +34,11 @@ test:
 test-integration:
     cargo test -- --ignored
 
-# The gate with the `otel` feature on too (OTLP export via adelie-telemetry,
-# epic mcp-core#38 D2). Not part of the default `check`/pre-push path — it
-# needs a C toolchain for the TLS backend and adds real build time — but a
-# change that compiles with default features can still fail with `otel` on,
-# so run this before a change that touches telemetry.
+# OTLP export via adelie-telemetry needs a C toolchain for the TLS backend
+# and adds real build time, so it is not part of the default `check`/pre-push
+# path (epic mcp-core#38 D2) — but a change that compiles with default
+# features can still fail with `otel` on. Run this before a telemetry change.
+# The gate with the `otel` feature on too.
 check-otel: fmt-check
     cargo clippy --all-targets --features otel -- -D warnings
     cargo build --features otel

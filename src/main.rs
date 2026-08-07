@@ -583,6 +583,11 @@ async fn run_headless(config: &ConnectionConfig, prompt: String) -> Result<()> {
         let mut streamed = false;
         let mut reply_bytes = 0usize;
         let stream_span = adele::telemetry::reply_streaming_span(&request_id);
+        // A turn error breaks the loop rather than returning directly, so the
+        // byte count and duration below are recorded on every exit — a turn
+        // that streamed several chunks before failing must not lose that
+        // count just because it ended in an error.
+        let mut turn_error = None;
         async {
             while let Some(event) = signal_rx.recv().await {
                 match event {
@@ -615,7 +620,8 @@ async fn run_headless(config: &ConnectionConfig, prompt: String) -> Result<()> {
                         error,
                         ..
                     } if rid == request_id => {
-                        return Err(anyhow::anyhow!("{error}"));
+                        turn_error = Some(error);
+                        break;
                     }
                     SignalEvent::ClientToolCall {
                         task_id,
@@ -640,12 +646,14 @@ async fn run_headless(config: &ConnectionConfig, prompt: String) -> Result<()> {
                 }
             }
             adele::telemetry::record_reply_bytes(&tracing::Span::current(), reply_bytes);
-            Ok(())
         }
         .instrument(stream_span)
-        .await?;
+        .await;
 
         adele::telemetry::record_turn_duration(turn_started.elapsed());
+        if let Some(error) = turn_error {
+            return Err(anyhow::anyhow!("{error}"));
+        }
         Ok(())
     }
     .instrument(adele::telemetry::turn_span())
