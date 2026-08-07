@@ -50,7 +50,7 @@ use adele::{
     client_tools, connections, credentials, kb, mcp, model_selector, personality_selector, picker,
     purposes, screen, ui, voice,
 };
-use client_ui_common::{Effect, UiMessage};
+use client_ui_common::{Effect, TurnOutcome, UiMessage};
 use desktop_assistant_api_model::ClientToolRegistration;
 use desktop_assistant_client_common::mcp_host::{
     ClientMcpConfig, McpHost, default_client_mcp_path, dispatch_client_tool_call,
@@ -1327,7 +1327,7 @@ async fn run(
                         // stream died with the connection (TUI-8): clear it so no
                         // frozen ▌ buffer lingers and the ack sentinel can't
                         // mis-claim the first post-reconnect stream.
-                        app.clear_streaming_state();
+                        record_turn_reports(&app.clear_streaming_state());
                         connector = None;
                         signal_rx = unbounded_channel().1;
                         reconnect = schedule_reconnect(None);
@@ -1714,6 +1714,38 @@ enum SignalAction {
 ///
 /// The view-level effects (transcript, chat status, and the composer clear on
 /// enqueue) were already absorbed inside `apply_core`.
+/// Record every turn report in `effects` (client-ui-common#51).
+///
+/// The reducer reports a turn on all four paths one can end: the reply
+/// completes, the turn errors, the connection drops, or this client resets its
+/// streaming state on reconnect. This client opens no per-turn span yet, so the
+/// report becomes one log line instead.
+///
+/// That line is what an operator greps to find a turn, so it is INFO and it
+/// carries ids only. The failure text stays off it as a boolean: INFO never
+/// carries content, and the reducer documents that string as untrusted for
+/// telemetry, because neither the daemon nor a provider promises to keep the
+/// user's own words out of a refusal message.
+fn record_turn_reports(effects: &[Effect]) {
+    for effect in effects {
+        if let Effect::TurnFinished {
+            conversation_id,
+            request_id,
+            idempotency_key,
+            outcome,
+        } = effect
+        {
+            tracing::info!(
+                conversation_id = conversation_id.as_str(),
+                request_id = request_id.as_str(),
+                idempotency_key = idempotency_key.as_deref(),
+                failed = matches!(outcome, TurnOutcome::Failed(_)),
+                "turn finished"
+            );
+        }
+    }
+}
+
 async fn run_controller_effects(
     app: &mut App,
     connector: &Option<Rc<Connector>>,
@@ -1724,6 +1756,7 @@ async fn run_controller_effects(
 ) {
     for effect in effects {
         match effect {
+            Effect::TurnFinished { .. } => record_turn_reports(std::slice::from_ref(&effect)),
             Effect::Speak(text) if !text.trim().is_empty() => {
                 enqueue_narration(narration_tx, voice_daemon, voice_session, text);
             }
@@ -2060,7 +2093,7 @@ fn apply_sub_screen_disconnect(
     let Some(reason) = reason else {
         return;
     };
-    app.clear_streaming_state();
+    record_turn_reports(&app.clear_streaming_state());
     *connector = None;
     *signal_rx = unbounded_channel().1;
     *reconnect = schedule_reconnect(None);
@@ -2920,6 +2953,9 @@ async fn run_send_prompt(
     };
     let client = connector.client();
     let refinement = system_refinement.as_deref().unwrap_or("");
+    // Kept for the ack: the send call consumes the key, and the reducer needs it
+    // back to tie the turn to this send (client-ui-common#51).
+    let echoed_key = idempotency_key.clone();
     let result = match (app.take_pending_override(), client.as_commands()) {
         (Some(ovr), Some(commands)) => {
             commands
@@ -2956,7 +2992,9 @@ async fn run_send_prompt(
         }
     };
     match result {
-        Ok(task_id) => app.apply_prompt_ack(task_id, conversation_id),
+        Ok(task_id) => {
+            record_turn_reports(&app.apply_prompt_ack(task_id, conversation_id, echoed_key));
+        }
         Err(e) => {
             let _ = app.apply_core(UiMessage::SendFailed {
                 conversation_id,

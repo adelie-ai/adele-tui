@@ -867,7 +867,7 @@ mod tests {
             title: "Test".into(),
             ..conversation_detail("1")
         });
-        app.apply_prompt_ack("task1".into(), "1".into());
+        app.apply_prompt_ack("task1".into(), "1".into(), None);
         app.apply_core(UiMessage::StreamChunk {
             request_id: "req1".into(),
             chunk: "Partial response...".into(),
