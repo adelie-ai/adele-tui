@@ -26,6 +26,7 @@ pub mod screen;
 pub mod settings;
 pub mod settings_screen;
 pub mod tasks;
+pub mod telemetry;
 #[cfg(test)]
 pub mod test_fixtures;
 pub mod theme;
