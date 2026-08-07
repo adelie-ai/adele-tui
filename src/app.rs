@@ -1200,21 +1200,32 @@ impl App {
         self.pending_delete_conversation = None;
     }
 
-    pub fn delete_selected_conversation(&mut self) -> Option<String> {
-        let id = self.selected_conversation_id()?.to_string();
+    /// Returns the deleted conversation's id, and the turn report the delete
+    /// produced if a reply was still arriving in it (client-ui-common#51).
+    /// `None` when nothing is selected. Run the effects: a turn ended by a
+    /// delete never completes, so nothing else will close a span opened for it.
+    pub fn delete_selected_conversation(&mut self) -> (Option<String>, Vec<Effect>) {
+        let Some(id) = self.selected_conversation_id().map(str::to_string) else {
+            return (None, Vec::new());
+        };
         // Route the removal through the shared core: the reducer drops the row,
         // prunes the conversation's per-conversation voice state (GTK-9 — the TUI
         // previously leaked it, growing the maps unbounded), and clears the open
-        // chat when the deleted conversation was the active one. The emitted
-        // effects are all view-effects (SetConversations re-clamps the positional
-        // selection; ClearChat blanks the chat; the side-pane + EnsureActive
-        // effects are TUI no-ops), so `apply_core` fully handles them.
+        // chat when the deleted conversation was the active one. Every view
+        // effect is handled inside `apply_core` (SetConversations re-clamps the
+        // positional selection; ClearChat blanks the chat; the side-pane +
+        // EnsureActive effects are TUI no-ops).
+        //
+        // What comes back is the turn report, and only that: dropping the
+        // conversation drops its stream, which ends a turn streaming into it.
         let effects = self.apply_core(UiMessage::ConversationDeleted { id: id.clone() });
         debug_assert!(
-            effects.is_empty(),
-            "ConversationDeleted must emit only view-effects: {effects:?}"
+            effects
+                .iter()
+                .all(|e| matches!(e, Effect::TurnFinished { .. })),
+            "ConversationDeleted must emit only view-effects and turn reports: {effects:?}"
         );
-        Some(id)
+        (Some(id), effects)
     }
 }
 
@@ -2611,6 +2622,47 @@ mod tests {
         assert_eq!(app.selected_conversation_id(), Some("2"));
     }
 
+    /// Deleting a conversation with a reply still arriving in it ends that
+    /// turn, so the reducer reports it and this path must hand it back rather
+    /// than assert it away.
+    #[test]
+    fn deleting_a_streaming_conversation_hands_back_the_turn_it_ended() {
+        let mut app = app_with_conversations();
+        app.selected_conversation = Some(1);
+        app.load_conversation(ConversationDetail {
+            title: "Second".into(),
+            ..conversation_detail("2")
+        });
+        app.apply_prompt_ack("task-1".into(), "2".into(), Some("submit-key".into()));
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "req-1".into(),
+            chunk: "half an answer".into(),
+        });
+
+        let (deleted, effects) = app.delete_selected_conversation();
+
+        assert_eq!(deleted, Some("2".to_string()));
+        assert_eq!(
+            turns_finished(&effects),
+            vec![("2", Some("submit-key"))],
+            "the delete must hand back the turn it ended: {effects:?}"
+        );
+    }
+
+    /// Deleting an idle conversation hands back nothing.
+    #[test]
+    fn deleting_an_idle_conversation_hands_back_nothing() {
+        let mut app = app_with_conversations();
+        app.selected_conversation = Some(1);
+        let (deleted, effects) = app.delete_selected_conversation();
+        assert_eq!(deleted, Some("2".to_string()));
+        assert_eq!(
+            turns_finished(&effects),
+            vec![],
+            "no turn was in flight, so none ended: {effects:?}"
+        );
+    }
+
     #[test]
     fn delete_selected_conversation() {
         let mut app = app_with_conversations();
@@ -2622,7 +2674,7 @@ mod tests {
             ..conversation_detail("2")
         });
 
-        let deleted = app.delete_selected_conversation();
+        let deleted = app.delete_selected_conversation().0;
         assert_eq!(deleted, Some("2".to_string()));
         assert_eq!(app.conversations().len(), 2);
         assert!(
@@ -2665,7 +2717,7 @@ mod tests {
         app.begin_delete_confirm();
         assert!(app.confirm_delete(), "reports the overlay was up");
         assert!(!app.delete_confirm_pending(), "overlay cleared on confirm");
-        let deleted = app.delete_selected_conversation();
+        let deleted = app.delete_selected_conversation().0;
         assert_eq!(deleted, Some("2".to_string()));
         assert_eq!(app.conversations().len(), 2);
         assert!(app.conversations().iter().all(|c| c.id != "2"));
@@ -2735,7 +2787,7 @@ mod tests {
         let mut app = app_with_conversations();
         app.selected_conversation = Some(2);
 
-        let deleted = app.delete_selected_conversation();
+        let deleted = app.delete_selected_conversation().0;
         assert_eq!(deleted, Some("3".to_string()));
         assert_eq!(app.selected_conversation, Some(1));
     }
@@ -2749,7 +2801,7 @@ mod tests {
         }]);
         app.selected_conversation = Some(0);
 
-        let deleted = app.delete_selected_conversation();
+        let deleted = app.delete_selected_conversation().0;
         assert_eq!(deleted, Some("1".to_string()));
         assert_eq!(app.selected_conversation, None);
     }
@@ -2757,7 +2809,7 @@ mod tests {
     #[test]
     fn delete_with_no_selection_returns_none() {
         let mut app = app_with_conversations();
-        assert!(app.delete_selected_conversation().is_none());
+        assert!(app.delete_selected_conversation().0.is_none());
     }
 
     #[test]

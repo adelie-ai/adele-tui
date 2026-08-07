@@ -1716,10 +1716,11 @@ enum SignalAction {
 /// enqueue) were already absorbed inside `apply_core`.
 /// Record every turn report in `effects` (client-ui-common#51).
 ///
-/// The reducer reports a turn on all four paths one can end: the reply
-/// completes, the turn errors, the connection drops, or this client resets its
-/// streaming state on reconnect. This client opens no per-turn span yet, so the
-/// report becomes one log line instead.
+/// The reducer reports a turn wherever it drops, clears or replaces a stream:
+/// the reply completes, the turn errors, the connection drops, this client
+/// resets its streaming state on reconnect, the conversation is deleted, or a
+/// later ack replaces a turn still in flight. This client opens no per-turn
+/// span yet, so the report becomes one log line instead.
 ///
 /// That line is what an operator greps to find a turn, so it is INFO and it
 /// carries ids only. The failure text stays off it as a boolean: INFO never
@@ -2153,7 +2154,9 @@ async fn handle_action(
             // Optimistically remove locally (TUI-2 shape), then delete off-loop.
             // The future only resyncs the sidebar when the delete fails, so a
             // failed delete can't leave the row missing; success is silent.
-            if let Some(id) = app.delete_selected_conversation() {
+            let (deleted, ended) = app.delete_selected_conversation();
+            record_turn_reports(&ended);
+            if let Some(id) = deleted {
                 let show_archived = app.show_archived;
                 in_flight.push(async move {
                     match conn.client().delete_conversation(&id).await {
