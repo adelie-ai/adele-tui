@@ -28,6 +28,7 @@ use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     time::{Instant, sleep_until},
 };
+use tracing::Instrument as _;
 
 // The binary is a thin shim over the `adele` library crate (refactor #3): every
 // screen/widget/helper module lives in `lib.rs` and is reached via `adele::`,
@@ -426,44 +427,6 @@ fn install_panic_hook() {
     }));
 }
 
-/// Build the tracing `EnvFilter` directive for a `-v` count. `RUST_LOG`, when
-/// set, takes precedence and this is not consulted. Higher counts widen the
-/// level for our own crates while keeping third-party noise at `warn`.
-fn log_filter(verbose: u8) -> String {
-    let level = match verbose {
-        0 => "warn",
-        1 => "info",
-        2 => "debug",
-        _ => "trace",
-    };
-    format!(
-        "warn,adele={level},desktop_assistant_client_common={level},\
-         desktop_assistant_mcp_client={level},client_ui_common={level}"
-    )
-}
-
-/// Install a stderr tracing subscriber when `-v`/`--verbose` is given or
-/// `RUST_LOG` is set; otherwise stay silent so normal output is clean. Logging
-/// to stderr keeps a headless `--prompt` run's reply (stdout) separable from
-/// diagnostics. Best-effort: an already-installed global subscriber is a no-op.
-fn init_logging(verbose: u8) {
-    use tracing_subscriber::EnvFilter;
-    let has_rust_log = std::env::var_os("RUST_LOG").is_some();
-    if verbose == 0 && !has_rust_log {
-        return;
-    }
-    let filter = if has_rust_log {
-        EnvFilter::from_default_env()
-    } else {
-        EnvFilter::new(log_filter(verbose))
-    };
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .with_target(true)
-        .try_init();
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // Both `ring` and `aws-lc-rs` end up enabled in rustls because reqwest 0.12
@@ -479,9 +442,13 @@ async fn main() -> Result<()> {
     let cli = CliArgs::from_arg_matches(&matches)?;
     let cli_explicit = any_explicit_connection_arg(&matches);
 
-    // Install logging first so connection/registration/streaming diagnostics are
-    // captured for the headless path too (verbose or RUST_LOG; silent otherwise).
-    init_logging(cli.global.verbose);
+    // Install telemetry first so connection/registration/streaming diagnostics
+    // are captured for the headless path too (verbose or RUST_LOG; silent
+    // otherwise). Held for the life of `main` (epic mcp-core#38 D6): dropping
+    // the guard flushes the exporters, so every return path below — `config`,
+    // headless `exec`, and the interactive TUI — needs it alive through its
+    // own return.
+    let _telemetry_guard = adele::telemetry::init_logging(cli.global.verbose);
 
     // `config …`: pure, daemon-free config management. Dispatch and return
     // before any terminal setup or daemon connection.
@@ -542,118 +509,147 @@ async fn main() -> Result<()> {
 /// tools, send the prompt, stream the reply to stdout, and exit. A client tool
 /// call during the turn is routed to the MCP host (or resolved via the built-in
 /// dispatch) and its result submitted so the turn always resumes.
+///
+/// The whole function runs inside the turn root span (epic mcp-core#38
+/// D12/D13, adele-tui#152): it opens here, the moment the prompt is read, and
+/// closes when the function returns, which is exactly when the reply finishes
+/// streaming (there is no work after the loop below). Connect, registration,
+/// and reply streaming are its child spans. None of this carries the prompt
+/// or reply text (D10) — only ids and byte counts.
 async fn run_headless(config: &ConnectionConfig, prompt: String) -> Result<()> {
     use std::io::Write as _;
 
-    let conn = Connector::connect(config)
-        .await
-        .map_err(|e| anyhow::anyhow!("connection failed: {e}"))?;
-    let mut signal_rx = conn.subscribe();
+    async move {
+        let conn = Connector::connect(config)
+            .instrument(adele::telemetry::connect_span())
+            .await
+            .map_err(|e| anyhow::anyhow!("connection failed: {e}"))?;
+        let mut signal_rx = conn.subscribe();
 
-    // Start the client-side MCP host for the `tui` surface and advertise its
-    // tools (merged with the built-ins) so a headless prompt can trigger local
-    // tools exactly like the interactive client. Keep the loaded config in scope
-    // so its per-surface disabled-built-in list can be consulted below.
-    let mcp_cfg = ClientMcpConfig::load(&default_client_mcp_path());
-    let servers: Vec<_> = mcp_cfg
-        .resolved_servers("tui")
-        .into_iter()
-        .cloned()
-        .collect();
-    // Compiled-in built-ins (da#538 Phase C/D): host the full core MCP set
-    // in-process. `McpHost::start_with_disabled` centralizes the override,
-    // skipping (and logging) any built-in whose name a client-mcp.toml server
-    // already provides, plus any the user disabled for the `tui` surface in
-    // client config (da#538 slice 4).
-    let mcp_builtins = adele::builtins::builtin_servers();
-    let host = if servers.is_empty() && mcp_builtins.is_empty() {
-        None
-    } else {
-        Some(
-            McpHost::start_with_disabled(
-                &servers,
-                mcp_builtins,
-                mcp_cfg.surface_disabled_builtins("tui"),
+        // Start the client-side MCP host for the `tui` surface and advertise its
+        // tools (merged with the built-ins) so a headless prompt can trigger local
+        // tools exactly like the interactive client. Keep the loaded config in scope
+        // so its per-surface disabled-built-in list can be consulted below.
+        let mcp_cfg = ClientMcpConfig::load(&default_client_mcp_path());
+        let servers: Vec<_> = mcp_cfg
+            .resolved_servers("tui")
+            .into_iter()
+            .cloned()
+            .collect();
+        // Compiled-in built-ins (da#538 Phase C/D): host the full core MCP set
+        // in-process. `McpHost::start_with_disabled` centralizes the override,
+        // skipping (and logging) any built-in whose name a client-mcp.toml server
+        // already provides, plus any the user disabled for the `tui` surface in
+        // client config (da#538 slice 4).
+        let mcp_builtins = adele::builtins::builtin_servers();
+        let host = if servers.is_empty() && mcp_builtins.is_empty() {
+            None
+        } else {
+            Some(
+                McpHost::start_with_disabled(
+                    &servers,
+                    mcp_builtins,
+                    mcp_cfg.surface_disabled_builtins("tui"),
+                )
+                .await,
             )
-            .await,
-        )
-    };
-    let host_tools = host.as_ref().map(|h| h.registrations()).unwrap_or_default();
-    let builtins = vec![
-        client_tools::say_this_registration(),
-        client_tools::request_voice_registration(),
-        client_tools::stop_voice_registration(),
-    ];
-    // Best-effort: client tools need a command channel (UDS/WS), not D-Bus.
-    let _ = conn
-        .register_client_tools(merge_registrations(builtins, host_tools))
-        .await;
+        };
+        let host_tools = host.as_ref().map(|h| h.registrations()).unwrap_or_default();
+        let builtins = vec![
+            client_tools::say_this_registration(),
+            client_tools::request_voice_registration(),
+            client_tools::stop_voice_registration(),
+        ];
+        // Best-effort: client tools need a command channel (UDS/WS), not D-Bus.
+        let _ = conn
+            .register_client_tools(merge_registrations(builtins, host_tools))
+            .instrument(adele::telemetry::registration_span())
+            .await;
 
-    let conversation_id = conn
-        .client()
-        .create_conversation("adele --prompt")
-        .await
-        .map_err(|e| anyhow::anyhow!("could not create conversation: {e}"))?;
-    let request_id = conn
-        .send_prompt_with_system_refinement(&conversation_id, &prompt, "")
-        .await
-        .map_err(|e| anyhow::anyhow!("could not send prompt: {e}"))?;
+        let conversation_id = conn
+            .client()
+            .create_conversation("adele --prompt")
+            .await
+            .map_err(|e| anyhow::anyhow!("could not create conversation: {e}"))?;
+        adele::telemetry::record_conversation_id(&tracing::Span::current(), &conversation_id);
 
-    let mut stdout = io::stdout();
-    let mut streamed = false;
-    while let Some(event) = signal_rx.recv().await {
-        match event {
-            SignalEvent::Chunk {
-                request_id: rid,
-                chunk,
-                ..
-            } if rid == request_id => {
-                streamed = true;
-                let _ = stdout.write_all(chunk.as_bytes());
-                let _ = stdout.flush();
-            }
-            SignalEvent::Complete {
-                request_id: rid,
-                full_response,
-                ..
-            } if rid == request_id => {
-                // Some providers don't stream chunks; fall back to the final text.
-                if !streamed {
-                    let _ = stdout.write_all(full_response.as_bytes());
-                }
-                let _ = writeln!(stdout);
-                break;
-            }
-            SignalEvent::Error {
-                request_id: rid,
-                error,
-                ..
-            } if rid == request_id => {
-                return Err(anyhow::anyhow!("{error}"));
-            }
-            SignalEvent::ClientToolCall {
-                task_id,
-                tool_call_id,
-                tool_name,
-                arguments,
-                ..
-            } => {
-                let result = match host.as_ref() {
-                    Some(host) if host.handles(&tool_name) => {
-                        host.call(&tool_name, arguments).await
+        let turn_started = Instant::now();
+        let request_id = conn
+            .send_prompt_with_system_refinement(&conversation_id, &prompt, "")
+            .await
+            .map_err(|e| anyhow::anyhow!("could not send prompt: {e}"))?;
+
+        let mut stdout = io::stdout();
+        let mut streamed = false;
+        let mut reply_bytes = 0usize;
+        let stream_span = adele::telemetry::reply_streaming_span(&request_id);
+        async {
+            while let Some(event) = signal_rx.recv().await {
+                match event {
+                    SignalEvent::Chunk {
+                        request_id: rid,
+                        chunk,
+                        ..
+                    } if rid == request_id => {
+                        streamed = true;
+                        reply_bytes += chunk.len();
+                        adele::telemetry::trace_chunk_received(chunk.len());
+                        let _ = stdout.write_all(chunk.as_bytes());
+                        let _ = stdout.flush();
                     }
-                    // The built-in client tools are TUI-visual (speak / show);
-                    // headless just resolves them so the turn completes.
-                    _ => client_tools::dispatch(&tool_name, &arguments, false).result,
-                };
-                let _ = conn
-                    .submit_client_tool_result(&task_id, &tool_call_id, result)
-                    .await;
+                    SignalEvent::Complete {
+                        request_id: rid,
+                        full_response,
+                        ..
+                    } if rid == request_id => {
+                        // Some providers don't stream chunks; fall back to the final text.
+                        if !streamed {
+                            reply_bytes += full_response.len();
+                            let _ = stdout.write_all(full_response.as_bytes());
+                        }
+                        let _ = writeln!(stdout);
+                        break;
+                    }
+                    SignalEvent::Error {
+                        request_id: rid,
+                        error,
+                        ..
+                    } if rid == request_id => {
+                        return Err(anyhow::anyhow!("{error}"));
+                    }
+                    SignalEvent::ClientToolCall {
+                        task_id,
+                        tool_call_id,
+                        tool_name,
+                        arguments,
+                        ..
+                    } => {
+                        let result = match host.as_ref() {
+                            Some(host) if host.handles(&tool_name) => {
+                                host.call(&tool_name, arguments).await
+                            }
+                            // The built-in client tools are TUI-visual (speak / show);
+                            // headless just resolves them so the turn completes.
+                            _ => client_tools::dispatch(&tool_name, &arguments, false).result,
+                        };
+                        let _ = conn
+                            .submit_client_tool_result(&task_id, &tool_call_id, result)
+                            .await;
+                    }
+                    _ => {}
+                }
             }
-            _ => {}
+            adele::telemetry::record_reply_bytes(&tracing::Span::current(), reply_bytes);
+            Ok(())
         }
+        .instrument(stream_span)
+        .await?;
+
+        adele::telemetry::record_turn_duration(turn_started.elapsed());
+        Ok(())
     }
-    Ok(())
+    .instrument(adele::telemetry::turn_span())
+    .await
 }
 
 /// Reconnect backoff state machine. Sequence: 2s → 4s → 8s → 16s → 30s,
@@ -825,7 +821,10 @@ async fn run(
 
     // Initial connect — on failure, fall straight into the backoff loop
     // instead of running with no connection.
-    match Connector::connect(config).await {
+    match Connector::connect(config)
+        .instrument(adele::telemetry::connect_span())
+        .await
+    {
         Ok(conn) => {
             signal_rx = subscribe_and_load(&mut app, &conn).await;
             finish_connection_init(&mut app, &conn).await;
@@ -1298,8 +1297,14 @@ async fn run(
                     ReconnectState::Connected => None,
                 };
                 app.status_message = "Reconnecting...".to_string();
-                match Connector::connect(config).await {
+                match Connector::connect(config)
+                    .instrument(adele::telemetry::connect_span())
+                    .await
+                {
                     Ok(conn) => {
+                        // A live connection replacing a dropped one — count it (task 6).
+                        // The initial connect above is not a reconnect and is not counted.
+                        adele::telemetry::record_reconnect();
                         // Subscribe + refresh the sidebar first (so the resync's
                         // by-id reselect runs against the FRESH list).
                         signal_rx = subscribe_and_load(&mut app, &conn).await;
@@ -2649,6 +2654,7 @@ async fn register_client_tools(conn: &Connector, host_tools: Vec<ClientToolRegis
     ];
     if let Err(e) = conn
         .register_client_tools(merge_registrations(builtins, host_tools))
+        .instrument(adele::telemetry::registration_span())
         .await
     {
         tracing::debug!("client tool registration skipped: {e}");
@@ -3033,24 +3039,9 @@ mod tests {
         out
     }
 
-    #[test]
-    fn log_filter_scales_level_with_verbosity_and_quiets_third_party() {
-        assert!(
-            log_filter(0).contains("adele=warn"),
-            "no -v => our crates stay at warn"
-        );
-        assert!(log_filter(1).contains("adele=info"), "one -v => info");
-        assert!(log_filter(2).contains("adele=debug"), "two -v => debug");
-        assert!(log_filter(3).contains("adele=trace"), "three -v => trace");
-        assert!(log_filter(9).contains("adele=trace"), "saturates at trace");
-        // Our client crates track the same level so streaming/registration is visible.
-        assert!(log_filter(2).contains("desktop_assistant_client_common=debug"));
-        // Third-party noise stays at warn regardless of verbosity.
-        assert!(
-            log_filter(3).starts_with("warn,"),
-            "base directive keeps third-party at warn"
-        );
-    }
+    // log_filter's own scaling behavior is covered by
+    // telemetry::tests::log_filter_scales_level_with_verbosity_and_quiets_third_party
+    // now that the function lives in that module (adele-tui#152).
 
     #[test]
     fn clap_parses_transport_flags() {
