@@ -161,21 +161,29 @@ mod tests {
         );
     }
 
-    /// D10: none of the span/metric helpers may let prompt or reply content
-    /// reach a log line or a span field. This exercises every helper with a
-    /// secret standing in for real conversation content and asserts the
-    /// secret never appears in the captured console output, while the
-    /// structural markers (span names, ids) do.
+    /// Structural check on the span/metric helpers: each one's name and id
+    /// field actually reach the console, correctly nested and recorded.
+    ///
+    /// This is *not* the D10 content test. Every helper here takes only
+    /// `&str` ids and `usize` counts, so no string of conversation content
+    /// can be passed to them at all - the type signature is the D10
+    /// enforcement, and a test that fed one of them `secret.len()` instead
+    /// of `secret` would prove nothing beyond what the compiler already
+    /// guarantees (a real prior version of this test did exactly that, and
+    /// passed even with a review-injected content leak in the code that
+    /// calls these helpers). The real D10 guarantee - that the call sites in
+    /// `run_headless` never pass content through in the first place - is
+    /// `stream_reply_never_logs_chunk_or_reply_content` and
+    /// `stream_reply_never_logs_full_response_when_not_streamed` in
+    /// `main.rs`, which drive the actual code with real content.
     #[test]
-    fn spans_do_not_record_prompt_or_reply_text() {
+    fn span_helpers_record_ids_and_structure() {
         let buf = SharedBuf::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(buf.clone())
             .with_ansi(false)
             .with_max_level(tracing::Level::TRACE)
             .finish();
-
-        let secret = "the model must never see this logged: SECRET-PROMPT-CONTENT";
 
         tracing::subscriber::with_default(subscriber, || {
             let turn = turn_span();
@@ -190,16 +198,12 @@ mod tests {
 
             let stream = reply_streaming_span("req-xyz789");
             let _stream_guard = stream.enter();
-            trace_chunk_received(secret.len());
-            record_reply_bytes(&stream, secret.len());
+            trace_chunk_received(61);
+            record_reply_bytes(&stream, 61);
             tracing::trace!("stream closed");
         });
 
         let output = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        assert!(
-            !output.contains("SECRET-PROMPT-CONTENT") && !output.contains(secret),
-            "a span or event recorded reply content: {output}"
-        );
         assert!(
             output.contains("turn"),
             "the root turn span must appear: {output}"

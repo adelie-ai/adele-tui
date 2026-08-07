@@ -517,8 +517,6 @@ async fn main() -> Result<()> {
 /// and reply streaming are its child spans. None of this carries the prompt
 /// or reply text (D10) — only ids and byte counts.
 async fn run_headless(config: &ConnectionConfig, prompt: String) -> Result<()> {
-    use std::io::Write as _;
-
     async move {
         let conn = Connector::connect(config)
             .instrument(adele::telemetry::connect_span())
@@ -574,79 +572,40 @@ async fn run_headless(config: &ConnectionConfig, prompt: String) -> Result<()> {
         adele::telemetry::record_conversation_id(&tracing::Span::current(), &conversation_id);
 
         let turn_started = Instant::now();
-        let request_id = conn
+        let request_id = match conn
             .send_prompt_with_system_refinement(&conversation_id, &prompt, "")
             .await
-            .map_err(|e| anyhow::anyhow!("could not send prompt: {e}"))?;
+        {
+            Ok(request_id) => request_id,
+            Err(e) => {
+                // Deliberate choice (adele-tui#152 review): record a duration
+                // here too, symmetric with the stream-error path below. A
+                // turn rejected at submit still took time, and that time is
+                // exactly what an operator wants when the daemon is refusing
+                // or slow to accept work, not only when it accepts and then
+                // fails mid-stream.
+                adele::telemetry::record_turn_duration(turn_started.elapsed());
+                return Err(anyhow::anyhow!("could not send prompt: {e}"));
+            }
+        };
 
         let mut stdout = io::stdout();
-        let mut streamed = false;
-        let mut reply_bytes = 0usize;
         let stream_span = adele::telemetry::reply_streaming_span(&request_id);
-        // A turn error breaks the loop rather than returning directly, so the
-        // byte count and duration below are recorded on every exit — a turn
-        // that streamed several chunks before failing must not lose that
-        // count just because it ended in an error.
-        let mut turn_error = None;
-        async {
-            while let Some(event) = signal_rx.recv().await {
-                match event {
-                    SignalEvent::Chunk {
-                        request_id: rid,
-                        chunk,
-                        ..
-                    } if rid == request_id => {
-                        streamed = true;
-                        reply_bytes += chunk.len();
-                        adele::telemetry::trace_chunk_received(chunk.len());
-                        let _ = stdout.write_all(chunk.as_bytes());
-                        let _ = stdout.flush();
-                    }
-                    SignalEvent::Complete {
-                        request_id: rid,
-                        full_response,
-                        ..
-                    } if rid == request_id => {
-                        // Some providers don't stream chunks; fall back to the final text.
-                        if !streamed {
-                            reply_bytes += full_response.len();
-                            let _ = stdout.write_all(full_response.as_bytes());
-                        }
-                        let _ = writeln!(stdout);
-                        break;
-                    }
-                    SignalEvent::Error {
-                        request_id: rid,
-                        error,
-                        ..
-                    } if rid == request_id => {
-                        turn_error = Some(error);
-                        break;
-                    }
-                    SignalEvent::ClientToolCall {
-                        task_id,
-                        tool_call_id,
-                        tool_name,
-                        arguments,
-                        ..
-                    } => {
-                        let result = match host.as_ref() {
-                            Some(host) if host.handles(&tool_name) => {
-                                host.call(&tool_name, arguments).await
-                            }
-                            // The built-in client tools are TUI-visual (speak / show);
-                            // headless just resolves them so the turn completes.
-                            _ => client_tools::dispatch(&tool_name, &arguments, false).result,
-                        };
-                        let _ = conn
-                            .submit_client_tool_result(&task_id, &tool_call_id, result)
-                            .await;
-                    }
-                    _ => {}
-                }
-            }
-            adele::telemetry::record_reply_bytes(&tracing::Span::current(), reply_bytes);
-        }
+        // A `&Connector` (Copy) rather than `conn` itself, so the closure
+        // below can borrow it on every call instead of moving the one
+        // `Connector` value out of an `FnMut` closure it must survive.
+        let conn_ref = &conn;
+        let (_reply_bytes, turn_error) = stream_reply(
+            &mut signal_rx,
+            &request_id,
+            &mut stdout,
+            host.as_ref(),
+            |task_id, tool_call_id, result| async move {
+                let _ = conn_ref
+                    .submit_client_tool_result(&task_id, &tool_call_id, result)
+                    .await;
+            },
+        )
         .instrument(stream_span)
         .await;
 
@@ -658,6 +617,96 @@ async fn run_headless(config: &ConnectionConfig, prompt: String) -> Result<()> {
     }
     .instrument(adele::telemetry::turn_span())
     .await
+}
+
+/// Stream one turn's headless reply to `stdout`, dispatching any client-tool
+/// call that arrives mid-turn. Returns the total reply byte count and, if
+/// the turn ended in an error, the daemon's error text — the caller decides
+/// whether to record the duration and return `Err`.
+///
+/// Extracted from `run_headless` (adele-tui#152 review) so the loop that
+/// actually touches `chunk` and `full_response` is directly unit-testable
+/// with real content, not just with a byte count standing in for it — see
+/// `stream_reply_never_logs_chunk_or_reply_content` below, which failed
+/// against the inline version when reply content was logged directly and
+/// passes here. Only a byte count ever reaches telemetry (D10), via
+/// `adele::telemetry::trace_chunk_received` / `record_reply_bytes`.
+///
+/// `submit_tool_result` takes the place of a `&Connector` so this loop does
+/// not depend on a live daemon connection to be testable: production passes
+/// a closure that calls `conn.submit_client_tool_result`, and a test that
+/// never sends `SignalEvent::ClientToolCall` can pass one that panics if it
+/// is ever actually called.
+async fn stream_reply<F, Fut>(
+    signal_rx: &mut UnboundedReceiver<SignalEvent>,
+    request_id: &str,
+    stdout: &mut impl std::io::Write,
+    host: Option<&McpHost>,
+    mut submit_tool_result: F,
+) -> (usize, Option<String>)
+where
+    F: FnMut(String, String, Result<String, String>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut streamed = false;
+    let mut reply_bytes = 0usize;
+    let mut turn_error = None;
+    while let Some(event) = signal_rx.recv().await {
+        match event {
+            SignalEvent::Chunk {
+                request_id: rid,
+                chunk,
+                ..
+            } if rid == request_id => {
+                streamed = true;
+                reply_bytes += chunk.len();
+                adele::telemetry::trace_chunk_received(chunk.len());
+                let _ = stdout.write_all(chunk.as_bytes());
+                let _ = stdout.flush();
+            }
+            SignalEvent::Complete {
+                request_id: rid,
+                full_response,
+                ..
+            } if rid == request_id => {
+                // Some providers don't stream chunks; fall back to the final text.
+                if !streamed {
+                    reply_bytes += full_response.len();
+                    let _ = stdout.write_all(full_response.as_bytes());
+                }
+                let _ = writeln!(stdout);
+                break;
+            }
+            SignalEvent::Error {
+                request_id: rid,
+                error,
+                ..
+            } if rid == request_id => {
+                turn_error = Some(error);
+                break;
+            }
+            SignalEvent::ClientToolCall {
+                task_id,
+                tool_call_id,
+                tool_name,
+                arguments,
+                ..
+            } => {
+                let result = match host {
+                    Some(host) if host.handles(&tool_name) => {
+                        host.call(&tool_name, arguments).await
+                    }
+                    // The built-in client tools are TUI-visual (speak / show);
+                    // headless just resolves them so the turn completes.
+                    _ => client_tools::dispatch(&tool_name, &arguments, false).result,
+                };
+                submit_tool_result(task_id, tool_call_id, result).await;
+            }
+            _ => {}
+        }
+    }
+    adele::telemetry::record_reply_bytes(&tracing::Span::current(), reply_bytes);
+    (reply_bytes, turn_error)
 }
 
 /// Reconnect backoff state machine. Sequence: 2s → 4s → 8s → 16s → 30s,
@@ -3050,6 +3099,157 @@ mod tests {
     // log_filter's own scaling behavior is covered by
     // telemetry::tests::log_filter_scales_level_with_verbosity_and_quiets_third_party
     // now that the function lives in that module (adele-tui#152).
+
+    #[derive(Clone, Default)]
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+        type Writer = SharedBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// D10, proven by mutation rather than read alone (adele-tui#152 review):
+    /// a version of this test that called the telemetry helpers directly
+    /// with `secret.len()` instead of `secret` passed the whole suite even
+    /// with `tracing::info!(%chunk, ...)` injected into the real `Chunk`
+    /// arm — the secret never reached the code under test, so the assertion
+    /// could not fail. This one instead drives [`stream_reply`], the actual
+    /// function `run_headless` calls, with the real secret through a real
+    /// channel, under a real capturing subscriber, and does fail against
+    /// that same mutation.
+    #[tokio::test]
+    async fn stream_reply_never_logs_chunk_or_reply_content() {
+        let secret = "the user's real conversation: TOP-SECRET-CONVERSATION-CONTENT";
+
+        let (tx, mut rx) = unbounded_channel::<SignalEvent>();
+        tx.send(SignalEvent::Chunk {
+            conversation_id: "conv-1".to_string(),
+            request_id: "req-1".to_string(),
+            chunk: secret.to_string(),
+        })
+        .expect("the receiver is still open");
+        tx.send(SignalEvent::Complete {
+            conversation_id: "conv-1".to_string(),
+            request_id: "req-1".to_string(),
+            full_response: secret.to_string(),
+        })
+        .expect("the receiver is still open");
+        drop(tx);
+
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        // #[tokio::test] defaults to the current-thread flavor, so this
+        // thread-local default is safe to hold across the `.await` below —
+        // the task never migrates to another OS thread mid-poll.
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let mut stdout: Vec<u8> = Vec::new();
+        let (reply_bytes, turn_error) = stream_reply(
+            &mut rx,
+            "req-1",
+            &mut stdout,
+            None,
+            |_task_id, _tool_call_id, _result: Result<String, String>| async {
+                panic!("this test never sends a ClientToolCall event")
+            },
+        )
+        .await;
+
+        drop(guard);
+
+        assert!(turn_error.is_none(), "no error was sent: {turn_error:?}");
+        assert_eq!(
+            reply_bytes,
+            secret.len(),
+            "the streamed chunk's byte count must still be recorded"
+        );
+
+        let stdout_text = String::from_utf8(stdout).expect("stdout is valid utf8");
+        assert!(
+            stdout_text.contains(secret),
+            "the reply must still reach stdout, its legitimate channel: {stdout_text:?}"
+        );
+
+        let logs =
+            String::from_utf8(buf.0.lock().unwrap().clone()).expect("log output is valid utf8");
+        assert!(
+            !logs.contains(secret),
+            "reply content reached a log line or span field: {logs}"
+        );
+    }
+
+    /// The non-streaming fallback (a provider that sent no `Chunk` events,
+    /// only `Complete`) writes `full_response` from a different branch of
+    /// the same match arm and carries the same D10 risk — covered
+    /// separately so a leak specific to that branch cannot hide behind the
+    /// streamed case above.
+    #[tokio::test]
+    async fn stream_reply_never_logs_full_response_when_not_streamed() {
+        let secret = "the assistant's real, unstreamed reply: SECOND-SECRET-CONTENT";
+
+        let (tx, mut rx) = unbounded_channel::<SignalEvent>();
+        tx.send(SignalEvent::Complete {
+            conversation_id: "conv-1".to_string(),
+            request_id: "req-1".to_string(),
+            full_response: secret.to_string(),
+        })
+        .expect("the receiver is still open");
+        drop(tx);
+
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let mut stdout: Vec<u8> = Vec::new();
+        let (reply_bytes, turn_error) = stream_reply(
+            &mut rx,
+            "req-1",
+            &mut stdout,
+            None,
+            |_task_id, _tool_call_id, _result: Result<String, String>| async {
+                panic!("this test never sends a ClientToolCall event")
+            },
+        )
+        .await;
+
+        drop(guard);
+
+        assert!(turn_error.is_none(), "no error was sent: {turn_error:?}");
+        assert_eq!(reply_bytes, secret.len());
+
+        let stdout_text = String::from_utf8(stdout).expect("stdout is valid utf8");
+        assert!(
+            stdout_text.contains(secret),
+            "the reply must still reach stdout: {stdout_text:?}"
+        );
+
+        let logs =
+            String::from_utf8(buf.0.lock().unwrap().clone()).expect("log output is valid utf8");
+        assert!(
+            !logs.contains(secret),
+            "reply content reached a log line or span field: {logs}"
+        );
+    }
 
     #[test]
     fn clap_parses_transport_flags() {
