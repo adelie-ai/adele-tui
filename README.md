@@ -174,6 +174,56 @@ Given before any subcommand (they apply to the TUI and `exec` alike):
 | `--ws-subject` | `DESKTOP_ASSISTANT_TUI_WS_SUBJECT` | `desktop-tui` | JWT subject |
 | `-v`, `--verbose` | | | Verbose logging to stderr (`-v`/`-vv`/`-vvv`) |
 
+## Logging
+
+`adele` is silent by default: with no `-v` and no `RUST_LOG`, it writes
+nothing to either stream. Logs always go to stderr, never stdout — the
+headless `exec` (and deprecated `--prompt`) path writes the model reply to
+stdout, and a log line there would corrupt it.
+
+- `-v` / `-vv` / `-vvv` raise the level for `adele` and its client crates
+  (`info` / `debug` / `trace`); everything else stays at `warn`.
+- `RUST_LOG`, when set, overrides the level entirely (standard
+  `tracing_subscriber::EnvFilter` syntax, e.g. `RUST_LOG=debug` or
+  `RUST_LOG=info,adele=trace`).
+
+### OpenTelemetry export (`otel` feature)
+
+Off by default: `cargo build` and `cargo install --path .` resolve no
+`opentelemetry` crate. Build with `cargo build --features otel` (or
+`cargo install --path . --features otel`) to also export traces, metrics,
+and log records to a collector over OTLP, through the shared
+[`adelie-telemetry`](https://github.com/adelie-ai/adelie-telemetry) crate.
+`RUST_LOG` governs the exported log records too — there is no separate
+filter for the collector.
+
+Configuration is entirely through the standard `OTEL_*` environment
+variables; `adele` adds no flags or variables of its own:
+
+| Variable | Effect |
+|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector endpoint for all three signals |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Endpoint for traces, overrides the generic one |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Endpoint for metrics, overrides the generic one |
+| `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | Endpoint for log records, overrides the generic one |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc`, `http/protobuf`, or `http/json` (per-signal forms exist too) |
+| `OTEL_EXPORTER_OTLP_HEADERS` | Extra headers, as `key=value,key=value` (per-signal forms exist too) |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` | Export timeout in milliseconds (per-signal forms exist too) |
+| `OTEL_EXPORTER_OTLP_COMPRESSION` | `gzip` or `zstd` |
+| `OTEL_RESOURCE_ATTRIBUTES` | Extra resource attributes, as `key=value,key=value` |
+
+See the [`adelie-telemetry` README](https://github.com/adelie-ai/adelie-telemetry)
+for the complete variable reference, the transport tradeoffs (`grpc` vs.
+`http/protobuf`), and what an `otel` build costs in dependencies and binary
+size.
+
+`adele` opens a span around connecting to the daemon, around advertising its
+client tools, and around one turn's reply streaming, all children of a
+per-turn root span. None of them ever carry the prompt or reply text — only
+ids, counts, and durations. These spans stay local to this process for now:
+carrying them to the daemon as a `traceparent` so one trace covers a whole
+turn end to end is tracked separately (`desktop-assistant#1152`).
+
 ## Test
 
 ```sh

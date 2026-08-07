@@ -36,6 +36,11 @@ toml = "0.9"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Shared telemetry setup (epic mcp-core#38, adele-tui#152): the subscriber,
+# the metrics facade + in-process registry, the shutdown guard, and the
+# trace-context helpers. Depends on no other Adelie crate. The `otel` feature
+# below is off by default and adds no opentelemetry crate to a default build.
+adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev = "36dcd571c1b2d35a6afc9376e1600766480c4fdc" }
 # Direct zbus client for the standalone voice daemon (`org.desktopAssistant.Voice`),
 # a separate D-Bus service from the orchestrator transport. Used by
 # `voice_client::VoiceController` to route narration through the daemon's warm
@@ -178,6 +183,12 @@ mcp-internet-radio = ["dep:internet-radio-mcp"]
 mcp-openstreetmap = ["dep:openstreetmap-mcp"]
 mcp-geocode = ["dep:geocode-mcp"]
 mcp-skills = ["dep:skills-mcp"]
+
+# OTLP export via adelie-telemetry (epic mcp-core#38 D2), off by default.
+# `cargo build --features otel` turns on the traces/metrics/logs exporters,
+# configured from the standard `OTEL_*` environment variables. A default
+# build (including `cargo install`) resolves no opentelemetry crate at all.
+otel = ["adelie-telemetry/otel"]
 
 [lints.rust]
 warnings = "deny"
