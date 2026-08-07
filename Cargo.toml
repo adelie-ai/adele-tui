@@ -40,7 +40,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # the metrics facade + in-process registry, the shutdown guard, and the
 # trace-context helpers. Depends on no other Adelie crate. The `otel` feature
 # below is off by default and adds no opentelemetry crate to a default build.
-adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev = "36dcd571c1b2d35a6afc9376e1600766480c4fdc" }
+adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev = "5c762eca14e43295dd27c5d5adaa658924f5f133" }
 # Direct zbus client for the standalone voice daemon (`org.desktopAssistant.Voice`),
 # a separate D-Bus service from the orchestrator transport. Used by
 # `voice_client::VoiceController` to route narration through the daemon's warm
