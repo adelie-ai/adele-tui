@@ -925,16 +925,29 @@ impl App {
     /// `task_id` (post-desktop-assistant#114 `SendMessageAck`) or an empty string
     /// (legacy `Ack`) — neither is the chunk-stream `request_id` (server-generated,
     /// arriving in the first `AssistantDelta`), so the reducer seeds a sentinel the
-    /// first stream event claims (#52). `PromptSent` emits no effects.
-    pub fn apply_prompt_ack(&mut self, task_id: String, conversation_id: String) {
-        let _ = self.core.apply(UiMessage::PromptSent {
+    /// first stream event claims (#52).
+    ///
+    /// `idempotency_key` is the key this send was given on
+    /// `Effect::SendPrompt`, echoed back so the reducer ties the turn to the
+    /// send that started it (client-ui-common#51). Returns the effects the ack
+    /// produced. Normally none; an ack that replaces a turn still in flight
+    /// reports that turn, so a host span for it closes rather than leaking.
+    pub fn apply_prompt_ack(
+        &mut self,
+        task_id: String,
+        conversation_id: String,
+        idempotency_key: Option<String>,
+    ) -> Vec<Effect> {
+        let effects = self.core.apply(UiMessage::PromptSent {
             task_id,
             conversation_id,
+            idempotency_key,
         });
         // Immediate feedback in the gap between Enter and the first streamed
         // token. The daemon's own `Status` events (e.g. "Searching…") overwrite
         // this, and completion/error clears it.
         self.set_assistant_status("Adele is thinking…");
+        effects
     }
 
     /// Drop all in-flight streaming state on a connection teardown (TUI-8): the
@@ -942,9 +955,16 @@ impl App {
     /// ack sentinel must not mis-claim the first post-reconnect stream. Delegates
     /// to the core (which owns the streaming state); also clears the TUI-only
     /// transient assistant-status line.
-    pub fn clear_streaming_state(&mut self) {
-        self.core.reset_streaming_state();
+    ///
+    /// Returns one effect per turn the teardown ended
+    /// (client-ui-common#51). This client drives its own reconnect from the run
+    /// loop rather than through a `Disconnected` message, so this is the only
+    /// place those reports reach it. Run them: a turn ended here never
+    /// completes, so nothing else will ever close a span opened for it.
+    pub fn clear_streaming_state(&mut self) -> Vec<Effect> {
+        let effects = self.core.reset_streaming_state();
         self.assistant_status = None;
+        effects
     }
 
     /// Move the sidebar selection to the conversation with `id`, returning
@@ -1180,21 +1200,32 @@ impl App {
         self.pending_delete_conversation = None;
     }
 
-    pub fn delete_selected_conversation(&mut self) -> Option<String> {
-        let id = self.selected_conversation_id()?.to_string();
+    /// Returns the deleted conversation's id, and the turn report the delete
+    /// produced if a reply was still arriving in it (client-ui-common#51).
+    /// `None` when nothing is selected. Run the effects: a turn ended by a
+    /// delete never completes, so nothing else will close a span opened for it.
+    pub fn delete_selected_conversation(&mut self) -> (Option<String>, Vec<Effect>) {
+        let Some(id) = self.selected_conversation_id().map(str::to_string) else {
+            return (None, Vec::new());
+        };
         // Route the removal through the shared core: the reducer drops the row,
         // prunes the conversation's per-conversation voice state (GTK-9 — the TUI
         // previously leaked it, growing the maps unbounded), and clears the open
-        // chat when the deleted conversation was the active one. The emitted
-        // effects are all view-effects (SetConversations re-clamps the positional
-        // selection; ClearChat blanks the chat; the side-pane + EnsureActive
-        // effects are TUI no-ops), so `apply_core` fully handles them.
+        // chat when the deleted conversation was the active one. Every view
+        // effect is handled inside `apply_core` (SetConversations re-clamps the
+        // positional selection; ClearChat blanks the chat; the side-pane +
+        // EnsureActive effects are TUI no-ops).
+        //
+        // What comes back is the turn report, and only that: dropping the
+        // conversation drops its stream, which ends a turn streaming into it.
         let effects = self.apply_core(UiMessage::ConversationDeleted { id: id.clone() });
         debug_assert!(
-            effects.is_empty(),
-            "ConversationDeleted must emit only view-effects: {effects:?}"
+            effects
+                .iter()
+                .all(|e| matches!(e, Effect::TurnFinished { .. })),
+            "ConversationDeleted must emit only view-effects and turn reports: {effects:?}"
         );
-        Some(id)
+        (Some(id), effects)
     }
 }
 
@@ -1668,7 +1699,7 @@ mod tests {
     fn app_streaming_on_c1() -> App {
         let mut app = App::new();
         app.load_conversation(detail("c1"));
-        app.apply_prompt_ack("task-1".into(), "c1".into());
+        app.apply_prompt_ack("task-1".into(), "c1".into(), None);
         app
     }
 
@@ -2097,7 +2128,7 @@ mod tests {
         // the open conversation's transcript on completion.
         let mut app = App::new();
         app.load_conversation(detail("c1"));
-        app.apply_prompt_ack("task-abc".into(), "c1".into());
+        app.apply_prompt_ack("task-abc".into(), "c1".into(), None);
 
         app.apply_core(UiMessage::StreamChunk {
             request_id: "server-xyz".into(),
@@ -2130,10 +2161,11 @@ mod tests {
     fn apply_core_does_not_bleed_a_backgrounded_completion_into_the_open_chat() {
         // TUI-4: a Complete arriving after the user switched conversations must
         // NOT append to the newly opened conversation, emits no narration, and
-        // still clears the slot.
+        // still clears the slot. It does report the turn it ended, which renders
+        // nothing (client-ui-common#51).
         let mut app = App::new();
         app.load_conversation(detail("c1"));
-        app.apply_prompt_ack("task-1".into(), "c1".into());
+        app.apply_prompt_ack("task-1".into(), "c1".into(), None);
         app.apply_core(UiMessage::StreamChunk {
             request_id: "req-1".into(),
             chunk: "partial ".into(),
@@ -2146,8 +2178,15 @@ mod tests {
             full_response: "done".into(),
         });
         assert!(
-            controller.is_empty(),
-            "a backgrounded completion emits no controller effect (no narration)"
+            !controller
+                .iter()
+                .any(|e| !matches!(e, Effect::TurnFinished { .. })),
+            "a backgrounded completion emits no controller effect (no narration): {controller:?}"
+        );
+        assert_eq!(
+            turns_finished(&controller),
+            vec![("c1", None)],
+            "but it does report the turn it ended, naming c1: {controller:?}"
         );
         assert!(
             app.current_conversation().unwrap().messages.is_empty(),
@@ -2162,7 +2201,7 @@ mod tests {
         // must neither yank it nor paint into the open chat (TUI-4 / TUI-10).
         let mut app = App::new();
         app.load_conversation(detail("c1"));
-        app.apply_prompt_ack("task-1".into(), "c1".into());
+        app.apply_prompt_ack("task-1".into(), "c1".into(), None);
         app.load_conversation(detail("c2"));
         app.scroll_up(7);
 
@@ -2187,7 +2226,7 @@ mod tests {
         // stale pending slot, and the transient assistant-status line is cleared.
         let mut app = App::new();
         app.load_conversation(detail("c1"));
-        app.apply_prompt_ack("task-1".into(), "c1".into());
+        app.apply_prompt_ack("task-1".into(), "c1".into(), None);
         app.apply_core(UiMessage::StreamChunk {
             request_id: "req-1".into(),
             chunk: "now-dead partial".into(),
@@ -2201,13 +2240,86 @@ mod tests {
         assert!(app.assistant_status.is_none());
     }
 
+    // --- #163: the turn reports a teardown hands back ------------------------
+    //
+    // The shared reducer reports every turn that ends so a host can close a
+    // per-turn span. A reconnect ends turns too, and this client drives its own
+    // reconnect from the run loop rather than through a `Disconnected` message,
+    // so `clear_streaming_state` is the only place those reports arrive here.
+
+    /// Every `TurnFinished` in an effect list, as (conversation, key).
+    fn turns_finished(effects: &[Effect]) -> Vec<(&str, Option<&str>)> {
+        let mut found: Vec<_> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::TurnFinished {
+                    conversation_id,
+                    idempotency_key,
+                    ..
+                } => Some((conversation_id.as_str(), idempotency_key.as_deref())),
+                _ => None,
+            })
+            .collect();
+        found.sort_by_key(|(id, _)| *id);
+        found
+    }
+
+    #[test]
+    fn a_reconnect_hands_back_the_turns_it_ended() {
+        let mut app = App::new();
+        app.load_conversation(detail("c1"));
+        app.apply_prompt_ack("task-1".into(), "c1".into(), Some("submit-key".into()));
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "req-1".into(),
+            chunk: "half an answer".into(),
+        });
+
+        let effects = app.clear_streaming_state();
+
+        assert_eq!(
+            turns_finished(&effects),
+            vec![("c1", Some("submit-key"))],
+            "a reconnect must hand back the turn it ended: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn a_reconnect_with_no_turn_in_flight_hands_back_nothing() {
+        let mut app = App::new();
+        app.load_conversation(detail("c1"));
+        let effects = app.clear_streaming_state();
+        assert_eq!(
+            turns_finished(&effects),
+            vec![],
+            "no turn was in flight, so none ended: {effects:?}"
+        );
+    }
+
+    /// The ack carries the key its send was given, so the turn is tied to that
+    /// send rather than to whichever send the reducer guessed at.
+    #[test]
+    fn the_ack_ties_the_turn_to_its_own_send() {
+        let mut app = App::new();
+        app.load_conversation(detail("c1"));
+        app.apply_prompt_ack("task-1".into(), "c1".into(), Some("key-a".into()));
+        let effects = app.apply_core(UiMessage::StreamComplete {
+            request_id: "req-1".into(),
+            full_response: "the answer".into(),
+        });
+        assert_eq!(
+            turns_finished(&effects),
+            vec![("c1", Some("key-a"))],
+            "the finished turn must name the send that started it: {effects:?}"
+        );
+    }
+
     #[test]
     fn cleared_sentinel_cannot_misclaim_the_next_stream() {
         // Unhappy path (TUI-8): a leftover ack sentinel from before the
         // disconnect must not claim the first post-reconnect stream.
         let mut app = App::new();
         app.load_conversation(detail("c1"));
-        app.apply_prompt_ack("task-1".into(), "c1".into()); // sentinel armed
+        app.apply_prompt_ack("task-1".into(), "c1".into(), None); // sentinel armed
         app.clear_streaming_state();
 
         app.apply_core(UiMessage::StreamChunk {
@@ -2247,7 +2359,7 @@ mod tests {
         // the slot + buffer.
         let mut app = App::new();
         app.load_conversation(detail("c1"));
-        app.apply_prompt_ack("task-1".into(), "c1".into());
+        app.apply_prompt_ack("task-1".into(), "c1".into(), None);
         app.apply_core(UiMessage::StreamChunk {
             request_id: "req1".into(),
             chunk: "half a thought".into(),
@@ -2340,7 +2452,7 @@ mod tests {
         // completion for `main` to enqueue.
         let mut app = app_with_open_conversation("c1");
         app.set_adele_output("c1", AdeleOutput::Always);
-        app.apply_prompt_ack("task-1".into(), "c1".into());
+        app.apply_prompt_ack("task-1".into(), "c1".into(), None);
         app.apply_core(UiMessage::StreamChunk {
             request_id: "req1".into(),
             chunk: "hi".into(),
@@ -2365,7 +2477,7 @@ mod tests {
         // completion clears it (ClearChatStatus) — both via apply_core.
         let mut app = App::new();
         app.load_conversation(detail("c1"));
-        app.apply_prompt_ack("task-1".into(), "c1".into());
+        app.apply_prompt_ack("task-1".into(), "c1".into(), None);
         app.apply_core(UiMessage::AssistantStatus {
             request_id: "req1".into(),
             message: "Searching knowledge base...".into(),
@@ -2391,7 +2503,7 @@ mod tests {
             title: "Test".into(),
             ..conversation_detail("c1")
         });
-        app.apply_prompt_ack("t-1".into(), "c1".into());
+        app.apply_prompt_ack("t-1".into(), "c1".into(), None);
         assert_eq!(app.assistant_status.as_deref(), Some("Adele is thinking…"));
     }
 
@@ -2510,6 +2622,47 @@ mod tests {
         assert_eq!(app.selected_conversation_id(), Some("2"));
     }
 
+    /// Deleting a conversation with a reply still arriving in it ends that
+    /// turn, so the reducer reports it and this path must hand it back rather
+    /// than assert it away.
+    #[test]
+    fn deleting_a_streaming_conversation_hands_back_the_turn_it_ended() {
+        let mut app = app_with_conversations();
+        app.selected_conversation = Some(1);
+        app.load_conversation(ConversationDetail {
+            title: "Second".into(),
+            ..conversation_detail("2")
+        });
+        app.apply_prompt_ack("task-1".into(), "2".into(), Some("submit-key".into()));
+        app.apply_core(UiMessage::StreamChunk {
+            request_id: "req-1".into(),
+            chunk: "half an answer".into(),
+        });
+
+        let (deleted, effects) = app.delete_selected_conversation();
+
+        assert_eq!(deleted, Some("2".to_string()));
+        assert_eq!(
+            turns_finished(&effects),
+            vec![("2", Some("submit-key"))],
+            "the delete must hand back the turn it ended: {effects:?}"
+        );
+    }
+
+    /// Deleting an idle conversation hands back nothing.
+    #[test]
+    fn deleting_an_idle_conversation_hands_back_nothing() {
+        let mut app = app_with_conversations();
+        app.selected_conversation = Some(1);
+        let (deleted, effects) = app.delete_selected_conversation();
+        assert_eq!(deleted, Some("2".to_string()));
+        assert_eq!(
+            turns_finished(&effects),
+            vec![],
+            "no turn was in flight, so none ended: {effects:?}"
+        );
+    }
+
     #[test]
     fn delete_selected_conversation() {
         let mut app = app_with_conversations();
@@ -2521,7 +2674,7 @@ mod tests {
             ..conversation_detail("2")
         });
 
-        let deleted = app.delete_selected_conversation();
+        let deleted = app.delete_selected_conversation().0;
         assert_eq!(deleted, Some("2".to_string()));
         assert_eq!(app.conversations().len(), 2);
         assert!(
@@ -2564,7 +2717,7 @@ mod tests {
         app.begin_delete_confirm();
         assert!(app.confirm_delete(), "reports the overlay was up");
         assert!(!app.delete_confirm_pending(), "overlay cleared on confirm");
-        let deleted = app.delete_selected_conversation();
+        let deleted = app.delete_selected_conversation().0;
         assert_eq!(deleted, Some("2".to_string()));
         assert_eq!(app.conversations().len(), 2);
         assert!(app.conversations().iter().all(|c| c.id != "2"));
@@ -2634,7 +2787,7 @@ mod tests {
         let mut app = app_with_conversations();
         app.selected_conversation = Some(2);
 
-        let deleted = app.delete_selected_conversation();
+        let deleted = app.delete_selected_conversation().0;
         assert_eq!(deleted, Some("3".to_string()));
         assert_eq!(app.selected_conversation, Some(1));
     }
@@ -2648,7 +2801,7 @@ mod tests {
         }]);
         app.selected_conversation = Some(0);
 
-        let deleted = app.delete_selected_conversation();
+        let deleted = app.delete_selected_conversation().0;
         assert_eq!(deleted, Some("1".to_string()));
         assert_eq!(app.selected_conversation, None);
     }
@@ -2656,7 +2809,7 @@ mod tests {
     #[test]
     fn delete_with_no_selection_returns_none() {
         let mut app = app_with_conversations();
-        assert!(app.delete_selected_conversation().is_none());
+        assert!(app.delete_selected_conversation().0.is_none());
     }
 
     #[test]
@@ -2850,7 +3003,7 @@ mod tests {
         // auto-following — applying a chunk through the core never moves scroll.
         let mut app = App::new();
         app.load_conversation(detail("c1"));
-        app.apply_prompt_ack("task1".into(), "c1".into());
+        app.apply_prompt_ack("task1".into(), "c1".into(), None);
         app.apply_core(UiMessage::StreamChunk {
             request_id: "req1".into(),
             chunk: "data".into(),
@@ -2864,7 +3017,7 @@ mod tests {
         // reply — chunks must not yank the view back to the bottom.
         let mut app = App::new();
         app.load_conversation(detail("c1"));
-        app.apply_prompt_ack("task1".into(), "c1".into());
+        app.apply_prompt_ack("task1".into(), "c1".into(), None);
         app.scroll_up(10);
         app.apply_core(UiMessage::StreamChunk {
             request_id: "req1".into(),
@@ -3167,7 +3320,7 @@ mod tests {
         // origin's gate even while another conversation was on screen.
         let mut app = app_with_open_conversation("c1");
         app.set_adele_output("c1", AdeleOutput::Always);
-        app.apply_prompt_ack("task-1".into(), "c1".into());
+        app.apply_prompt_ack("task-1".into(), "c1".into(), None);
         app.apply_core(UiMessage::StreamChunk {
             request_id: "req-1".into(),
             chunk: "partial".into(),
