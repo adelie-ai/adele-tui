@@ -1989,7 +1989,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -2206,7 +2205,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -2733,7 +2731,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -5223,7 +5220,6 @@ dependencies = [
  "shellexpand",
  "thiserror 2.0.19",
  "tokio",
- "tracing",
  "uuid",
  "zbus",
 ]
@@ -5253,7 +5249,6 @@ dependencies = [
  "shellexpand",
  "thiserror 2.0.19",
  "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -6169,7 +6164,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
- "tracing",
 ]
 
 [[package]]

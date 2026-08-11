@@ -176,6 +176,83 @@ impl VoiceSession {
 mod tests {
     use super::*;
 
+    // The gate is a pure function of four facts rather than a chain of `if`s
+    // inside the key handler, so every reason a press does nothing can be
+    // checked on any platform - including the not-compiled-in reason, which the
+    // host platform would otherwise decide for the test.
+
+    #[test]
+    fn a_build_without_dictation_says_so_rather_than_looking_broken() {
+        let blocked = dictation_gate(false, true, false, true).unwrap_err();
+        assert_eq!(blocked, DictationBlocked::NotCompiledIn);
+        let message = blocked.message();
+        assert!(
+            message.contains("this build"),
+            "the message must say the build lacks it, not that voice is off: {message}"
+        );
+    }
+
+    #[test]
+    fn not_compiled_in_outranks_the_other_reasons() {
+        // Every other message would send someone to edit voice.toml or wait for
+        // models, neither of which can help a build with no dictation in it.
+        assert_eq!(
+            dictation_gate(false, false, true, false).unwrap_err(),
+            DictationBlocked::NotCompiledIn
+        );
+    }
+
+    #[test]
+    fn voice_off_is_reported_when_the_build_has_dictation() {
+        assert_eq!(
+            dictation_gate(true, false, false, true).unwrap_err(),
+            DictationBlocked::VoiceOff
+        );
+    }
+
+    #[test]
+    fn a_second_press_while_capturing_is_reported_as_already_listening() {
+        assert_eq!(
+            dictation_gate(true, true, true, true).unwrap_err(),
+            DictationBlocked::AlreadyListening
+        );
+    }
+
+    #[test]
+    fn a_press_before_the_models_finish_loading_is_reported_as_loading() {
+        assert_eq!(
+            dictation_gate(true, true, false, false).unwrap_err(),
+            DictationBlocked::StillLoading
+        );
+    }
+
+    #[test]
+    fn a_ready_session_on_a_supported_build_is_allowed() {
+        assert!(dictation_gate(true, true, false, true).is_ok());
+    }
+
+    #[test]
+    fn every_blocked_reason_has_a_non_empty_message() {
+        for blocked in [
+            DictationBlocked::NotCompiledIn,
+            DictationBlocked::VoiceOff,
+            DictationBlocked::AlreadyListening,
+            DictationBlocked::StillLoading,
+        ] {
+            assert!(!blocked.message().is_empty());
+        }
+    }
+
+    /// Playback does not depend on dictation: the Piper and Polly TTS backends
+    /// need no ONNX Runtime, so a build without a VAD still speaks replies.
+    #[test]
+    fn playback_is_available_on_a_build_without_dictation() {
+        assert!(
+            VoiceSession::PLAYBACK_SUPPORTED,
+            "dropping dictation must not drop reply playback"
+        );
+    }
+
     #[test]
     fn voice_mode_defaults_to_off() {
         assert_eq!(VoiceMode::default(), VoiceMode::Off);
