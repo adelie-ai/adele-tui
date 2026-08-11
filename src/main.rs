@@ -44,7 +44,7 @@ use adele::picker::PickerOutcome;
 use adele::profile::ProfileStore;
 use adele::settings::{Settings, default_settings_path};
 use adele::settings_screen;
-use adele::voice::{VoiceConfig, VoiceSession};
+use adele::voice::{DictationOutcome, VoiceConfig, VoiceSession};
 use adele::voice_client::VoiceController;
 use adele::{
     client_tools, connections, credentials, kb, mcp, model_selector, personality_selector, picker,
@@ -2754,24 +2754,13 @@ async fn register_client_tools(conn: &Connector, host_tools: Vec<ClientToolRegis
     }
 }
 
-/// Result of a one-shot embedded dictation capture, delivered from the capture
-/// task back to the event loop.
-enum DictationOutcome {
-    /// A non-empty transcript was produced.
-    Transcribed(String),
-    /// The capture ended with no usable speech (timed out, near-silent, or an
-    /// empty transcript) — the module returned `None`.
-    NoSpeech,
-    /// The capture errored (mic open failed, model error, …).
-    Failed(String),
-}
-
-/// Begin a one-shot dictation capture, if embedded voice is ready and not
-/// already capturing. Spawns the mic→VAD→Whisper work on a task and reports the
-/// outcome over `dictation_tx`; the UI just shows a "Listening…" indicator.
+/// Begin a one-shot dictation capture, if this build has dictation and embedded
+/// voice is ready and not already capturing. Spawns the mic→VAD→Whisper work on
+/// a task and reports the outcome over `dictation_tx`; the UI just shows a
+/// "Listening…" indicator.
 ///
-/// Gating order matters: nothing here opens the mic unless voice is in
-/// `embedded` mode, the session has loaded, and no capture is already running.
+/// The gating decision is [`voice::dictation_gate`], so every reason a press
+/// does nothing is testable without standing up an audio device.
 fn start_dictation(
     app: &mut App,
     cfg: &VoiceConfig,
@@ -2779,36 +2768,31 @@ fn start_dictation(
     dictating: &mut bool,
     dictation_tx: &tokio::sync::mpsc::UnboundedSender<DictationOutcome>,
 ) {
-    if !cfg.embedded_enabled() {
-        app.status_message =
-            "Voice is off — set mode = \"embedded\" in ~/.config/adele-tui/voice.toml".into();
+    if let Err(blocked) = voice::dictation_gate(
+        voice::DICTATION_SUPPORTED,
+        cfg.embedded_enabled(),
+        *dictating,
+        session.is_some(),
+    ) {
+        app.status_message = blocked.message().into();
         return;
     }
-    if *dictating {
-        app.status_message = "Already listening…".into();
-        return;
-    }
-    let Some(session) = session.as_ref() else {
-        app.status_message = "Voice still loading models — try again in a moment".into();
+
+    // The gate passing means the build has dictation and the session is loaded,
+    // so `capture` is `Some` here. Handled rather than unwrapped, because the
+    // gate and the session are two separate facts and only one of them is
+    // checked by the compiler.
+    let Some(capture) = session.as_ref().and_then(VoiceSession::capture) else {
+        app.status_message = voice::DictationBlocked::NotCompiledIn.message().into();
         return;
     };
 
     *dictating = true;
     // Reuse the transient assistant-status indicator line for "Listening…".
     app.set_assistant_status("Listening…");
-    let handle = session.dictation();
     let tx = dictation_tx.clone();
     tokio::spawn(async move {
-        // One capture at a time: holding the lock for the whole capture both
-        // gives this task the `&mut Dictation` it needs and prevents a second
-        // press from opening the mic concurrently.
-        let mut dictation = handle.lock().await;
-        let outcome = match dictation.dictate().await {
-            Ok(Some(text)) => DictationOutcome::Transcribed(text),
-            Ok(None) => DictationOutcome::NoSpeech,
-            Err(e) => DictationOutcome::Failed(e.to_string()),
-        };
-        let _ = tx.send(outcome);
+        let _ = tx.send(capture.await);
     });
 }
 
