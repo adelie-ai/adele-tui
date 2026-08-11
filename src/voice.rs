@@ -143,11 +143,18 @@ fn config_path() -> Option<std::path::PathBuf> {
 ///
 /// Paired with the target-scoped `adele-voice-module` dependency in
 /// `Cargo.toml`: macOS selects no VAD backend, because the only one available
-/// needs ONNX Runtime, which has no prebuilt binary for that target. The pairing
-/// is not left to care - the two disagreeing stops the build, because
-/// `build_dictation` exists only when the module compiles both adapters.
+/// needs ONNX Runtime, which has no prebuilt binary for that target.
 ///
-/// This is the one place the platform is named. Everything else asks this.
+/// The pairing is compiler-checked in **one** direction only. Claiming
+/// dictation the manifest did not grant fails to build, because
+/// `build_dictation` exists only when the module compiles both adapters. The
+/// other direction is silent: a manifest that grants a VAD while this stays
+/// false compiles clean and leaves dictation switched off. That is the shape to
+/// watch when adelie-ai/voice#133 adds the Apple adapters - closing it needs the
+/// module to publish whether it has a dictation pipeline, tracked as
+/// adelie-ai/voice#171.
+///
+/// Read this rather than naming the platform again at a call site.
 pub const DICTATION_SUPPORTED: bool = cfg!(not(target_os = "macos"));
 
 /// Why a dictation key press did not start a capture.
@@ -167,10 +174,13 @@ impl DictationBlocked {
     /// What to show the user, which must point at something they can act on.
     pub fn message(self) -> &'static str {
         match self {
+            // Deliberately does not promise that playback works. Whether it
+            // does depends on the mode and on the daemon, neither of which this
+            // reason knows about, and a press in `mode = "off"` reaches here.
             Self::NotCompiledIn => {
                 "Dictation is not in this build — speech input needs a voice-activity \
-                 detector, and none is available for this platform yet. Reply playback \
-                 still works."
+                 detector, and none is available for this platform yet \
+                 (adelie-ai/voice#133)"
             }
             Self::VoiceOff => {
                 "Voice is off — set mode = \"embedded\" in ~/.config/adele-tui/voice.toml"
@@ -179,6 +189,46 @@ impl DictationBlocked {
             Self::StillLoading => "Voice still loading models — try again in a moment",
         }
     }
+}
+
+/// Status text while the embedded session loads.
+///
+/// Takes `dictation_supported` rather than reading [`DICTATION_SUPPORTED`], so
+/// both wordings are checkable from either platform.
+pub fn session_loading_message(dictation_supported: bool) -> &'static str {
+    if dictation_supported {
+        "Voice: loading models… (Ctrl+G to dictate)"
+    } else {
+        "Voice: loading playback…"
+    }
+}
+
+/// Status text once the embedded session is up.
+///
+/// Two things a person needs and cannot otherwise discover. Whether this build
+/// can dictate at all - offering `Ctrl+G` to a build with no dictation is how
+/// the key press ends up contradicting the banner that advertised it. And
+/// whether the TTS backend in `voice.toml` is one this build contains, because
+/// the module falls back to Piper when it is not, and that fallback is silent
+/// unless the person is running with logging turned up.
+pub fn session_ready_message(
+    dictation_supported: bool,
+    configured_tts_backend: &str,
+    compiled_in_tts_backends: &[&str],
+) -> String {
+    let ready = if dictation_supported {
+        "Voice ready (Ctrl+G to dictate)"
+    } else {
+        "Voice ready for playback — dictation is not in this build"
+    };
+    if compiled_in_tts_backends.contains(&configured_tts_backend) {
+        return ready.into();
+    }
+    format!(
+        "{ready} — {configured_tts_backend} TTS is not in this build, falling back to piper \
+         (available: {})",
+        compiled_in_tts_backends.join(", ")
+    )
 }
 
 /// Decide whether a dictation key press can start a capture.
@@ -365,6 +415,56 @@ mod tests {
         ] {
             assert!(!blocked.message().is_empty());
         }
+    }
+
+    #[test]
+    fn a_build_without_dictation_does_not_advertise_the_dictate_key() {
+        // The banner and the key press have to agree. Offering Ctrl+G here is
+        // how a person gets told to press a key that then says it does nothing.
+        assert!(!session_loading_message(false).contains("Ctrl+G"));
+        assert!(!session_ready_message(false, "piper", &["piper"]).contains("Ctrl+G"));
+    }
+
+    #[test]
+    fn a_build_with_dictation_still_advertises_the_dictate_key() {
+        assert!(session_loading_message(true).contains("Ctrl+G"));
+        assert!(session_ready_message(true, "piper", &["piper"]).contains("Ctrl+G"));
+    }
+
+    #[test]
+    fn a_tts_backend_this_build_lacks_is_named_in_the_ready_message() {
+        // The module falls back to Piper and reports it at error level, but the
+        // TUI installs no subscriber at default verbosity, so without this the
+        // person's configured backend is swapped out with nothing said.
+        let message = session_ready_message(false, "kokoro", &["piper", "polly"]);
+        assert!(message.contains("kokoro"), "{message}");
+        assert!(message.contains("piper"), "{message}");
+        assert!(message.contains("polly"), "{message}");
+    }
+
+    #[test]
+    fn a_tts_backend_this_build_has_is_not_flagged() {
+        let message = session_ready_message(true, "kokoro", &["piper", "polly", "kokoro"]);
+        assert!(!message.contains("not in this build"), "{message}");
+    }
+
+    #[test]
+    fn the_unavailable_dictation_message_does_not_promise_playback() {
+        // Reachable with mode = "off" and no daemon, where nothing speaks.
+        let message = DictationBlocked::NotCompiledIn.message();
+        assert!(
+            !message.to_lowercase().contains("playback still works"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn the_unavailable_dictation_message_says_what_would_restore_it() {
+        assert!(
+            DictationBlocked::NotCompiledIn
+                .message()
+                .contains("voice#133")
+        );
     }
 
     #[test]

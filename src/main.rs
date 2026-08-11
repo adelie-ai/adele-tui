@@ -933,7 +933,7 @@ async fn run(
             let _ = tx.send(VoiceSession::build(&cfg).await);
         });
         session_rx = Some(rx);
-        app.status_message = "Voice: loading models… (Ctrl+G to dictate)".into();
+        app.status_message = voice::session_loading_message(voice::DICTATION_SUPPORTED).into();
     }
 
     loop {
@@ -1422,7 +1422,11 @@ async fn run(
                 match built {
                     Ok(Ok(session)) => {
                         voice_session = Some(session);
-                        app.status_message = "Voice ready (Ctrl+G to dictate)".into();
+                        app.status_message = voice::session_ready_message(
+                            voice::DICTATION_SUPPORTED,
+                            &voice_cfg.tts.backend,
+                            adele_voice_module::COMPILED_IN_TTS_BACKENDS,
+                        );
                     }
                     Ok(Err(e)) => {
                         app.status_message = format!("Voice unavailable: {e}");
@@ -2778,10 +2782,11 @@ fn start_dictation(
         return;
     }
 
-    // The gate passing means the build has dictation and the session is loaded,
-    // so `capture` is `Some` here. Handled rather than unwrapped, because the
-    // gate and the session are two separate facts and only one of them is
-    // checked by the compiler.
+    // Unreachable today: the gate has already established that this build has
+    // dictation and that the session is loaded, which is exactly when `capture`
+    // returns `Some`. Kept rather than unwrapped because the two are separate
+    // facts held together by hand, and the cost of them parting is a panic in
+    // the middle of someone's session against a status line they can act on.
     let Some(capture) = session.as_ref().and_then(VoiceSession::capture) else {
         app.status_message = voice::DictationBlocked::NotCompiledIn.message().into();
         return;
