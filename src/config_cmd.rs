@@ -763,6 +763,211 @@ mod tests {
         );
     }
 
+    // --- Writes go through the locked edit transaction (#176) ---------------
+
+    /// A `client-mcp.toml` that cannot be parsed. `ClientMcpConfig::load`
+    /// tolerates it and yields an empty config, so a load-then-save pair writes
+    /// that empty config back over every server definition on the machine.
+    const UNPARSEABLE: &str = "this is not toml {\n";
+
+    /// A config whose server names collide. The strict parse rejects it, the
+    /// tolerant load does not, so it is the second way a write can erase the
+    /// file's real contents.
+    const DUPLICATE_NAMES: &str = "\
+[[servers]]
+name = \"notes\"
+command = \"a\"
+
+[[servers]]
+name = \"notes\"
+command = \"b\"
+";
+
+    /// The sidecar file an edit locks. Derived here from the contract, not from
+    /// the implementation.
+    fn lock_path(config: &Path) -> std::path::PathBuf {
+        let mut name = config
+            .file_name()
+            .expect("config has a file name")
+            .to_owned();
+        name.push(".lock");
+        config.with_file_name(name)
+    }
+
+    /// Hold the sidecar lock the way a second Adele client would. A `flock`
+    /// belongs to an open file description, so a second open in this process
+    /// contends exactly as another process does.
+    fn hold_lock(config: &Path) -> std::fs::File {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_path(config))
+            .expect("open sidecar lock");
+        file.try_lock().expect("take sidecar lock");
+        file
+    }
+
+    #[test]
+    fn add_server_refuses_an_unparseable_config_and_writes_nothing() {
+        let (_dir, path) = temp_cfg();
+        std::fs::write(&path, UNPARSEABLE).expect("seed an unparseable config");
+        let before = std::fs::read(&path).expect("read before");
+
+        let err = mcp_add_server(
+            &path,
+            "notes",
+            "notes-mcp",
+            &[],
+            None,
+            &["tui".to_string()],
+            true,
+            &mut Vec::new(),
+        )
+        .expect_err("an unparseable config must refuse the write");
+
+        assert!(
+            err.to_string().contains("client-mcp.toml"),
+            "the refusal names the file: {err}"
+        );
+        assert_eq!(
+            before,
+            std::fs::read(&path).expect("read after"),
+            "a refused edit leaves the file byte-identical"
+        );
+    }
+
+    #[test]
+    fn add_server_refuses_a_config_with_duplicate_server_names() {
+        let (_dir, path) = temp_cfg();
+        std::fs::write(&path, DUPLICATE_NAMES).expect("seed a duplicate-name config");
+        let before = std::fs::read(&path).expect("read before");
+
+        let err = mcp_add_server(
+            &path,
+            "other",
+            "other-mcp",
+            &[],
+            None,
+            &["tui".to_string()],
+            true,
+            &mut Vec::new(),
+        )
+        .expect_err("a duplicate-name config must refuse the write");
+
+        assert!(
+            err.to_string().contains("notes"),
+            "the refusal names the duplicate: {err}"
+        );
+        assert_eq!(
+            before,
+            std::fs::read(&path).expect("read after"),
+            "a refused edit leaves the file byte-identical"
+        );
+    }
+
+    #[test]
+    fn remove_server_refuses_an_unparseable_config_and_writes_nothing() {
+        let (_dir, path) = temp_cfg();
+        std::fs::write(&path, UNPARSEABLE).expect("seed an unparseable config");
+        let before = std::fs::read(&path).expect("read before");
+
+        let err = mcp_remove_server(&path, "notes", &mut Vec::new())
+            .expect_err("an unparseable config must refuse the write");
+
+        assert!(
+            err.to_string().contains("client-mcp.toml"),
+            "the refusal names the file: {err}"
+        );
+        assert_eq!(
+            before,
+            std::fs::read(&path).expect("read after"),
+            "a refused edit leaves the file byte-identical"
+        );
+    }
+
+    #[test]
+    fn set_enabled_refuses_an_unparseable_config_and_writes_nothing() {
+        let (_dir, path) = temp_cfg();
+        std::fs::write(&path, UNPARSEABLE).expect("seed an unparseable config");
+        let before = std::fs::read(&path).expect("read before");
+        let builtins = [BuiltinInfo::new("web", 3)];
+
+        let err = mcp_set_enabled(&path, "web", "tui", false, &builtins, &mut Vec::new())
+            .expect_err("an unparseable config must refuse the write");
+
+        assert!(
+            err.to_string().contains("client-mcp.toml"),
+            "the refusal names the file: {err}"
+        );
+        assert_eq!(
+            before,
+            std::fs::read(&path).expect("read after"),
+            "a refused edit leaves the file byte-identical"
+        );
+    }
+
+    /// An unparseable config hides every definition from a tolerant load, so a
+    /// server that is defined in the file reads as absent. The refusal must say
+    /// the file cannot be read, not that the server does not exist.
+    #[test]
+    fn set_enabled_reports_the_parse_failure_rather_than_a_missing_server() {
+        let (_dir, path) = temp_cfg();
+        std::fs::write(&path, UNPARSEABLE).expect("seed an unparseable config");
+
+        let err = mcp_set_enabled(&path, "notes", "tui", true, &[], &mut Vec::new())
+            .expect_err("an unparseable config must refuse the write");
+
+        assert!(
+            !err.to_string().contains("no such client-MCP server"),
+            "an unreadable file is not a missing server: {err}"
+        );
+    }
+
+    /// The lock is what makes two clients queue instead of losing an edit. A
+    /// lock another client holds blocks this write, and releasing it unblocks
+    /// the next one.
+    #[test]
+    fn enable_defined_server_refuses_while_another_client_holds_the_lock() {
+        let (_dir, path) = temp_cfg();
+        mcp_add_server(
+            &path,
+            "notes",
+            "notes-mcp",
+            &[],
+            None,
+            &["tui".to_string()],
+            false,
+            &mut Vec::new(),
+        )
+        .expect("add");
+        let before = std::fs::read(&path).expect("read before");
+
+        let held = hold_lock(&path);
+        let err = mcp_set_enabled(&path, "notes", "tui", true, &[], &mut Vec::new())
+            .expect_err("a held lock must refuse the write");
+        assert!(
+            err.to_string().contains("another Adele client is editing"),
+            "the refusal names the cause: {err}"
+        );
+        assert_eq!(
+            before,
+            std::fs::read(&path).expect("read after"),
+            "a refused edit leaves the file byte-identical"
+        );
+
+        drop(held);
+        mcp_set_enabled(&path, "notes", "tui", true, &[], &mut Vec::new())
+            .expect("the next write succeeds once the lock is released");
+        assert!(
+            ClientMcpConfig::load(&path)
+                .surface_enabled_names("tui")
+                .iter()
+                .any(|n| n == "notes"),
+            "the released write took effect"
+        );
+    }
+
     #[test]
     fn show_reports_added_server_and_path() {
         let (_dir, path) = temp_cfg();

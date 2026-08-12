@@ -2833,6 +2833,43 @@ mod tests {
         );
     }
 
+    /// A `client-mcp.toml` that cannot be parsed holds every other client's
+    /// server definitions. A tolerant load reads it as empty, so a load-then-save
+    /// pair erases them. The toggle must refuse, keep the file, and say why on
+    /// the panel's error line (#176).
+    #[test]
+    fn toggle_builtin_refuses_an_unparseable_config_and_reports_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("client-mcp.toml");
+        std::fs::write(&path, "this is not toml {\n").expect("seed an unparseable config");
+        let before = std::fs::read(&path).expect("read before");
+
+        let mut state = state_with(Vec::new(), Vec::new());
+        state.config_path = path.clone();
+        state.builtin_dtos = vec![builtin_dto("web", 3, None, false)];
+
+        toggle_builtin(&mut state, 0);
+
+        assert_eq!(
+            before,
+            std::fs::read(&path).expect("read after"),
+            "a refused edit leaves the config byte-identical"
+        );
+        assert!(
+            !state.builtin_dtos[0].disabled_by_config,
+            "a refused edit does not flip the row"
+        );
+        let err = state.error.as_deref().expect("the refusal reaches the panel");
+        assert!(
+            err.contains("client-mcp.toml"),
+            "the panel error names the file: {err}"
+        );
+        assert!(
+            state.notice.is_none(),
+            "a refused edit reports no success notice"
+        );
+    }
+
     #[test]
     fn draw_list_sanitizes_hostile_daemon_text() {
         let state = state_with(vec![hostile_server()], Vec::new());
