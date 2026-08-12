@@ -8,8 +8,6 @@ version = "0.1.0"
 dependencies = [
  "adele-voice-client-common",
  "adele-voice-module",
- "adele-voice-stt-whisper",
- "adele-voice-vad-silero",
  "adelie-telemetry",
  "anyhow",
  "async-trait",
@@ -1258,7 +1256,7 @@ checksum = "0b023947811758c97c59bf9d1c188fd619ad4718dcaa767947df1cadb14f39f4"
 dependencies = [
  "glob",
  "libc",
- "libloading 0.8.9",
+ "libloading",
 ]
 
 [[package]]
@@ -1989,7 +1987,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -2206,7 +2203,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -2733,7 +2729,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -2934,16 +2929,6 @@ name = "libloading"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
-dependencies = [
- "cfg-if",
- "windows-link",
-]
-
-[[package]]
-name = "libloading"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
 dependencies = [
  "cfg-if",
  "windows-link",
@@ -3666,7 +3651,6 @@ version = "2.0.0-rc.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7de3af33d24a745ffb8fab904b13478438d1cd52868e6f17735ef6e1f8bf133"
 dependencies = [
- "libloading 0.9.0",
  "ndarray",
  "ort-sys",
  "smallvec",
@@ -5223,7 +5207,6 @@ dependencies = [
  "shellexpand",
  "thiserror 2.0.19",
  "tokio",
- "tracing",
  "uuid",
  "zbus",
 ]
@@ -5253,7 +5236,6 @@ dependencies = [
  "shellexpand",
  "thiserror 2.0.19",
  "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -6169,7 +6151,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
- "tracing",
 ]
 
 [[package]]

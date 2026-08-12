@@ -321,6 +321,17 @@ pub fn handle_key_event(
 /// The keymap shown in the `?`/F1 help overlay (rendered by `ui::draw_help_overlay`).
 /// Lives next to `handle_key_event` so the help stays the single source of truth
 /// for the bindings.
+/// How the help overlay describes `Ctrl+G`.
+///
+/// A build with no embedded dictation still dictates through a running voice
+/// daemon, so the binding is not dead - but listing it plainly would promise
+/// in-app dictation that the key press then refuses.
+const DICTATE_HELP: &str = if crate::voice::DICTATION_SUPPORTED {
+    "push-to-talk dictation"
+} else {
+    "push-to-talk dictation (voice daemon only in this build)"
+};
+
 pub fn help_sections() -> &'static [(&'static str, &'static [(&'static str, &'static str)])] {
     &[
         (
@@ -372,7 +383,7 @@ pub fn help_sections() -> &'static [(&'static str, &'static [(&'static str, &'st
         (
             "Voice",
             &[
-                ("Ctrl+G", "push-to-talk dictation"),
+                ("Ctrl+G", DICTATE_HELP),
                 ("Alt+S", "cycle Adele voice output"),
                 ("Alt+V", "toggle You (voice input)"),
             ],

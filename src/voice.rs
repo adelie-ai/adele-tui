@@ -20,14 +20,30 @@
 //! Building the embedded pipeline loads ONNX models (hundreds of MB), so it is
 //! done lazily on first use rather than at startup, and only when the mode is
 //! `embedded`.
+//!
+//! # Dictation is not on every target
+//!
+//! The endpointer is Silero VAD, which needs ONNX Runtime, and `ort` publishes
+//! no prebuilt binary for `x86_64-apple-darwin`. **Intel macOS** therefore
+//! selects no VAD backend at all (see the `adele-voice-module` entries in
+//! `Cargo.toml`) and has **no dictation**: [`DICTATION_SUPPORTED`] is false,
+//! [`dictation_gate`] reports [`DictationBlocked::NotCompiledIn`], and a key
+//! press says so. Apple Silicon is unaffected - `ort` ships an
+//! `aarch64-apple-darwin` build - and so is every other target.
+//!
+//! Reply **playback** works everywhere, because the Piper and Polly backends
+//! need no ONNX Runtime. Dictation returns to Intel macOS with the native
+//! Apple Speech adapters in adelie-ai/voice#133.
 
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 use std::sync::Arc;
 
 use adele_voice_module::config::{AudioConfig, SttConfig, TtsConfig, VadConfig};
-use adele_voice_module::{Dictation, Speaker, TtsBackend, build_dictation, build_speaker};
-use adele_voice_stt_whisper::WhisperStt;
-use adele_voice_vad_silero::SileroVad;
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+use adele_voice_module::{Dictation, SileroVad, WhisperStt, build_dictation};
+use adele_voice_module::{Speaker, TtsBackend, build_speaker};
 use serde::Deserialize;
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 use tokio::sync::Mutex;
 
 /// The speakable-sentence chunker now lives in the shared `client-voice` crate
@@ -126,7 +142,147 @@ fn config_path() -> Option<std::path::PathBuf> {
     Some(base.join("adele-tui").join("voice.toml"))
 }
 
-/// The embedded voice pipeline: a one-shot dictation capture plus a speaker.
+/// Whether this build contains a dictation pipeline.
+///
+/// Paired with the target-scoped `adele-voice-module` dependency in
+/// `Cargo.toml`: **Intel** macOS selects no VAD backend, because the only one
+/// available needs ONNX Runtime, and `ort` publishes no prebuilt binary for
+/// `x86_64-apple-darwin`. It does publish one for `aarch64-apple-darwin`, so
+/// Apple Silicon keeps dictation - the carve-out is by architecture, not by
+/// operating system, because widening it to all of macOS would take dictation
+/// away from a machine where it works.
+///
+/// The pairing is compiler-checked in **one** direction only. Claiming
+/// dictation the manifest did not grant fails to build, because
+/// `build_dictation` exists only when the module compiles both adapters. The
+/// other direction is silent: a manifest that grants a VAD while this stays
+/// false compiles clean and leaves dictation switched off. That is the shape to
+/// watch when adelie-ai/voice#133 adds the Apple adapters - closing it needs the
+/// module to publish whether it has a dictation pipeline, tracked as
+/// adelie-ai/voice#171.
+///
+/// Read this rather than naming the platform again at a call site.
+pub const DICTATION_SUPPORTED: bool = cfg!(not(all(target_os = "macos", target_arch = "x86_64")));
+
+/// Why a dictation key press did not start a capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DictationBlocked {
+    /// The build contains no dictation pipeline at all.
+    NotCompiledIn,
+    /// Voice is configured off.
+    VoiceOff,
+    /// A capture is already running.
+    AlreadyListening,
+    /// The session is still loading its models.
+    StillLoading,
+}
+
+impl DictationBlocked {
+    /// What to show the user, which must point at something they can act on.
+    pub fn message(self) -> &'static str {
+        match self {
+            // Deliberately does not promise that playback works. Whether it
+            // does depends on the mode and on the daemon, neither of which this
+            // reason knows about, and a press in `mode = "off"` reaches here.
+            Self::NotCompiledIn => {
+                "Dictation is not in this build — speech input needs a voice-activity \
+                 detector, and none is available for this platform yet \
+                 (adelie-ai/voice#133)"
+            }
+            Self::VoiceOff => {
+                "Voice is off — set mode = \"embedded\" in ~/.config/adele-tui/voice.toml"
+            }
+            Self::AlreadyListening => "Already listening…",
+            Self::StillLoading => "Voice still loading models — try again in a moment",
+        }
+    }
+}
+
+/// Status text while the embedded session loads.
+///
+/// Takes `dictation_supported` rather than reading [`DICTATION_SUPPORTED`], so
+/// both wordings are checkable from either platform.
+pub fn session_loading_message(dictation_supported: bool) -> &'static str {
+    if dictation_supported {
+        "Voice: loading models… (Ctrl+G to dictate)"
+    } else {
+        "Voice: loading playback…"
+    }
+}
+
+/// Status text once the embedded session is up.
+///
+/// Two things a person needs and cannot otherwise discover. Whether this build
+/// can dictate at all - offering `Ctrl+G` to a build with no dictation is how
+/// the key press ends up contradicting the banner that advertised it. And
+/// whether the TTS backend in `voice.toml` is one this build contains, because
+/// the module falls back to Piper when it is not, and that fallback is silent
+/// unless the person is running with logging turned up.
+pub fn session_ready_message(
+    dictation_supported: bool,
+    configured_tts_backend: &str,
+    compiled_in_tts_backends: &[&str],
+) -> String {
+    let ready = if dictation_supported {
+        "Voice ready (Ctrl+G to dictate)"
+    } else {
+        "Voice ready for playback — dictation is not in this build"
+    };
+    if compiled_in_tts_backends.contains(&configured_tts_backend) {
+        return ready.into();
+    }
+    // Deliberately does not say "not compiled in": a name this build does not
+    // offer is as often a typo in voice.toml as a backend left out of the
+    // build, and the client cannot tell the two apart. Naming what IS on offer
+    // is what makes either one recoverable.
+    format!(
+        "{ready} — voice.toml asks for {configured_tts_backend} TTS, which this build does not \
+         offer; using piper (available: {})",
+        compiled_in_tts_backends.join(", ")
+    )
+}
+
+/// Decide whether a dictation key press can start a capture.
+///
+/// `NotCompiledIn` is checked first on purpose. Every other message sends
+/// someone to edit `voice.toml` or to wait, and neither does anything for a
+/// build with no dictation in it.
+pub fn dictation_gate(
+    supported: bool,
+    embedded_enabled: bool,
+    already_dictating: bool,
+    session_ready: bool,
+) -> Result<(), DictationBlocked> {
+    if !supported {
+        return Err(DictationBlocked::NotCompiledIn);
+    }
+    if !embedded_enabled {
+        return Err(DictationBlocked::VoiceOff);
+    }
+    if already_dictating {
+        return Err(DictationBlocked::AlreadyListening);
+    }
+    if !session_ready {
+        return Err(DictationBlocked::StillLoading);
+    }
+    Ok(())
+}
+
+/// Result of a one-shot embedded dictation capture, delivered from the capture
+/// task back to the event loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DictationOutcome {
+    /// A non-empty transcript was produced.
+    Transcribed(String),
+    /// The capture ended with no usable speech (timed out, near-silent, or an
+    /// empty transcript) — the module returned `None`.
+    NoSpeech,
+    /// The capture errored (mic open failed, model error, …).
+    Failed(String),
+}
+
+/// The embedded voice pipeline: a speaker, plus a one-shot dictation capture on
+/// the targets that have one.
 ///
 /// The `Dictation` is behind a `Mutex` because each press dictates on a spawned
 /// task (capture is blocking-ish — it opens the mic and waits for speech), and
@@ -134,36 +290,65 @@ fn config_path() -> Option<std::path::PathBuf> {
 /// the mic at once. `Speaker` is cheap to clone (shared `Arc` handles), so the
 /// playback task gets its own clone.
 pub struct VoiceSession {
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
     dictation: Arc<Mutex<Dictation<SileroVad, WhisperStt>>>,
     speaker: Speaker<TtsBackend>,
 }
 
 impl VoiceSession {
-    /// Wire the embedded pipeline from config. Loads the VAD/STT models and the
-    /// TTS backend (local-first Kokoro→Piper fallback), so this is the expensive
-    /// step; call it once, lazily, on the first dictate.
+    /// Wire the embedded pipeline from config. Loads the TTS backend and, where
+    /// the build has dictation, the VAD/STT models, so this is the expensive
+    /// step; call it once, lazily, on first use.
     ///
     /// Whether replies are *spoken* is no longer a property of the session: the
     /// per-conversation `Ctrl+S` speech toggle (adele-tui#73) governs that. The
     /// session just supplies the `Speaker`; the caller decides per conversation
     /// whether to use it.
+    ///
+    /// `build_speaker` is called on every target, with no `cfg` around it, so a
+    /// build that lost reply playback would not compile. That is what holds
+    /// playback independent of whether the target has dictation.
     pub async fn build(cfg: &VoiceConfig) -> anyhow::Result<Self> {
         // Build the speaker first so the dictation can share its output sink as
         // an echo guard (half-duplex): the mic then won't capture and transcribe
         // Adele's own TTS playback. The stored `speaker` is the one playback runs
         // through, so the guard watches the right sink.
         let speaker = build_speaker(&cfg.tts, &cfg.audio).await;
-        let dictation =
-            build_dictation(&cfg.audio, &cfg.vad, &cfg.stt)?.with_echo_guard(speaker.sink());
-        Ok(Self {
-            dictation: Arc::new(Mutex::new(dictation)),
-            speaker,
+        #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+        {
+            let dictation =
+                build_dictation(&cfg.audio, &cfg.vad, &cfg.stt)?.with_echo_guard(speaker.sink());
+            Ok(Self {
+                dictation: Arc::new(Mutex::new(dictation)),
+                speaker,
+            })
+        }
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        Ok(Self { speaker })
+    }
+
+    /// One capture, run to completion, or `None` where the build has no
+    /// dictation pipeline.
+    ///
+    /// The returned future owns the lock for its whole duration: that both gives
+    /// it the `&mut Dictation` it needs and stops a second press opening the mic
+    /// while the first is still recording.
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    pub fn capture(&self) -> Option<impl std::future::Future<Output = DictationOutcome> + use<>> {
+        let handle = Arc::clone(&self.dictation);
+        Some(async move {
+            let mut dictation = handle.lock().await;
+            match dictation.dictate().await {
+                Ok(Some(text)) => DictationOutcome::Transcribed(text),
+                Ok(None) => DictationOutcome::NoSpeech,
+                Err(e) => DictationOutcome::Failed(e.to_string()),
+            }
         })
     }
 
-    /// A clonable handle to the dictation capture, for spawning a capture task.
-    pub fn dictation(&self) -> Arc<Mutex<Dictation<SileroVad, WhisperStt>>> {
-        Arc::clone(&self.dictation)
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    pub fn capture(&self) -> Option<impl std::future::Future<Output = DictationOutcome> + use<>> {
+        None::<std::future::Ready<DictationOutcome>>
     }
 
     /// A speaker clone for spawning a playback task.
@@ -175,6 +360,123 @@ impl VoiceSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The gate is a pure function of four facts rather than a chain of `if`s
+    // inside the key handler, so every reason a press does nothing can be
+    // checked on any platform - including the not-compiled-in reason, which the
+    // host platform would otherwise decide for the test.
+
+    #[test]
+    fn a_build_without_dictation_says_so_rather_than_looking_broken() {
+        let blocked = dictation_gate(false, true, false, true).unwrap_err();
+        assert_eq!(blocked, DictationBlocked::NotCompiledIn);
+        let message = blocked.message();
+        assert!(
+            message.contains("this build"),
+            "the message must say the build lacks it, not that voice is off: {message}"
+        );
+    }
+
+    #[test]
+    fn not_compiled_in_outranks_the_other_reasons() {
+        // Every other message would send someone to edit voice.toml or wait for
+        // models, neither of which can help a build with no dictation in it.
+        assert_eq!(
+            dictation_gate(false, false, true, false).unwrap_err(),
+            DictationBlocked::NotCompiledIn
+        );
+    }
+
+    #[test]
+    fn voice_off_is_reported_when_the_build_has_dictation() {
+        assert_eq!(
+            dictation_gate(true, false, false, true).unwrap_err(),
+            DictationBlocked::VoiceOff
+        );
+    }
+
+    #[test]
+    fn a_second_press_while_capturing_is_reported_as_already_listening() {
+        assert_eq!(
+            dictation_gate(true, true, true, true).unwrap_err(),
+            DictationBlocked::AlreadyListening
+        );
+    }
+
+    #[test]
+    fn a_press_before_the_models_finish_loading_is_reported_as_loading() {
+        assert_eq!(
+            dictation_gate(true, true, false, false).unwrap_err(),
+            DictationBlocked::StillLoading
+        );
+    }
+
+    #[test]
+    fn a_ready_session_on_a_supported_build_is_allowed() {
+        assert!(dictation_gate(true, true, false, true).is_ok());
+    }
+
+    #[test]
+    fn every_blocked_reason_has_a_non_empty_message() {
+        for blocked in [
+            DictationBlocked::NotCompiledIn,
+            DictationBlocked::VoiceOff,
+            DictationBlocked::AlreadyListening,
+            DictationBlocked::StillLoading,
+        ] {
+            assert!(!blocked.message().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_build_without_dictation_does_not_advertise_the_dictate_key() {
+        // The banner and the key press have to agree. Offering Ctrl+G here is
+        // how a person gets told to press a key that then says it does nothing.
+        assert!(!session_loading_message(false).contains("Ctrl+G"));
+        assert!(!session_ready_message(false, "piper", &["piper"]).contains("Ctrl+G"));
+    }
+
+    #[test]
+    fn a_build_with_dictation_still_advertises_the_dictate_key() {
+        assert!(session_loading_message(true).contains("Ctrl+G"));
+        assert!(session_ready_message(true, "piper", &["piper"]).contains("Ctrl+G"));
+    }
+
+    #[test]
+    fn a_tts_backend_this_build_lacks_is_named_in_the_ready_message() {
+        // The module falls back to Piper and reports it at error level, but the
+        // TUI installs no subscriber at default verbosity, so without this the
+        // person's configured backend is swapped out with nothing said.
+        let message = session_ready_message(false, "kokoro", &["piper", "polly"]);
+        assert!(message.contains("kokoro"), "{message}");
+        assert!(message.contains("piper"), "{message}");
+        assert!(message.contains("polly"), "{message}");
+    }
+
+    #[test]
+    fn a_tts_backend_this_build_has_is_not_flagged() {
+        let message = session_ready_message(true, "kokoro", &["piper", "polly", "kokoro"]);
+        assert!(!message.contains("not in this build"), "{message}");
+    }
+
+    #[test]
+    fn the_unavailable_dictation_message_does_not_promise_playback() {
+        // Reachable with mode = "off" and no daemon, where nothing speaks. The
+        // check is that playback is not mentioned at all, rather than that one
+        // phrasing of the promise is absent: this reason cannot know whether
+        // playback works, so any claim about it is one it is not entitled to.
+        let message = DictationBlocked::NotCompiledIn.message().to_lowercase();
+        assert!(!message.contains("playback"), "{message}");
+    }
+
+    #[test]
+    fn the_unavailable_dictation_message_says_what_would_restore_it() {
+        assert!(
+            DictationBlocked::NotCompiledIn
+                .message()
+                .contains("voice#133")
+        );
+    }
 
     #[test]
     fn voice_mode_defaults_to_off() {

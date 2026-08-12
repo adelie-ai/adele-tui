@@ -81,12 +81,37 @@ skills-mcp = { path = "../skills-mcp", optional = true }
 # Embeddable voice module (adelie-ai/voice phase 1) for in-app dictation +
 # reply playback with no voice daemon — see adele-tui#67 / voice#34. Path-dep
 # of the sibling `voice` checkout, mirroring how we path-dep desktop-assistant
-# from adele-gtk; revisit git-dep/publish once the module's API is stable. The
-# two adapter crates are named so we can spell the concrete pipeline type
-# `Dictation<SileroVad, WhisperStt>`; cargo resolves the rest of the module's
-# transitive deps from the voice workspace automatically.
-[dependencies.adele-voice-module]
+# from adele-gtk; revisit git-dep/publish once the module's API is stable.
+#
+# The module re-exports the adapter types it compiles in, so the concrete
+# pipeline type `Dictation<SileroVad, WhisperStt>` is named through the module
+# rather than by path-depping the adapter crates. That is what makes the macOS
+# selection below effective: a direct dep on an adapter would keep its own
+# dependencies in the graph no matter which module features are chosen.
+[target.'cfg(not(all(target_os = "macos", target_arch = "x86_64")))'.dependencies.adele-voice-module]
 path = "../voice/crates/module"
+
+# macOS selects no ONNX-Runtime backend.
+#
+# `ort` ships no prebuilt ONNX Runtime for `x86_64-apple-darwin`, and the two
+# backends that pull it in are `vad-silero` and `tts-kokoro`. Declining both
+# keeps `ort` out of the graph entirely, so the crate builds and tests with no
+# `libonnxruntime` on the machine — previously the whole crate failed to
+# compile here, `cargo test` included, for work nowhere near voice.
+#
+# `stt-whisper` is declined too. It needs no ONNX Runtime, but with no VAD
+# compiled in there is nothing to pair it with, so it would cost a from-source
+# whisper build and deliver nothing. It returns together with a VAD when
+# adelie-ai/voice#133 lands the Apple Speech adapters.
+#
+# `tts-polly` stays: cloud TTS needs no ONNX Runtime, and Piper is always
+# compiled into the module, so reply playback is unaffected on this target. A
+# `voice.toml` asking for `kokoro` gets an error naming the backend, the feature
+# that would add it, and what is available, then falls back to Piper.
+[target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies.adele-voice-module]
+path = "../voice/crates/module"
+default-features = false
+features = ["tts-polly"]
 
 # Shared client-side voice-output plumbing (desktop-assistant#274): the
 # `AdeleOutput` level + narration gate, the byte-identical system-refinement
@@ -97,32 +122,6 @@ path = "../voice/crates/module"
 # `../voice` symlink path-dep as the module above.
 [dependencies.adele-voice-client-common]
 path = "../voice/crates/client-voice"
-
-[dependencies.adele-voice-vad-silero]
-path = "../voice/crates/vad-silero"
-
-# macOS: resolve ONNX Runtime at runtime instead of linking it at build time.
-#
-# `ort` ships no prebuilt ONNX Runtime for `x86_64-apple-darwin`, and because
-# `adele-voice-module` depends on vad-silero unconditionally, the link-time path
-# fails the WHOLE crate — `cargo build`/`test`/`clippy` are unavailable on an
-# Intel Mac even for work nowhere near voice. `load-dynamic` restores them.
-#
-# Target-scoped so Linux is completely untouched: cargo unifies features per
-# build, so a Linux build never sees this and keeps linking exactly as before.
-# Opting in here (rather than defaulting it on in vad-silero) keeps the blast
-# radius to this one target.
-#
-# Runtime cost of the opt-in: macOS needs `libonnxruntime` available
-# (`brew install onnxruntime`, or point `ORT_DYLIB_PATH` at it). Absent it, voice
-# input fails when first used instead of at build time — an acceptable trade for
-# a platform whose voice backend is unfinished anyway (adelie-ai/voice#133).
-[target.'cfg(target_os = "macos")'.dependencies.adele-voice-vad-silero]
-path = "../voice/crates/vad-silero"
-features = ["load-dynamic"]
-
-[dependencies.adele-voice-stt-whisper]
-path = "../voice/crates/stt-whisper"
 
 # Option D dep-sourcing: client-ui-common path-deps the desktop-assistant crates
 # while adele keeps its git pin above. Redirect those transitive deps onto the SAME
