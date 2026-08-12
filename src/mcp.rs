@@ -1264,6 +1264,9 @@ fn toggle_builtin(state: &mut State, index: usize) {
         }
         Err(e) => {
             state.notice = None;
+            // `draw_status` renders `busy` in place of `error`, so a refusal
+            // arriving while something else is in flight would never be drawn.
+            state.busy = None;
             state.error = Some(format!("Config unchanged: {e}"));
         }
     }
@@ -2823,6 +2826,11 @@ mod tests {
             Ok(())
         })
         .expect("seed edit");
+        assert_eq!(
+            ClientMcpConfig::load(&path).surface_disabled_builtins("tui"),
+            &["web"],
+            "the seed landed, so the assertion below has something to remove"
+        );
 
         toggle_builtin(&mut state, 0);
 
@@ -2871,12 +2879,100 @@ mod tests {
             .as_deref()
             .expect("the refusal reaches the panel");
         assert!(
+            err.contains("parse error"),
+            "the panel error names the cause, not just the file: {err}"
+        );
+        assert!(
             err.contains("client-mcp.toml"),
             "the panel error names the file: {err}"
         );
         assert!(
             state.notice.is_none(),
             "a refused edit reports no success notice"
+        );
+    }
+
+    /// `draw_status` renders `busy` in place of `error`, so a refusal that
+    /// arrives while something else is in flight is invisible unless the toggle
+    /// clears `busy`. Rendered at 80 columns, which is what a person has.
+    #[test]
+    fn toggle_builtin_refusal_reaches_the_status_line_while_busy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("client-mcp.toml");
+        std::fs::write(&path, "this is not toml {\n").expect("seed an unparseable config");
+
+        let mut state = state_with(Vec::new(), Vec::new());
+        state.config_path = path.clone();
+        state.builtin_dtos = vec![builtin_dto("web", 3, None, false)];
+        state.busy = Some("Loading MCP servers...".into());
+
+        toggle_builtin(&mut state, 0);
+
+        let drawn = rendered(&state, 80, 20);
+        assert!(
+            drawn.contains("Config unchanged"),
+            "the refusal is drawn: {drawn}"
+        );
+        assert!(
+            !drawn.contains("Loading MCP servers"),
+            "the refusal is not masked by a stale busy line: {drawn}"
+        );
+    }
+
+    /// A lock another client holds refuses the toggle, and the panel says so.
+    /// This is the panel-side half of the property the lock exists for: two
+    /// clients queue rather than one losing the other's edit.
+    #[test]
+    fn toggle_builtin_refuses_while_another_client_holds_the_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("client-mcp.toml");
+        ClientMcpConfig::edit(&path, |cfg| {
+            cfg.set_builtin_disabled("tui", "other", true);
+            Ok(())
+        })
+        .expect("seed edit");
+        let before = std::fs::read(&path).expect("read before");
+
+        let mut lock_name = path.file_name().expect("file name").to_owned();
+        lock_name.push(".lock");
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.with_file_name(lock_name))
+            .expect("open sidecar lock");
+        held.try_lock().expect("take sidecar lock");
+
+        let mut state = state_with(Vec::new(), Vec::new());
+        state.config_path = path.clone();
+        state.builtin_dtos = vec![builtin_dto("web", 3, None, false)];
+
+        toggle_builtin(&mut state, 0);
+
+        assert_eq!(
+            before,
+            std::fs::read(&path).expect("read after"),
+            "a refused edit leaves the config byte-identical"
+        );
+        assert!(
+            !state.builtin_dtos[0].disabled_by_config,
+            "a refused edit does not flip the row"
+        );
+        let err = state
+            .error
+            .as_deref()
+            .expect("the refusal reaches the panel");
+        assert!(
+            err.contains("another Adele client is editing"),
+            "the panel error names the cause: {err}"
+        );
+
+        drop(held);
+        toggle_builtin(&mut state, 0);
+        assert_eq!(
+            ClientMcpConfig::load(&path).surface_disabled_builtins("tui"),
+            &["other", "web"],
+            "the next toggle succeeds once the lock is released"
         );
     }
 

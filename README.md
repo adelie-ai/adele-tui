@@ -186,8 +186,8 @@ from the interactive `F5` panel.
 **Every write to `client-mcp.toml` takes a lock**, because the file is shared by
 every Adele client on the machine. Each change (from the CLI or from the `F5`
 panel) holds one lock on a sidecar `client-mcp.toml.lock` across the read, the
-change and the write, so two clients that edit at the same time queue instead of
-losing one of the two edits. Two consequences you can see:
+change and the write, so a second client waits for the first instead of losing
+one of the two edits. Two consequences you can see:
 
 - A `client-mcp.toml` that cannot be parsed **refuses the change** and stays as
   it is. The command prints the cause and exits non-zero; the `F5` panel shows

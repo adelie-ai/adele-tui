@@ -832,7 +832,7 @@ command = \"b\"
     }
 
     #[test]
-    fn add_server_refuses_an_unparseable_config_and_writes_nothing() {
+    fn add_server_refuses_an_unparseable_config_and_leaves_it_byte_identical() {
         let (_dir, path) = temp_cfg();
         std::fs::write(&path, UNPARSEABLE).expect("seed an unparseable config");
         let before = std::fs::read(&path).expect("read before");
@@ -849,6 +849,10 @@ command = \"b\"
         )
         .expect_err("an unparseable config must refuse the write");
 
+        assert!(
+            err.to_string().contains("parse error"),
+            "the refusal names the cause, not just the file: {err}"
+        );
         assert!(
             err.to_string().contains("client-mcp.toml"),
             "the refusal names the file: {err}"
@@ -890,7 +894,7 @@ command = \"b\"
     }
 
     #[test]
-    fn remove_server_refuses_an_unparseable_config_and_writes_nothing() {
+    fn remove_server_refuses_an_unparseable_config_and_leaves_it_byte_identical() {
         let (_dir, path) = temp_cfg();
         std::fs::write(&path, UNPARSEABLE).expect("seed an unparseable config");
         let before = std::fs::read(&path).expect("read before");
@@ -898,6 +902,10 @@ command = \"b\"
         let err = mcp_remove_server(&path, "notes", &mut Vec::new())
             .expect_err("an unparseable config must refuse the write");
 
+        assert!(
+            err.to_string().contains("parse error"),
+            "the refusal names the cause, not just the file: {err}"
+        );
         assert!(
             err.to_string().contains("client-mcp.toml"),
             "the refusal names the file: {err}"
@@ -910,7 +918,7 @@ command = \"b\"
     }
 
     #[test]
-    fn set_enabled_refuses_an_unparseable_config_and_writes_nothing() {
+    fn set_enabled_refuses_an_unparseable_config_and_leaves_it_byte_identical() {
         let (_dir, path) = temp_cfg();
         std::fs::write(&path, UNPARSEABLE).expect("seed an unparseable config");
         let before = std::fs::read(&path).expect("read before");
@@ -920,6 +928,10 @@ command = \"b\"
             .expect_err("an unparseable config must refuse the write");
 
         assert!(
+            err.to_string().contains("parse error"),
+            "the refusal names the cause, not just the file: {err}"
+        );
+        assert!(
             err.to_string().contains("client-mcp.toml"),
             "the refusal names the file: {err}"
         );
@@ -930,20 +942,25 @@ command = \"b\"
         );
     }
 
-    /// An unparseable config hides every definition from a tolerant load, so a
-    /// server that is defined in the file reads as absent. The refusal must say
-    /// the file cannot be read, not that the server does not exist.
+    /// A config the strict parse rejects hides every definition from a tolerant
+    /// load, so a server the file really defines reads as absent. `notes` is
+    /// defined twice in this fixture. The refusal must say the file cannot be
+    /// read, not that the server does not exist.
     #[test]
-    fn set_enabled_reports_the_parse_failure_rather_than_a_missing_server() {
+    fn set_enabled_reports_the_read_failure_rather_than_a_missing_server() {
         let (_dir, path) = temp_cfg();
-        std::fs::write(&path, UNPARSEABLE).expect("seed an unparseable config");
+        std::fs::write(&path, DUPLICATE_NAMES).expect("seed a duplicate-name config");
 
         let err = mcp_set_enabled(&path, "notes", "tui", true, &[], &mut Vec::new())
-            .expect_err("an unparseable config must refuse the write");
+            .expect_err("a config the strict parse rejects must refuse the write");
 
         assert!(
+            err.to_string().contains("duplicate server name"),
+            "the refusal names the cause: {err}"
+        );
+        assert!(
             !err.to_string().contains("no such client-MCP server"),
-            "an unreadable file is not a missing server: {err}"
+            "a file that cannot be read is not a missing server: {err}"
         );
     }
 
