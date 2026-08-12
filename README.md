@@ -130,9 +130,9 @@ drive a local or remote (k8s) brain end to end. This replaces the old
 
 ### `config` — scriptable config management
 
-The non-interactive twin of the `F5` MCP-servers panel. It loads, mutates, and
-saves the shared client-MCP config (`$XDG_CONFIG_HOME/adele/client-mcp.toml`)
-directly, with no daemon connection:
+The non-interactive twin of the `F5` MCP-servers panel. It reads and changes the
+shared client-MCP config (`$XDG_CONFIG_HOME/adele/client-mcp.toml`) directly,
+with no daemon connection:
 
 ```sh
 adele config path                     # print the config file location
@@ -182,6 +182,18 @@ the panel remain daemon-server operations.
 
 Daemon-hosted MCP servers are out of scope for the `config` CLI — manage those
 from the interactive `F5` panel.
+
+**Every write to `client-mcp.toml` takes a lock**, because the file is shared by
+every Adele client on the machine. Each change (from the CLI or from the `F5`
+panel) holds one lock on a sidecar `client-mcp.toml.lock` across the read, the
+change and the write, so a second client waits for the first instead of losing
+one of the two edits. Two consequences you can see:
+
+- A `client-mcp.toml` that cannot be parsed **refuses the change** and stays as
+  it is. The command prints the cause and exits non-zero; the `F5` panel shows
+  it on the error line. Fix the file by hand, then run the command again.
+- A change waits about two seconds for another client's edit, then reports that
+  another Adele client is editing. Run it again.
 
 ### Global options
 

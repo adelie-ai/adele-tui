@@ -1230,12 +1230,18 @@ fn do_toggle<'a>(
 }
 
 /// Toggle a built-in's per-surface off state (da#538 slice 4). Unlike a daemon
-/// server this is a client-side config write, not an RPC: load the shared
-/// client-MCP config, flip `disabled_builtins` for `SURFACE`, persist, and flip
+/// server this is a client-side config write, not an RPC: flip
+/// `disabled_builtins` for `SURFACE` in the shared client-MCP config, then flip
 /// the DTO so the row re-derives (disabled <-> active) on the next draw. The
 /// running in-process host is not restarted, so the change takes effect on the
-/// next client launch — surfaced in the confirmation note. Loading fresh (rather
-/// than trusting an in-memory copy) means a concurrent CLI edit isn't clobbered.
+/// next client launch — surfaced in the confirmation note.
+///
+/// The write goes through [`ClientMcpConfig::edit`], which holds one lock across
+/// the read, the change and the write. That is what keeps a concurrent CLI or
+/// GTK edit from being clobbered, and it reads the file strictly: a config that
+/// cannot be parsed refuses the toggle instead of being replaced by an empty
+/// one. Every refusal reaches the panel's error line, and the row keeps its old
+/// state.
 fn toggle_builtin(state: &mut State, index: usize) {
     let Some(dto) = state.builtin_dtos.get(index) else {
         return;
@@ -1243,9 +1249,10 @@ fn toggle_builtin(state: &mut State, index: usize) {
     let name = dto.name.clone();
     let new_disabled = !dto.disabled_by_config;
 
-    let mut cfg = ClientMcpConfig::load(&state.config_path);
-    cfg.set_builtin_disabled(SURFACE, &name, new_disabled);
-    match cfg.save(&state.config_path) {
+    match ClientMcpConfig::edit(&state.config_path, |cfg| {
+        cfg.set_builtin_disabled(SURFACE, &name, new_disabled);
+        Ok(())
+    }) {
         Ok(()) => {
             state.builtin_dtos[index].disabled_by_config = new_disabled;
             state.error = None;
@@ -1257,7 +1264,10 @@ fn toggle_builtin(state: &mut State, index: usize) {
         }
         Err(e) => {
             state.notice = None;
-            state.error = Some(format!("Failed to save config: {e}"));
+            // `draw_status` renders `busy` in place of `error`, so a refusal
+            // arriving while something else is in flight would never be drawn.
+            state.busy = None;
+            state.error = Some(format!("Config unchanged: {e}"));
         }
     }
 }
@@ -2811,11 +2821,16 @@ mod tests {
         // Start disabled, then toggle back on.
         state.builtin_dtos = vec![builtin_dto("web", 3, None, true)];
         // Seed the config so the re-enable has something to remove.
-        {
-            let mut cfg = ClientMcpConfig::load(&path);
+        ClientMcpConfig::edit(&path, |cfg| {
             cfg.set_builtin_disabled("tui", "web", true);
-            cfg.save(&path).expect("seed save");
-        }
+            Ok(())
+        })
+        .expect("seed edit");
+        assert_eq!(
+            ClientMcpConfig::load(&path).surface_disabled_builtins("tui"),
+            &["web"],
+            "the seed landed, so the assertion below has something to remove"
+        );
 
         toggle_builtin(&mut state, 0);
 
@@ -2830,6 +2845,134 @@ mod tests {
         assert!(
             notice.contains("enabled"),
             "notice reports re-enable: {notice}"
+        );
+    }
+
+    /// A `client-mcp.toml` that cannot be parsed holds every other client's
+    /// server definitions. A tolerant load reads it as empty, so a load-then-save
+    /// pair erases them. The toggle must refuse, keep the file, and say why on
+    /// the panel's error line (#176).
+    #[test]
+    fn toggle_builtin_refuses_an_unparseable_config_and_reports_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("client-mcp.toml");
+        std::fs::write(&path, "this is not toml {\n").expect("seed an unparseable config");
+        let before = std::fs::read(&path).expect("read before");
+
+        let mut state = state_with(Vec::new(), Vec::new());
+        state.config_path = path.clone();
+        state.builtin_dtos = vec![builtin_dto("web", 3, None, false)];
+
+        toggle_builtin(&mut state, 0);
+
+        assert_eq!(
+            before,
+            std::fs::read(&path).expect("read after"),
+            "a refused edit leaves the config byte-identical"
+        );
+        assert!(
+            !state.builtin_dtos[0].disabled_by_config,
+            "a refused edit does not flip the row"
+        );
+        let err = state
+            .error
+            .as_deref()
+            .expect("the refusal reaches the panel");
+        assert!(
+            err.contains("parse error"),
+            "the panel error names the cause, not just the file: {err}"
+        );
+        assert!(
+            err.contains("client-mcp.toml"),
+            "the panel error names the file: {err}"
+        );
+        assert!(
+            state.notice.is_none(),
+            "a refused edit reports no success notice"
+        );
+    }
+
+    /// `draw_status` renders `busy` in place of `error`, so a refusal that
+    /// arrives while something else is in flight is invisible unless the toggle
+    /// clears `busy`. Rendered at 80 columns, which is what a person has.
+    #[test]
+    fn toggle_builtin_refusal_reaches_the_status_line_while_busy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("client-mcp.toml");
+        std::fs::write(&path, "this is not toml {\n").expect("seed an unparseable config");
+
+        let mut state = state_with(Vec::new(), Vec::new());
+        state.config_path = path.clone();
+        state.builtin_dtos = vec![builtin_dto("web", 3, None, false)];
+        state.busy = Some("Loading MCP servers...".into());
+
+        toggle_builtin(&mut state, 0);
+
+        let drawn = rendered(&state, 80, 20);
+        assert!(
+            drawn.contains("Config unchanged"),
+            "the refusal is drawn: {drawn}"
+        );
+        assert!(
+            !drawn.contains("Loading MCP servers"),
+            "the refusal is not masked by a stale busy line: {drawn}"
+        );
+    }
+
+    /// A lock another client holds refuses the toggle, and the panel says so.
+    /// This is the panel-side half of the property the lock exists for: two
+    /// clients queue rather than one losing the other's edit.
+    #[test]
+    fn toggle_builtin_refuses_while_another_client_holds_the_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("client-mcp.toml");
+        ClientMcpConfig::edit(&path, |cfg| {
+            cfg.set_builtin_disabled("tui", "other", true);
+            Ok(())
+        })
+        .expect("seed edit");
+        let before = std::fs::read(&path).expect("read before");
+
+        let mut lock_name = path.file_name().expect("file name").to_owned();
+        lock_name.push(".lock");
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.with_file_name(lock_name))
+            .expect("open sidecar lock");
+        held.try_lock().expect("take sidecar lock");
+
+        let mut state = state_with(Vec::new(), Vec::new());
+        state.config_path = path.clone();
+        state.builtin_dtos = vec![builtin_dto("web", 3, None, false)];
+
+        toggle_builtin(&mut state, 0);
+
+        assert_eq!(
+            before,
+            std::fs::read(&path).expect("read after"),
+            "a refused edit leaves the config byte-identical"
+        );
+        assert!(
+            !state.builtin_dtos[0].disabled_by_config,
+            "a refused edit does not flip the row"
+        );
+        let err = state
+            .error
+            .as_deref()
+            .expect("the refusal reaches the panel");
+        assert!(
+            err.contains("another Adele client is editing"),
+            "the panel error names the cause: {err}"
+        );
+
+        drop(held);
+        toggle_builtin(&mut state, 0);
+        assert_eq!(
+            ClientMcpConfig::load(&path).surface_disabled_builtins("tui"),
+            &["other", "web"],
+            "the next toggle succeeds once the lock is released"
         );
     }
 

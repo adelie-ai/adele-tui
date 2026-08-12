@@ -315,7 +315,8 @@ impl From<Global> for ConnectionConfig {
 }
 
 /// Dispatch a `config` subcommand: pure, daemon-free config management that
-/// loads/mutates/saves the shared `client-mcp.toml` and prints to stdout. Runs
+/// changes the shared `client-mcp.toml` under its edit lock, and prints to
+/// stdout. A refused change returns the cause, which `main` prints. Runs
 /// before any TUI/terminal or daemon connection setup. Built-in server info
 /// (name + advertised tool count) is resolved from the compiled-in set so
 /// `mcp list`/`enable`/`disable` can report built-ins without a daemon.
