@@ -156,13 +156,12 @@ fn config_path() -> Option<std::path::PathBuf> {
 /// `build.rs`'s business and the manifest's.
 ///
 /// The build script and the target-scoped dependency are paired by hand, and
-/// the pairing is compiler-checked in **one** direction only: claiming
-/// dictation the manifest did not grant fails to build on the missing
-/// `build_dictation`, while granting a VAD that `build.rs` does not know about
-/// compiles clean and leaves dictation switched off. That is the shape to watch
-/// when adelie-ai/voice#133 adds the Apple adapters; closing it needs the module
-/// to publish whether it has a dictation pipeline, tracked as
-/// adelie-ai/voice#171.
+/// both directions of that pairing are checked. Claiming dictation the manifest
+/// did not grant fails to compile, on the missing `build_dictation`. Granting a
+/// VAD that `build.rs` does not know about would compile perfectly and ship with
+/// dictation switched off, so it is caught by
+/// `has_dictation_agrees_with_what_the_manifest_resolves` instead, which asks
+/// cargo what the manifest resolves for this build's own target.
 pub const DICTATION_SUPPORTED: bool = cfg!(has_dictation);
 
 /// Why a dictation key press did not start a capture.

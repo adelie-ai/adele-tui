@@ -14,12 +14,16 @@
 //! has to be correct on every platform with no flags.
 //!
 //! **This condition is stated twice**, here and in the target-scoped dependency
-//! in `Cargo.toml`, and nothing checks that the two agree. A build script runs
-//! after resolution, so it cannot influence which crates arrive; the manifest
-//! cannot run code. Two adjacent statements of one rule is the floor Cargo
-//! allows. Claiming dictation the manifest did not supply fails to build, on the
-//! missing `build_dictation`; the reverse is silent, and closing it needs the
-//! module to publish the fact - adelie-ai/voice#171.
+//! in `Cargo.toml`. A build script runs after resolution, so it cannot influence
+//! which crates arrive; the manifest cannot run code. Two adjacent statements of
+//! one rule is the floor Cargo allows.
+//!
+//! They are checked against each other, in both directions, by
+//! `tests/acceptance_voice_backends.rs`, which is why `ADELE_TARGET` is exported
+//! below: the test needs the triple this build was compiled for so it can ask
+//! cargo what the manifest resolves for that same triple. Claiming dictation the
+//! manifest did not supply already fails to compile, on the missing
+//! `build_dictation`; the reverse used to be silent, and is now a test failure.
 
 fn main() {
     // Declare the cfg so a typo in the name is a warning rather than a
@@ -27,10 +31,23 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(has_dictation)");
     println!("cargo::rerun-if-changed=build.rs");
 
+    // The triple this build targets, for the test that checks this decision
+    // against what the manifest actually resolves.
+    println!(
+        "cargo::rustc-env=ADELE_TARGET={}",
+        std::env::var("TARGET").unwrap_or_default()
+    );
+
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
 
     // Keep in step with the `adele-voice-module` entries in Cargo.toml.
+    //
+    // An unset variable yields "", so this is false - which is how Cargo's own
+    // `cfg(all(target_os = "macos", target_arch = "x86_64"))` evaluates an unset
+    // cfg too. The two statements therefore degrade in the same direction, and
+    // that direction fails loudly: a build claiming dictation it was not given
+    // stops on the missing `build_dictation` rather than quietly losing it.
     let intel_macos = os == "macos" && arch == "x86_64";
     if !intel_macos {
         println!("cargo::rustc-cfg=has_dictation");

@@ -81,3 +81,34 @@ fn a_linux_build_still_resolves_onnx_runtime() {
          graph; if it is gone, the check above can no longer detect anything"
     );
 }
+
+/// The `has_dictation` cfg must agree with what the manifest actually resolved.
+///
+/// `build.rs` decides whether this build has a dictation pipeline, and the
+/// target-scoped `adele-voice-module` dependency decides whether the VAD adapter
+/// is really there. Cargo cannot make one derive from the other: a build script
+/// runs after resolution, and a manifest cannot run code. So the two are written
+/// by hand, and this is what holds them together.
+///
+/// One direction already fails at compile time - claiming dictation the manifest
+/// did not supply leaves `build_dictation` undefined. The other direction is the
+/// one this catches: a manifest that grants a VAD while `build.rs` says
+/// otherwise compiles perfectly and silently ships with dictation switched off.
+/// That is the state adelie-ai/voice#133 will walk into when it adds the Apple
+/// adapters to the macOS feature set.
+#[test]
+fn has_dictation_agrees_with_what_the_manifest_resolves() {
+    let target = env!("ADELE_TARGET");
+    let resolves_vad = resolved_packages(target)
+        .lines()
+        .any(|line| line.starts_with("adele-voice-vad-silero v"));
+
+    assert_eq!(
+        cfg!(has_dictation),
+        resolves_vad,
+        "build.rs says has_dictation={} for {target}, but the manifest resolves \
+         adele-voice-vad-silero={resolves_vad}. Those two are written by hand and \
+         have drifted; change both.",
+        cfg!(has_dictation),
+    );
+}
