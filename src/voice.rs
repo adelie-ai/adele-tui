@@ -23,24 +23,27 @@
 //!
 //! # Dictation is not on every target
 //!
-//! The endpointer is Silero VAD, which needs ONNX Runtime, which has no
-//! prebuilt binary for macOS on x86_64. That target therefore selects no VAD
-//! backend at all (see the `adele-voice-module` entries in `Cargo.toml`) and
-//! has **no dictation**: [`DICTATION_SUPPORTED`] is false, [`dictation_gate`]
-//! reports [`DictationBlocked::NotCompiledIn`], and a key press says so.
-//! Reply **playback** is unaffected on every target, because the Piper and
-//! Polly backends need no ONNX Runtime. Dictation returns to macOS with the
-//! native Apple Speech adapters in adelie-ai/voice#133.
+//! The endpointer is Silero VAD, which needs ONNX Runtime, and `ort` publishes
+//! no prebuilt binary for `x86_64-apple-darwin`. **Intel macOS** therefore
+//! selects no VAD backend at all (see the `adele-voice-module` entries in
+//! `Cargo.toml`) and has **no dictation**: [`DICTATION_SUPPORTED`] is false,
+//! [`dictation_gate`] reports [`DictationBlocked::NotCompiledIn`], and a key
+//! press says so. Apple Silicon is unaffected - `ort` ships an
+//! `aarch64-apple-darwin` build - and so is every other target.
+//!
+//! Reply **playback** works everywhere, because the Piper and Polly backends
+//! need no ONNX Runtime. Dictation returns to Intel macOS with the native
+//! Apple Speech adapters in adelie-ai/voice#133.
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 use std::sync::Arc;
 
 use adele_voice_module::config::{AudioConfig, SttConfig, TtsConfig, VadConfig};
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 use adele_voice_module::{Dictation, SileroVad, WhisperStt, build_dictation};
 use adele_voice_module::{Speaker, TtsBackend, build_speaker};
 use serde::Deserialize;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 use tokio::sync::Mutex;
 
 /// The speakable-sentence chunker now lives in the shared `client-voice` crate
@@ -142,8 +145,12 @@ fn config_path() -> Option<std::path::PathBuf> {
 /// Whether this build contains a dictation pipeline.
 ///
 /// Paired with the target-scoped `adele-voice-module` dependency in
-/// `Cargo.toml`: macOS selects no VAD backend, because the only one available
-/// needs ONNX Runtime, which has no prebuilt binary for that target.
+/// `Cargo.toml`: **Intel** macOS selects no VAD backend, because the only one
+/// available needs ONNX Runtime, and `ort` publishes no prebuilt binary for
+/// `x86_64-apple-darwin`. It does publish one for `aarch64-apple-darwin`, so
+/// Apple Silicon keeps dictation - the carve-out is by architecture, not by
+/// operating system, because widening it to all of macOS would take dictation
+/// away from a machine where it works.
 ///
 /// The pairing is compiler-checked in **one** direction only. Claiming
 /// dictation the manifest did not grant fails to build, because
@@ -155,7 +162,7 @@ fn config_path() -> Option<std::path::PathBuf> {
 /// adelie-ai/voice#171.
 ///
 /// Read this rather than naming the platform again at a call site.
-pub const DICTATION_SUPPORTED: bool = cfg!(not(target_os = "macos"));
+pub const DICTATION_SUPPORTED: bool = cfg!(not(all(target_os = "macos", target_arch = "x86_64")));
 
 /// Why a dictation key press did not start a capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,9 +231,13 @@ pub fn session_ready_message(
     if compiled_in_tts_backends.contains(&configured_tts_backend) {
         return ready.into();
     }
+    // Deliberately does not say "not compiled in": a name this build does not
+    // offer is as often a typo in voice.toml as a backend left out of the
+    // build, and the client cannot tell the two apart. Naming what IS on offer
+    // is what makes either one recoverable.
     format!(
-        "{ready} — {configured_tts_backend} TTS is not in this build, falling back to piper \
-         (available: {})",
+        "{ready} — voice.toml asks for {configured_tts_backend} TTS, which this build does not \
+         offer; using piper (available: {})",
         compiled_in_tts_backends.join(", ")
     )
 }
@@ -279,7 +290,7 @@ pub enum DictationOutcome {
 /// the mic at once. `Speaker` is cheap to clone (shared `Arc` handles), so the
 /// playback task gets its own clone.
 pub struct VoiceSession {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
     dictation: Arc<Mutex<Dictation<SileroVad, WhisperStt>>>,
     speaker: Speaker<TtsBackend>,
 }
@@ -303,7 +314,7 @@ impl VoiceSession {
         // Adele's own TTS playback. The stored `speaker` is the one playback runs
         // through, so the guard watches the right sink.
         let speaker = build_speaker(&cfg.tts, &cfg.audio).await;
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
         {
             let dictation =
                 build_dictation(&cfg.audio, &cfg.vad, &cfg.stt)?.with_echo_guard(speaker.sink());
@@ -312,7 +323,7 @@ impl VoiceSession {
                 speaker,
             })
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
         Ok(Self { speaker })
     }
 
@@ -322,7 +333,7 @@ impl VoiceSession {
     /// The returned future owns the lock for its whole duration: that both gives
     /// it the `&mut Dictation` it needs and stops a second press opening the mic
     /// while the first is still recording.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
     pub fn capture(&self) -> Option<impl std::future::Future<Output = DictationOutcome> + use<>> {
         let handle = Arc::clone(&self.dictation);
         Some(async move {
@@ -335,7 +346,7 @@ impl VoiceSession {
         })
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     pub fn capture(&self) -> Option<impl std::future::Future<Output = DictationOutcome> + use<>> {
         None::<std::future::Ready<DictationOutcome>>
     }
@@ -450,12 +461,12 @@ mod tests {
 
     #[test]
     fn the_unavailable_dictation_message_does_not_promise_playback() {
-        // Reachable with mode = "off" and no daemon, where nothing speaks.
-        let message = DictationBlocked::NotCompiledIn.message();
-        assert!(
-            !message.to_lowercase().contains("playback still works"),
-            "{message}"
-        );
+        // Reachable with mode = "off" and no daemon, where nothing speaks. The
+        // check is that playback is not mentioned at all, rather than that one
+        // phrasing of the promise is absent: this reason cannot know whether
+        // playback works, so any claim about it is one it is not entitled to.
+        let message = DictationBlocked::NotCompiledIn.message().to_lowercase();
+        assert!(!message.contains("playback"), "{message}");
     }
 
     #[test]

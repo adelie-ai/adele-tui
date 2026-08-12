@@ -40,7 +40,7 @@ chat, tool calls, and background tasks.
 - **Embedded voice** (optional, off by default) — `Ctrl+G` dictates a prompt
   (mic → speech-to-text) straight into the composer and sends it; replies can
   be spoken back. Runs in-process with **no voice daemon and no wake word**.
-  Dictation is not available on macOS yet; see [Voice](#voice-embedded-dictation--playback).
+  In-app dictation is not available on Intel macOS yet; see [Voice](#voice-embedded-dictation--playback).
 
 ## Voice (embedded dictation + playback)
 
@@ -73,22 +73,27 @@ are ready, `Ctrl+G` reports that voice is still loading. If the models are not
 provisioned the TUI just reports voice is unavailable and otherwise runs
 normally — voice is a convenience, never load-bearing.
 
-### macOS: playback only, for now
+### Intel macOS: playback only, for now
 
-macOS builds have **no embedded dictation**. The endpointer is Silero VAD, which
-needs ONNX Runtime, and ONNX Runtime publishes no prebuilt binary for
-`x86_64-apple-darwin` — an unwanted copy of it fails the whole crate, so macOS
-selects no ONNX-Runtime backend at all. `Ctrl+G` says so rather than appearing
-to do nothing, and the status line offers no dictate key. Speech input returns
-when [voice#133](https://github.com/adelie-ai/voice/issues/133) lands native
-Apple Speech adapters.
+Builds for `x86_64-apple-darwin` have **no embedded dictation**. The endpointer
+is Silero VAD, which needs ONNX Runtime, and ONNX Runtime publishes no prebuilt
+binary for that target — an unwanted copy of it fails the whole crate, `cargo
+test` included — so Intel macOS selects no ONNX-Runtime backend at all. `Ctrl+G`
+says so rather than appearing to do nothing, and the status line and help
+overlay stop offering it as in-app dictation. Speech input returns when
+[voice#133](https://github.com/adelie-ai/voice/issues/133) lands native Apple
+Speech adapters.
 
-Reply **playback** works. The available TTS backends there are `piper` (local,
-needs the `piper` binary) and `polly` (AWS, billable); `kokoro` is an ONNX
-backend and is not compiled in. Since `kokoro` is the default, a macOS TUI with
-the config above falls back to Piper and says so in the status line when the
-session comes up. Set `backend = "piper"` (and provision it with the voice
-repo's `just init-piper`) to make the choice explicit.
+**Apple Silicon is unaffected** — ONNX Runtime does ship an
+`aarch64-apple-darwin` build, so an M-series Mac keeps dictation and every
+backend. The carve-out is by architecture, not by operating system.
+
+Reply **playback** works on both. On Intel the available TTS backends are
+`piper` (local, needs the `piper` binary) and `polly` (AWS, billable); `kokoro`
+is an ONNX backend and is not compiled in there. Since `kokoro` is the default,
+an Intel macOS TUI with the config above falls back to Piper and says so in the
+status line when the session comes up. Set `backend = "piper"` (and provision it
+with the voice repo's `just init-piper`) to make the choice explicit.
 
 Dictation through a running voice *daemon* is unaffected on every platform.
 

@@ -20,8 +20,11 @@ fn resolved_packages(target: &str) -> String {
     let output = Command::new(cargo)
         .args([
             "tree",
+            // Every edge kind that reaches a compiler invocation. `normal`
+            // alone would miss an `ort` arriving as a dev- or build-dependency,
+            // which breaks `cargo test` and `cargo clippy` just as thoroughly.
             "--edges",
-            "normal",
+            "normal,build,dev",
             "--prefix",
             "none",
             "--target",
@@ -47,11 +50,23 @@ fn resolves_onnx_runtime(target: &str) -> bool {
 }
 
 #[test]
-fn a_macos_build_resolves_no_onnx_runtime() {
+fn an_intel_macos_build_resolves_no_onnx_runtime() {
     assert!(
         !resolves_onnx_runtime("x86_64-apple-darwin"),
-        "macOS must select no ONNX-Runtime voice backend; `ort` has no prebuilt binary \
-         for that target, so its arrival fails the whole crate there"
+        "Intel macOS must select no ONNX-Runtime voice backend; `ort` has no prebuilt \
+         binary for x86_64-apple-darwin, so its arrival fails the whole crate there"
+    );
+}
+
+/// Apple Silicon keeps dictation. `ort` does publish an `aarch64-apple-darwin`
+/// build, so the carve-out above is by architecture; widening it to all of
+/// macOS would take working dictation away from an M-series machine.
+#[test]
+fn an_apple_silicon_build_still_resolves_onnx_runtime() {
+    assert!(
+        resolves_onnx_runtime("aarch64-apple-darwin"),
+        "aarch64-apple-darwin has a prebuilt `ort`, so it keeps the Silero VAD and \
+         Kokoro TTS backends; losing them here means the carve-out went too wide"
     );
 }
 

@@ -88,7 +88,7 @@ skills-mcp = { path = "../skills-mcp", optional = true }
 # rather than by path-depping the adapter crates. That is what makes the macOS
 # selection below effective: a direct dep on an adapter would keep its own
 # dependencies in the graph no matter which module features are chosen.
-[target.'cfg(not(target_os = "macos"))'.dependencies.adele-voice-module]
+[target.'cfg(not(all(target_os = "macos", target_arch = "x86_64")))'.dependencies.adele-voice-module]
 path = "../voice/crates/module"
 
 # macOS selects no ONNX-Runtime backend.
@@ -108,7 +108,7 @@ path = "../voice/crates/module"
 # compiled into the module, so reply playback is unaffected on this target. A
 # `voice.toml` asking for `kokoro` gets an error naming the backend, the feature
 # that would add it, and what is available, then falls back to Piper.
-[target.'cfg(target_os = "macos")'.dependencies.adele-voice-module]
+[target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies.adele-voice-module]
 path = "../voice/crates/module"
 default-features = false
 features = ["tts-polly"]

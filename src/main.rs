@@ -2269,10 +2269,15 @@ async fn handle_action(
         },
         Action::ToggleVoiceIn => match app.toggle_current_voice_in() {
             Some(true) => {
-                app.status_message =
+                app.status_message = if voice::DICTATION_SUPPORTED {
                     "You: Enabled for this conversation (push-to-talk with Ctrl+G; narrates \
                      replies when Adele is On Demand) — Ctrl+V to disable"
-                        .into();
+                } else {
+                    "You: Enabled for this conversation (push-to-talk with Ctrl+G needs the \
+                     voice daemon in this build; narrates replies when Adele is On Demand) \
+                     — Ctrl+V to disable"
+                }
+                .into();
             }
             Some(false) => {
                 app.status_message = "You: Disabled for this conversation (type only)".into();
