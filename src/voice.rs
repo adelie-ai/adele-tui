@@ -35,15 +35,15 @@
 //! need no ONNX Runtime. Dictation returns to Intel macOS with the native
 //! Apple Speech adapters in adelie-ai/voice#133.
 
-#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+#[cfg(has_dictation)]
 use std::sync::Arc;
 
 use adele_voice_module::config::{AudioConfig, SttConfig, TtsConfig, VadConfig};
-#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+#[cfg(has_dictation)]
 use adele_voice_module::{Dictation, SileroVad, WhisperStt, build_dictation};
 use adele_voice_module::{Speaker, TtsBackend, build_speaker};
 use serde::Deserialize;
-#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+#[cfg(has_dictation)]
 use tokio::sync::Mutex;
 
 /// The speakable-sentence chunker now lives in the shared `client-voice` crate
@@ -144,25 +144,25 @@ fn config_path() -> Option<std::path::PathBuf> {
 
 /// Whether this build contains a dictation pipeline.
 ///
-/// Paired with the target-scoped `adele-voice-module` dependency in
-/// `Cargo.toml`: **Intel** macOS selects no VAD backend, because the only one
-/// available needs ONNX Runtime, and `ort` publishes no prebuilt binary for
+/// The `has_dictation` cfg comes from `build.rs`, which is where the reason
+/// lives: Intel macOS selects no VAD backend, because the only one available
+/// needs ONNX Runtime and `ort` publishes no prebuilt binary for
 /// `x86_64-apple-darwin`. It does publish one for `aarch64-apple-darwin`, so
 /// Apple Silicon keeps dictation - the carve-out is by architecture, not by
-/// operating system, because widening it to all of macOS would take dictation
-/// away from a machine where it works.
+/// operating system.
 ///
-/// The pairing is compiler-checked in **one** direction only. Claiming
-/// dictation the manifest did not grant fails to build, because
-/// `build_dictation` exists only when the module compiles both adapters. The
-/// other direction is silent: a manifest that grants a VAD while this stays
-/// false compiles clean and leaves dictation switched off. That is the shape to
-/// watch when adelie-ai/voice#133 adds the Apple adapters - closing it needs the
-/// module to publish whether it has a dictation pipeline, tracked as
-/// adelie-ai/voice#171.
+/// Nothing in this file names a platform. The question every branch here asks
+/// is whether the build has a dictation pipeline, and how that gets decided is
+/// `build.rs`'s business and the manifest's.
 ///
-/// Read this rather than naming the platform again at a call site.
-pub const DICTATION_SUPPORTED: bool = cfg!(not(all(target_os = "macos", target_arch = "x86_64")));
+/// The build script and the target-scoped dependency are paired by hand, and
+/// both directions of that pairing are checked. Claiming dictation the manifest
+/// did not grant fails to compile, on the missing `build_dictation`. Granting a
+/// VAD that `build.rs` does not know about would compile perfectly and ship with
+/// dictation switched off, so it is caught by
+/// `has_dictation_agrees_with_what_the_manifest_resolves` instead, which asks
+/// cargo what the manifest resolves for this build's own target.
+pub const DICTATION_SUPPORTED: bool = cfg!(has_dictation);
 
 /// Why a dictation key press did not start a capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,7 +290,7 @@ pub enum DictationOutcome {
 /// the mic at once. `Speaker` is cheap to clone (shared `Arc` handles), so the
 /// playback task gets its own clone.
 pub struct VoiceSession {
-    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    #[cfg(has_dictation)]
     dictation: Arc<Mutex<Dictation<SileroVad, WhisperStt>>>,
     speaker: Speaker<TtsBackend>,
 }
@@ -314,7 +314,7 @@ impl VoiceSession {
         // Adele's own TTS playback. The stored `speaker` is the one playback runs
         // through, so the guard watches the right sink.
         let speaker = build_speaker(&cfg.tts, &cfg.audio).await;
-        #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+        #[cfg(has_dictation)]
         {
             let dictation =
                 build_dictation(&cfg.audio, &cfg.vad, &cfg.stt)?.with_echo_guard(speaker.sink());
@@ -323,7 +323,7 @@ impl VoiceSession {
                 speaker,
             })
         }
-        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        #[cfg(not(has_dictation))]
         Ok(Self { speaker })
     }
 
@@ -333,7 +333,7 @@ impl VoiceSession {
     /// The returned future owns the lock for its whole duration: that both gives
     /// it the `&mut Dictation` it needs and stops a second press opening the mic
     /// while the first is still recording.
-    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    #[cfg(has_dictation)]
     pub fn capture(&self) -> Option<impl std::future::Future<Output = DictationOutcome> + use<>> {
         let handle = Arc::clone(&self.dictation);
         Some(async move {
@@ -346,7 +346,7 @@ impl VoiceSession {
         })
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    #[cfg(not(has_dictation))]
     pub fn capture(&self) -> Option<impl std::future::Future<Output = DictationOutcome> + use<>> {
         None::<std::future::Ready<DictationOutcome>>
     }
