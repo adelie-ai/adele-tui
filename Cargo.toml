@@ -93,6 +93,11 @@ path = "../voice/crates/module"
 
 # macOS selects no ONNX-Runtime backend.
 #
+# `build.rs` states this same condition, to emit the `has_dictation` cfg the
+# code branches on. Cargo allows no better: a build script runs after
+# resolution, so it cannot pick the dependency, and the manifest cannot run
+# code. Change one and change the other.
+#
 # `ort` ships no prebuilt ONNX Runtime for `x86_64-apple-darwin`, and the two
 # backends that pull it in are `vad-silero` and `tts-kokoro`. Declining both
 # keeps `ort` out of the graph entirely, so the crate builds and tests with no

@@ -10,6 +10,10 @@ Repo-specific conventions for the ratatui terminal client. The overrides and add
 
 ## Where things live
 
+- `build.rs` — emits the `has_dictation` cfg. The one place that decides whether
+  this build has an embedded dictation pipeline; `src/voice.rs` names no
+  platform. Paired by hand with the target-scoped `adele-voice-module`
+  dependency in `Cargo.toml`, which a build script cannot influence.
 - `src/main.rs` — entry, CLI parsing, transport selection.
 - `src/app.rs` — top-level event loop and state machine. New screens hook into this.
 - `src/ui.rs` — top-level layout / draw dispatch.
