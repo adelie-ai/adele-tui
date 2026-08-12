@@ -1,9 +1,16 @@
 //! Non-interactive `config` subcommand handlers (adele-tui#122).
 //!
 //! The scriptable twin of the interactive `F5` MCP-servers panel and the
-//! connection/config screens: `adele config …` loads, mutates, and saves the
-//! shared client-MCP config ([`ClientMcpConfig`], `client-mcp.toml`) without ever
+//! connection/config screens: `adele config …` reads and changes the shared
+//! client-MCP config ([`ClientMcpConfig`], `client-mcp.toml`) without ever
 //! standing up a TUI or a daemon connection, so it composes in shell scripts.
+//!
+//! **Every change goes through [`ClientMcpConfig::edit`].** The file is
+//! machine-wide, so each Adele client on the box is a writer: `edit` holds one
+//! lock across the read, the change and the write, which serializes the clients
+//! and reads the file strictly. A config that cannot be parsed therefore fails
+//! the command, and the person sees the cause, rather than being replaced by an
+//! empty one.
 //!
 //! Every handler here is **pure over an injected config path** — the caller
 //! resolves [`default_client_mcp_path`] and passes it in — and writes its
@@ -210,9 +217,6 @@ pub fn mcp_add_server(
     enabled: bool,
     out: &mut impl Write,
 ) -> Result<()> {
-    let mut cfg = ClientMcpConfig::load(path);
-    let existed = cfg.list_defined_servers().iter().any(|s| s.name == name);
-
     // The definition is always enabled at the definition level (the surface
     // enable list is the on/off switch the `enable`/`disable` subcommands drive);
     // `--enabled` decides whether it is turned on for the given surface(s) now.
@@ -235,13 +239,17 @@ pub fn mcp_add_server(
         http: None,
         description: None,
     };
-    cfg.upsert_server(server);
-    if enabled {
-        for surface in surfaces {
-            cfg.set_surface_enabled(surface, name, true);
+    let existed = ClientMcpConfig::edit(path, |cfg| {
+        let existed = cfg.list_defined_servers().iter().any(|s| s.name == name);
+        cfg.upsert_server(server);
+        if enabled {
+            for surface in surfaces {
+                cfg.set_surface_enabled(surface, name, true);
+            }
         }
-    }
-    cfg.save(path).map_err(|e| anyhow!(e))?;
+        Ok(existed)
+    })
+    .map_err(|e| anyhow!(e))?;
 
     writeln!(
         out,
@@ -262,9 +270,7 @@ pub fn mcp_add_server(
 /// `config mcp remove-server`: delete a client-MCP server definition (and prune
 /// it from every surface). Errors if no server by that name is defined.
 pub fn mcp_remove_server(path: &Path, name: &str, out: &mut impl Write) -> Result<()> {
-    let mut cfg = ClientMcpConfig::load(path);
-    cfg.remove_server(name).map_err(|e| anyhow!(e))?;
-    cfg.save(path).map_err(|e| anyhow!(e))?;
+    ClientMcpConfig::edit(path, |cfg| cfg.remove_server(name)).map_err(|e| anyhow!(e))?;
     writeln!(out, "Removed client-MCP server '{name}'.")?;
     Ok(())
 }
@@ -289,32 +295,49 @@ pub fn mcp_set_enabled(
     builtins: &[BuiltinInfo],
     out: &mut impl Write,
 ) -> Result<()> {
-    let mut cfg = ClientMcpConfig::load(path);
-    let is_defined = cfg.list_defined_servers().iter().any(|s| s.name == name);
+    // The precedence decision reads the config, so it belongs inside the locked
+    // transaction with the change it selects. The closure reports which kind of
+    // thing it toggled; the confirmation is written after the edit commits, so a
+    // refused edit prints no success line.
+    let toggled = ClientMcpConfig::edit(path, |cfg| {
+        if cfg.list_defined_servers().iter().any(|s| s.name == name) {
+            cfg.set_surface_enabled(surface, name, on);
+            Ok(Toggled::Server)
+        } else if builtins.iter().any(|b| b.name == name) {
+            // A name that matches only a built-in: record its per-surface off
+            // state. `on = false` disables (adds to `disabled_builtins`);
+            // `on = true` re-enables (removes it). Both are idempotent and
+            // per-surface.
+            cfg.set_builtin_disabled(surface, name, !on);
+            Ok(Toggled::Builtin)
+        } else {
+            Err(format!("no such client-MCP server: '{name}'"))
+        }
+    })
+    .map_err(|e| anyhow!(e))?;
 
-    if is_defined {
-        cfg.set_surface_enabled(surface, name, on);
-        cfg.save(path).map_err(|e| anyhow!(e))?;
-        writeln!(
+    match toggled {
+        Toggled::Server => writeln!(
             out,
             "{} client-MCP server '{name}' for surface '{surface}'.",
             if on { "Enabled" } else { "Disabled" }
-        )?;
-    } else if builtins.iter().any(|b| b.name == name) {
-        // A name that matches only a built-in: record its per-surface off state.
-        // `on = false` disables (adds to `disabled_builtins`); `on = true`
-        // re-enables (removes it). Both are idempotent and per-surface.
-        cfg.set_builtin_disabled(surface, name, !on);
-        cfg.save(path).map_err(|e| anyhow!(e))?;
-        writeln!(
+        )?,
+        Toggled::Builtin => writeln!(
             out,
             "{} built-in '{name}' for surface '{surface}' (applies on next launch).",
             if on { "Enabled" } else { "Disabled" }
-        )?;
-    } else {
-        bail!("no such client-MCP server: '{name}'");
+        )?,
     }
     Ok(())
+}
+
+/// What [`mcp_set_enabled`] toggled, so the caller can confirm the right thing
+/// after the edit commits.
+enum Toggled {
+    /// A defined client-MCP server's per-surface enable list.
+    Server,
+    /// A built-in's per-surface `disabled_builtins` list.
+    Builtin,
 }
 
 /// The `config set`/`config get` key for the "Share device info with the

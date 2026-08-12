@@ -1230,12 +1230,18 @@ fn do_toggle<'a>(
 }
 
 /// Toggle a built-in's per-surface off state (da#538 slice 4). Unlike a daemon
-/// server this is a client-side config write, not an RPC: load the shared
-/// client-MCP config, flip `disabled_builtins` for `SURFACE`, persist, and flip
+/// server this is a client-side config write, not an RPC: flip
+/// `disabled_builtins` for `SURFACE` in the shared client-MCP config, then flip
 /// the DTO so the row re-derives (disabled <-> active) on the next draw. The
 /// running in-process host is not restarted, so the change takes effect on the
-/// next client launch — surfaced in the confirmation note. Loading fresh (rather
-/// than trusting an in-memory copy) means a concurrent CLI edit isn't clobbered.
+/// next client launch — surfaced in the confirmation note.
+///
+/// The write goes through [`ClientMcpConfig::edit`], which holds one lock across
+/// the read, the change and the write. That is what keeps a concurrent CLI or
+/// GTK edit from being clobbered, and it reads the file strictly: a config that
+/// cannot be parsed refuses the toggle instead of being replaced by an empty
+/// one. Every refusal reaches the panel's error line, and the row keeps its old
+/// state.
 fn toggle_builtin(state: &mut State, index: usize) {
     let Some(dto) = state.builtin_dtos.get(index) else {
         return;
@@ -1243,9 +1249,10 @@ fn toggle_builtin(state: &mut State, index: usize) {
     let name = dto.name.clone();
     let new_disabled = !dto.disabled_by_config;
 
-    let mut cfg = ClientMcpConfig::load(&state.config_path);
-    cfg.set_builtin_disabled(SURFACE, &name, new_disabled);
-    match cfg.save(&state.config_path) {
+    match ClientMcpConfig::edit(&state.config_path, |cfg| {
+        cfg.set_builtin_disabled(SURFACE, &name, new_disabled);
+        Ok(())
+    }) {
         Ok(()) => {
             state.builtin_dtos[index].disabled_by_config = new_disabled;
             state.error = None;
@@ -1257,7 +1264,7 @@ fn toggle_builtin(state: &mut State, index: usize) {
         }
         Err(e) => {
             state.notice = None;
-            state.error = Some(format!("Failed to save config: {e}"));
+            state.error = Some(format!("Config unchanged: {e}"));
         }
     }
 }
@@ -2811,11 +2818,11 @@ mod tests {
         // Start disabled, then toggle back on.
         state.builtin_dtos = vec![builtin_dto("web", 3, None, true)];
         // Seed the config so the re-enable has something to remove.
-        {
-            let mut cfg = ClientMcpConfig::load(&path);
+        ClientMcpConfig::edit(&path, |cfg| {
             cfg.set_builtin_disabled("tui", "web", true);
-            cfg.save(&path).expect("seed save");
-        }
+            Ok(())
+        })
+        .expect("seed edit");
 
         toggle_builtin(&mut state, 0);
 
@@ -2859,7 +2866,10 @@ mod tests {
             !state.builtin_dtos[0].disabled_by_config,
             "a refused edit does not flip the row"
         );
-        let err = state.error.as_deref().expect("the refusal reaches the panel");
+        let err = state
+            .error
+            .as_deref()
+            .expect("the refusal reaches the panel");
         assert!(
             err.contains("client-mcp.toml"),
             "the panel error names the file: {err}"
