@@ -27,8 +27,8 @@ chat, tool calls, and background tasks.
   cost it. Ranks by token cost (the "what ate my context" reading) or by call
   count, with a bar beside every figure so a re-sort visibly re-ranks; groups
   the tools by the server that hosts them, with a subtotal per server that stays
-  visible when a group is folded away; and marks a tool whose results were
-  compacted, because its resident bytes then under-report what it cost.
+  visible when a group is folded away; and marks a tool whose results the model
+  now reads as a pointer rather than as the tool's own output.
 - **OAuth2 + PKCE** authentication flow and credentials stored in the system
   keyring (libsecret / kwallet via the OS).
 - **Knowledge base browser/editor** for the daemon's built-in KB.

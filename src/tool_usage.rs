@@ -311,6 +311,15 @@ fn row_value(row: &ToolUsageView, axis: Axis) -> u64 {
     }
 }
 
+/// "1 result" / "N results".
+fn plural_results(results: u64) -> String {
+    if results == 1 {
+        "1 result".to_string()
+    } else {
+        format!("{} results", format_count(results))
+    }
+}
+
 /// "1 call" / "N calls".
 fn plural_calls(calls: u64) -> String {
     if calls == 1 {
@@ -348,22 +357,31 @@ pub fn resolved_namespace(row: &ToolUsageView) -> Option<&str> {
     (!prefix.is_empty()).then_some(prefix)
 }
 
-/// The under-reporting note for a row, or `None` when it has none.
+/// The note for a row whose results the model now reads as a pointer, or
+/// `None` when it has none.
 ///
-/// `result_bytes` counts what is resident now. Two different things raise
-/// `evicted_results`, and they report their bytes differently: a completed
-/// step's eviction leaves the stored output alone and still counts its full
-/// bytes, while a conversation compacted by an older version overwrote the row,
-/// so those bytes are gone and cannot be recovered. A client cannot tell the
-/// two apart from this view, so the note says the figure may be low rather than
-/// asserting that it is. Peak cost is tracked in desktop-assistant#675; nothing
-/// here invents it.
+/// `evicted_results` counts two shapes that this view cannot tell apart, and
+/// they move the figures in OPPOSITE directions:
+///
+/// - A completed agentic step distilled its results into a scratchpad note.
+///   The conversation still holds every byte, so `result_bytes` counts them in
+///   full while the model reads a short pointer instead. Here the figures
+///   OVER-state what the turn costs today. This is the normal, healthy shape
+///   for long agentic work, and it is not data loss.
+/// - A conversation compacted by an older build had the row overwritten. Those
+///   bytes are unrecoverable and count zero, so the figures UNDER-state what
+///   the tool once cost.
+///
+/// So the note names the fact and neither direction, because asserting either
+/// would be a claim this view cannot support. It states no size either: peak
+/// cost is desktop-assistant#675, and nothing here estimates it. The wording
+/// matches the sibling clients so one reading does not contradict another.
 #[must_use]
 pub fn eviction_note(row: &ToolUsageView) -> Option<String> {
     (row.evicted_results > 0).then(|| {
         format!(
-            "{} evicted - cost may be under-reported",
-            row.evicted_results
+            "{} now read as a pointer",
+            plural_results(u64::from(row.evicted_results))
         )
     })
 }
@@ -951,12 +969,19 @@ fn tool_item<'a>(row: &ToolUsageView, report: &Report<'_>, bar_width: usize) -> 
     }
 
     // The eviction mark leads the second line. A narrow terminal cuts from the
-    // right, and a mark placed last is the first thing to go - leaving a
-    // resident figure on screen with nothing saying it under-reports, which is
-    // the one reading this view must never give.
+    // right, and a mark placed last is the first thing to go - leaving the
+    // resident figure to be read as what the model sees, which for a completed
+    // step it is not.
+    //
+    // It is drawn in the neutral shade, not the warning one. A rising eviction
+    // count with steady bytes is the normal shape of long agentic work, so
+    // colouring it as a warning would make routine progress read as a problem.
     let mut second = vec![Span::raw("  ")];
     if let Some(note) = eviction_note(row) {
-        second.push(Span::styled(note, Style::default().fg(theme().warn)));
+        second.push(Span::styled(
+            note,
+            Style::default().fg(theme().debug_system),
+        ));
         second.push(Span::styled(
             " \u{b7} ",
             Style::default().fg(theme().hint_sep),
@@ -1155,6 +1180,19 @@ mod tests {
             .collect()
     }
 
+    /// Render `state` off-screen and return one style per cell, for the
+    /// properties that live in colour rather than in text.
+    fn rendered_styles(state: &State, w: u16, h: u16) -> Vec<Style> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("test terminal");
+        term.draw(|f| draw(f, state)).expect("draw");
+        term.backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.style())
+            .collect()
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -1238,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_with_evicted_results_is_marked_as_under_reported() {
+    fn a_tool_with_evicted_results_gets_a_note_that_claims_neither_direction() {
         let rows = vec![ToolUsageView {
             evicted_results: 3,
             ..tool("web__fetch", 4, 1_000)
@@ -1246,9 +1284,28 @@ mod tests {
         let note = eviction_note(&rows[0]).expect("a row with evictions carries a note");
         assert!(note.contains('3'), "the note names how many: {note}");
         assert!(
-            note.contains("under-reported"),
-            "the note says the figure is low, not that it is the whole story: {note}"
+            note.contains("pointer"),
+            "the note names what the model now reads: {note}"
         );
+
+        // The count covers two shapes that move the figures in OPPOSITE
+        // directions - a completed step keeps every byte, an old compaction
+        // lost them - and this view cannot tell them apart. Claiming either
+        // direction, or a size, would be a claim the data does not support.
+        for forbidden in [
+            "under-report",
+            "over-report",
+            "higher",
+            "lower",
+            "lost",
+            "actual",
+        ] {
+            assert!(
+                !note.contains(forbidden),
+                "the note must not claim what it cannot know ({forbidden}): {note}"
+            );
+        }
+
         assert!(
             eviction_note(&tool("web__fetch", 4, 1_000)).is_none(),
             "a row with no evictions carries no note"
@@ -1256,8 +1313,26 @@ mod tests {
 
         let out = rendered(&state_with(rows), 140, 40);
         assert!(
-            out.contains("3 evicted"),
+            out.contains("3 results now read as a pointer"),
             "the mark must be visible on the row, got: {out}"
+        );
+    }
+
+    /// A rising eviction count with steady bytes is the normal shape of long
+    /// agentic work, so the mark must not be dressed as a problem.
+    #[test]
+    fn the_eviction_mark_is_not_drawn_as_a_warning() {
+        let evicted = ToolUsageView {
+            evicted_results: 3,
+            ..tool("web__fetch", 4, 1_000)
+        };
+        let warn = theme().warn;
+        let styles = rendered_styles(&state_with(vec![evicted]), 140, 40);
+        let plain = rendered_styles(&state_with(vec![tool("web__fetch", 4, 1_000)]), 140, 40);
+        assert_eq!(
+            styles.iter().filter(|s| s.fg == Some(warn)).count(),
+            plain.iter().filter(|s| s.fg == Some(warn)).count(),
+            "an evicted row must not add warning-coloured cells"
         );
     }
 
@@ -1279,9 +1354,9 @@ mod tests {
         for width in [44, 60, 80, 140] {
             let out = rendered(&state, width, 40);
             assert!(
-                out.contains("3 evicted"),
-                "at {width} columns the reader must still be told the figure \
-                 under-reports, got: {out}"
+                out.contains("3 results"),
+                "at {width} columns the reader must still be told the model \
+                 reads these as a pointer, got: {out}"
             );
         }
     }
