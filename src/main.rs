@@ -2463,6 +2463,7 @@ async fn handle_action(
                 app.status_message = "Not connected — model picker unavailable".into();
             }
         }
+        Action::OpenToolUsage => {}
         Action::OpenPersonalityPicker => {
             if client.is_none() {
                 app.status_message = "Not connected — personality picker unavailable".into();

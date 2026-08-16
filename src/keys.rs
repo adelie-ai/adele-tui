@@ -50,6 +50,10 @@ pub enum Action {
     /// local, so it opens whether or not a daemon is reachable.
     OpenSettings,
     OpenModelPicker,
+    /// Open the per-conversation tool-cost view (`F7`, #132): what each tool the
+    /// conversation called has cost it in context. Per-conversation, so it needs
+    /// an open conversation as well as a connection.
+    OpenToolUsage,
     /// Open the per-conversation personality picker (`Ctrl+R`, "peRsonality").
     /// Mirrors `OpenModelPicker`; pins/clears the Expressive-7 traits for the
     /// active conversation via `set_conversation_personality`.
@@ -424,6 +428,33 @@ mod tests {
     }
 
     // --- Normal mode tests ---
+
+    /// `F7` opens the tool-cost view (#132) from every mode, like its F-key
+    /// siblings: the question it answers ("what ate my context") comes up
+    /// mid-compose as often as it does from the list.
+    #[test]
+    fn f7_opens_the_tool_cost_view() {
+        for mode in [InputMode::Normal, InputMode::Editing] {
+            assert_eq!(
+                handle_key_event(key(KeyCode::F(7)), &mode, false),
+                Some(Action::OpenToolUsage),
+                "F7 must open the tool-cost view in {mode:?}"
+            );
+        }
+    }
+
+    /// The help overlay is the only place a key is discoverable, so a binding
+    /// that is not listed there is a binding nobody finds.
+    #[test]
+    fn the_help_overlay_lists_the_tool_cost_key() {
+        assert!(
+            help_sections()
+                .iter()
+                .flat_map(|(_, rows)| rows.iter())
+                .any(|(key, _)| *key == "F7"),
+            "F7 must appear in the help overlay"
+        );
+    }
 
     #[test]
     fn normal_q_quits() {
