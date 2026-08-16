@@ -29,6 +29,7 @@ const HINTS_NORMAL: &[(&str, &str)] = &[
     ("F4", "purposes"),
     ("Ctrl+B", "sidebar"),
     ("F6", "settings"),
+    ("F7", "tool cost"),
 ];
 
 const HINTS_EDITING: &[(&str, &str)] = &[

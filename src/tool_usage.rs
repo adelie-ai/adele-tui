@@ -17,6 +17,10 @@
 //! Token cost is the default, because "what ate my context" is the question
 //! someone opens this view to answer.
 //!
+//! Everything above the draw path is pure: [`State`] holds no transport, so the
+//! ordering, the grouping, the bar widths and the key handling are all testable
+//! without a terminal or a daemon.
+//!
 //! Keys
 //! ----
 //!
@@ -29,13 +33,22 @@
 use std::collections::BTreeSet;
 use std::io;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent};
 use desktop_assistant_api_model::{Command, CommandResult, ToolTier, ToolUsageView};
 use desktop_assistant_client_common::{SignalEvent, TransportClient};
-use ratatui::{Frame, Terminal, backend::CrosstermBackend};
+use ratatui::{
+    Frame, Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+};
 
 use crate::in_flight::InFlight;
+use crate::mcp::sanitize;
 use crate::screen::Screen;
+use crate::theme::theme;
 
 /// Heading for the tools nothing attributes to a server.
 ///
@@ -53,6 +66,26 @@ pub const UNATTRIBUTED_NOTE: &str = "no server reported";
 /// chart that reads as broken.
 pub const EMPTY_STATE: &str = "No tool calls in this conversation";
 
+/// How the daemon's MCP executor joins a server's namespace to a tool name.
+const NAMESPACE_SEPARATOR: &str = "__";
+
+/// The column a name is padded to, and the length it is cut at. A tool name and
+/// a server name are both server-declared, so one absurd value must not push
+/// the figures off the row.
+const NAME_COLUMN: usize = 32;
+
+/// Longest bar the list will draw. Past this a bar stops being easier to
+/// compare and starts crowding out the figure beside it.
+const MAX_BAR_CELLS: usize = 24;
+
+/// Partial-cell bar glyphs, one eighth to seven eighths.
+const BAR_EIGHTHS: [char; 7] = [
+    '\u{258f}', '\u{258e}', '\u{258d}', '\u{258c}', '\u{258b}', '\u{258a}', '\u{2589}',
+];
+
+/// A whole bar cell.
+const BAR_FULL: char = '\u{2588}';
+
 /// Which figure ranks the rows, the groups, and the bars.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Axis {
@@ -68,13 +101,19 @@ impl Axis {
     /// How the header names this axis.
     #[must_use]
     pub fn label(self) -> &'static str {
-        todo!("Axis::label")
+        match self {
+            Self::Tokens => "Token cost",
+            Self::Calls => "Call count",
+        }
     }
 
     /// The other axis, for the `s` key.
     #[must_use]
     pub fn toggled(self) -> Self {
-        todo!("Axis::toggled")
+        match self {
+            Self::Tokens => Self::Calls,
+            Self::Calls => Self::Tokens,
+        }
     }
 }
 
@@ -93,14 +132,24 @@ impl Group<'_> {
     /// The group's heading text.
     #[must_use]
     pub fn heading(&self) -> &str {
-        todo!("Group::heading")
+        self.namespace.unwrap_or(UNATTRIBUTED_HEADING)
     }
 
     /// The subtotal for the active axis, as the heading row shows it.
     #[must_use]
     pub fn subtotal_line(&self, axis: Axis) -> String {
-        let _ = axis;
-        todo!("Group::subtotal_line")
+        match axis {
+            Axis::Tokens => format!("{} tokens", format_count(self.total_tokens)),
+            Axis::Calls => plural_calls(self.total_calls),
+        }
+    }
+
+    /// The figure this group ranks on.
+    fn value(&self, axis: Axis) -> u64 {
+        match axis {
+            Axis::Tokens => self.total_tokens,
+            Axis::Calls => self.total_calls,
+        }
     }
 }
 
@@ -129,17 +178,17 @@ impl<'a> Report<'a> {
     /// How many distinct tools the conversation called.
     #[must_use]
     pub fn distinct_tools(&self) -> usize {
-        todo!("Report::distinct_tools")
+        self.rows.len()
     }
 
     #[must_use]
     pub fn total_calls(&self) -> u64 {
-        todo!("Report::total_calls")
+        self.rows.iter().map(|r| u64::from(r.call_count)).sum()
     }
 
     #[must_use]
     pub fn total_tokens(&self) -> u64 {
-        todo!("Report::total_tokens")
+        self.rows.iter().map(|r| r.result_tokens).sum()
     }
 
     /// Every row, heaviest first on the active axis.
@@ -148,13 +197,41 @@ impl<'a> Report<'a> {
     /// every time the view is opened.
     #[must_use]
     pub fn ranked(&self) -> Vec<&'a ToolUsageView> {
-        todo!("Report::ranked")
+        let mut ranked: Vec<&'a ToolUsageView> = self.rows.iter().collect();
+        ranked.sort_by(|a, b| {
+            row_value(b, self.axis)
+                .cmp(&row_value(a, self.axis))
+                .then_with(|| a.tool_name.cmp(&b.tool_name))
+        });
+        ranked
     }
 
     /// The rows grouped by server, groups and rows both heaviest first.
     #[must_use]
     pub fn groups(&self) -> Vec<Group<'a>> {
-        todo!("Report::groups")
+        let mut groups: Vec<Group<'a>> = Vec::new();
+        for row in self.ranked() {
+            let namespace = resolved_namespace(row);
+            match groups.iter_mut().find(|g| g.namespace == namespace) {
+                Some(group) => {
+                    group.total_calls += u64::from(row.call_count);
+                    group.total_tokens += row.result_tokens;
+                    group.rows.push(row);
+                }
+                None => groups.push(Group {
+                    namespace,
+                    rows: vec![row],
+                    total_calls: u64::from(row.call_count),
+                    total_tokens: row.result_tokens,
+                }),
+            }
+        }
+        groups.sort_by(|a, b| {
+            b.value(self.axis)
+                .cmp(&a.value(self.axis))
+                .then_with(|| a.heading().cmp(b.heading()))
+        });
+        groups
     }
 
     /// How long a row's bar is, as a fraction of the heaviest row on the active
@@ -165,14 +242,48 @@ impl<'a> Report<'a> {
     /// one where they returned everything.
     #[must_use]
     pub fn fraction(&self, row: &ToolUsageView) -> f64 {
-        let _ = row;
-        todo!("Report::fraction")
+        let peak = self
+            .rows
+            .iter()
+            .map(|r| row_value(r, self.axis))
+            .max()
+            .unwrap_or(0);
+        if peak == 0 {
+            return 0.0;
+        }
+        row_value(row, self.axis) as f64 / peak as f64
     }
 
     /// The header totals: distinct tools, total calls, total tokens.
     #[must_use]
     pub fn totals_line(&self) -> String {
-        todo!("Report::totals_line")
+        let tools = if self.distinct_tools() == 1 {
+            "1 tool".to_string()
+        } else {
+            format!("{} tools", format_count(self.distinct_tools() as u64))
+        };
+        format!(
+            "{tools} \u{b7} {} \u{b7} {} tokens",
+            plural_calls(self.total_calls()),
+            format_count(self.total_tokens())
+        )
+    }
+}
+
+/// The figure a row ranks on.
+fn row_value(row: &ToolUsageView, axis: Axis) -> u64 {
+    match axis {
+        Axis::Tokens => row.result_tokens,
+        Axis::Calls => u64::from(row.call_count),
+    }
+}
+
+/// "1 call" / "N calls".
+fn plural_calls(calls: u64) -> String {
+    if calls == 1 {
+        "1 call".to_string()
+    } else {
+        format!("{} calls", format_count(calls))
     }
 }
 
@@ -188,8 +299,13 @@ impl<'a> Report<'a> {
 /// `None`: an empty group heading is worse than an honest unattributed one.
 #[must_use]
 pub fn resolved_namespace(row: &ToolUsageView) -> Option<&str> {
-    let _ = row;
-    todo!("resolved_namespace")
+    if let Some(namespace) = row.namespace.as_deref()
+        && !namespace.is_empty()
+    {
+        return Some(namespace);
+    }
+    let (prefix, _) = row.tool_name.split_once(NAMESPACE_SEPARATOR)?;
+    (!prefix.is_empty()).then_some(prefix)
 }
 
 /// The under-reporting note for a row, or `None` when it has none.
@@ -204,8 +320,12 @@ pub fn resolved_namespace(row: &ToolUsageView) -> Option<&str> {
 /// here invents it.
 #[must_use]
 pub fn eviction_note(row: &ToolUsageView) -> Option<String> {
-    let _ = row;
-    todo!("eviction_note")
+    (row.evicted_results > 0).then(|| {
+        format!(
+            "{} evicted - cost may be under-reported",
+            row.evicted_results
+        )
+    })
 }
 
 /// A `width`-cell bar for `fraction` of the widest row.
@@ -216,33 +336,70 @@ pub fn eviction_note(row: &ToolUsageView) -> Option<String> {
 /// exactly zero draws nothing.
 #[must_use]
 pub fn bar_cells(fraction: f64, width: usize) -> String {
-    let _ = (fraction, width);
-    todo!("bar_cells")
+    if width == 0 || fraction.is_nan() || fraction <= 0.0 {
+        return String::new();
+    }
+    let capacity = width * 8;
+    let eighths = (fraction.min(1.0) * capacity as f64).round() as usize;
+    let eighths = eighths.clamp(1, capacity);
+    let mut bar = String::with_capacity(width);
+    for _ in 0..eighths / 8 {
+        bar.push(BAR_FULL);
+    }
+    if !eighths.is_multiple_of(8) {
+        bar.push(BAR_EIGHTHS[eighths % 8 - 1]);
+    }
+    bar
 }
 
 /// A count with thousands separators, so a six-figure token figure can be read
 /// at a glance.
 #[must_use]
 pub fn format_count(value: u64) -> String {
-    let _ = value;
-    todo!("format_count")
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 /// A byte count in binary units.
 #[must_use]
 pub fn format_bytes(value: u64) -> String {
-    let _ = value;
-    todo!("format_bytes")
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes = value as f64;
+    if bytes < KIB {
+        format!("{value} B")
+    } else if bytes < MIB {
+        format!("{:.1} KiB", bytes / KIB)
+    } else if bytes < GIB {
+        format!("{:.1} MiB", bytes / MIB)
+    } else {
+        format!("{:.1} GiB", bytes / GIB)
+    }
 }
 
 /// The short chip label for a provenance tier.
 ///
 /// The wire strings ("network_egress", "code_execution") are too long for a row
-/// chip, so the chip carries a word and the gate flag carries the meaning.
+/// chip, so the chip carries a word and [`ToolTier::is_gated`] carries the
+/// meaning: whether a turn that has read outside content will refuse this tool.
 #[must_use]
 pub fn tier_label(tier: ToolTier) -> &'static str {
-    let _ = tier;
-    todo!("tier_label")
+    match tier {
+        ToolTier::Read => "read",
+        ToolTier::Present => "present",
+        ToolTier::Mutate => "mutate",
+        ToolTier::Egress => "network",
+        ToolTier::Execution => "execute",
+        ToolTier::Unclassified => "unclassified",
+    }
 }
 
 /// One drawn line of the list: a server heading, or a tool under it.
@@ -277,7 +434,6 @@ pub struct State {
     /// open. The unattributed group keys on the empty string, which
     /// [`resolved_namespace`] never returns, so it cannot collide with a real
     /// server.
-    #[expect(dead_code)]
     collapsed: BTreeSet<String>,
 }
 
@@ -310,23 +466,102 @@ impl State {
     /// Whether `namespace`'s group is folded away.
     #[must_use]
     pub fn is_collapsed(&self, namespace: Option<&str>) -> bool {
-        let _ = namespace;
-        todo!("State::is_collapsed")
+        self.collapsed.contains(fold_key(namespace))
     }
 
     /// The drawn list: a heading per server, then that server's tools unless it
     /// is folded away.
     #[must_use]
     pub fn entries(&self) -> Vec<Entry<'_>> {
-        todo!("State::entries")
+        let mut entries = Vec::new();
+        for group in self.report().groups() {
+            let collapsed = self.is_collapsed(group.namespace);
+            let rows = if collapsed {
+                Vec::new()
+            } else {
+                group.rows.clone()
+            };
+            entries.push(Entry::Group { group, collapsed });
+            entries.extend(rows.into_iter().map(Entry::Tool));
+        }
+        entries
     }
 
     /// Handle one key press. Pure: it mutates this state and reports what the
     /// caller must do off-loop.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Effect> {
-        let _ = key;
-        todo!("State::handle_key")
+        if !key.modifiers.is_empty() {
+            return None;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.closing = true,
+            KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
+            KeyCode::Char('s') => {
+                self.axis = self.axis.toggled();
+                // A new order is a new list, and the old index pointed into the
+                // old one; start the reading at the top of the new ranking.
+                self.selected = 0;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => self.toggle_fold(),
+            KeyCode::Char('r') => return Some(Effect::Refresh),
+            _ => {}
+        }
+        None
     }
+
+    fn move_selection(&mut self, delta: isize) {
+        let len = self.entries().len();
+        if len == 0 {
+            self.selected = 0;
+            return;
+        }
+        let last = len as isize - 1;
+        self.selected = (self.selected as isize + delta).clamp(0, last) as usize;
+    }
+
+    /// Fold or unfold the group the selection sits in.
+    ///
+    /// A heading folds itself. A tool row folds the group it belongs to, and
+    /// the selection moves up to the heading that is left standing - otherwise
+    /// it would point at a row that is no longer drawn.
+    fn toggle_fold(&mut self) {
+        let Some((namespace, heading_index)) = self.selected_group() else {
+            return;
+        };
+        let key = namespace.unwrap_or_default();
+        if !self.collapsed.remove(&key) {
+            self.collapsed.insert(key);
+        }
+        self.selected = heading_index;
+        let len = self.entries().len();
+        self.selected = self.selected.min(len.saturating_sub(1));
+    }
+
+    /// The namespace of the group the selection sits in, and the index of that
+    /// group's heading. `None` when the list is empty.
+    fn selected_group(&self) -> Option<(Option<String>, usize)> {
+        let entries = self.entries();
+        let index = match entries.get(self.selected)? {
+            Entry::Group { .. } => self.selected,
+            // A tool is always drawn under its own heading, so the nearest
+            // heading above the selection is the group it belongs to.
+            Entry::Tool(_) => entries[..self.selected]
+                .iter()
+                .rposition(|entry| matches!(entry, Entry::Group { .. }))?,
+        };
+        match &entries[index] {
+            Entry::Group { group, .. } => Some((group.namespace.map(str::to_string), index)),
+            Entry::Tool(_) => None,
+        }
+    }
+}
+
+/// The set key for a group. The unattributed group keys on the empty string,
+/// which [`resolved_namespace`] never returns, so no real server collides
+/// with it.
+fn fold_key(namespace: Option<&str>) -> &str {
+    namespace.unwrap_or("")
 }
 
 /// The tool-cost view as a [`Screen`]: its [`State`] plus the borrowed client.
@@ -439,8 +674,305 @@ async fn load(
 // --- draw --------------------------------------------------------------------
 
 fn draw(f: &mut Frame, state: &State) {
-    let _ = (f, state);
-    todo!("draw")
+    let area = f.area();
+    f.render_widget(Clear, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(5),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    draw_header(f, state, chunks[0]);
+    draw_body(f, state, chunks[1]);
+    draw_status(f, state, chunks[2]);
+    draw_hints(f, chunks[3]);
+}
+
+fn draw_header(f: &mut Frame, state: &State, area: Rect) {
+    let report = state.report();
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "Tool cost",
+            Style::default()
+                .fg(theme().title)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("   ranked by ", Style::default().fg(theme().text_dim)),
+        Span::styled(
+            state.axis.label(),
+            Style::default()
+                .fg(theme().pinned)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  (s switches)", Style::default().fg(theme().text_dim)),
+    ])];
+    // The totals belong to a report that has rows. On an empty conversation
+    // three zeroes read as a measurement; the empty state says it plainly.
+    if !report.is_empty() {
+        lines.push(Line::from(Span::styled(
+            report.totals_line(),
+            Style::default().fg(theme().text_dim),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_body(f: &mut Frame, state: &State, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme().border));
+
+    if let Some(error) = &state.error {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "Could not read tool cost",
+                    Style::default()
+                        .fg(theme().error_text)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    sanitize(error),
+                    Style::default().fg(theme().error_text),
+                )),
+            ])
+            .block(block),
+            area,
+        );
+        return;
+    }
+
+    let report = state.report();
+    if report.is_empty() {
+        // A read still in flight has nothing to say yet, and saying "no tool
+        // calls" before the answer arrives would be a claim, not a reading.
+        let message = if state.busy.is_some() {
+            vec![Line::from(Span::styled(
+                "Reading tool cost...",
+                Style::default().fg(theme().text_dim),
+            ))]
+        } else {
+            vec![
+                Line::from(Span::styled(
+                    EMPTY_STATE,
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    "Tools this conversation ran, and what they cost, appear here.",
+                    Style::default().fg(theme().text_dim),
+                )),
+            ]
+        };
+        f.render_widget(Paragraph::new(message).block(block), area);
+        return;
+    }
+
+    let bar_width = bar_width_for(area.width);
+    let items: Vec<ListItem> = state
+        .entries()
+        .iter()
+        .map(|entry| match entry {
+            Entry::Group { group, collapsed } => group_item(group, *collapsed, state.axis),
+            Entry::Tool(row) => tool_item(row, &report, bar_width),
+        })
+        .collect();
+
+    let list = List::new(items).block(block).highlight_style(
+        Style::default()
+            .bg(theme().list_highlight)
+            .fg(theme().list_highlight_fg),
+    );
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.selected));
+    f.render_stateful_widget(list, area, &mut list_state);
+}
+
+/// How wide the bars are for a list of this width. A third of the row, capped,
+/// so the figure beside the bar always has room.
+fn bar_width_for(area_width: u16) -> usize {
+    let inner = usize::from(area_width).saturating_sub(4);
+    (inner / 3).min(MAX_BAR_CELLS)
+}
+
+/// A server heading: the fold marker, the server, and its subtotal on the
+/// active axis. The subtotal shows whether the group is open or folded, so
+/// folding a server away never hides what it cost.
+fn group_item<'a>(group: &Group<'_>, collapsed: bool, axis: Axis) -> ListItem<'a> {
+    let marker = if collapsed { "\u{25b8} " } else { "\u{25be} " };
+    let heading = drawn_heading(group);
+    let mut spans = vec![
+        Span::styled(marker, Style::default().fg(theme().hint_sep)),
+        Span::styled(
+            format!("{heading:<NAME_COLUMN$}"),
+            Style::default()
+                .fg(theme().title)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            group.subtotal_line(axis),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if group.namespace.is_none() {
+        spans.push(Span::styled(
+            format!("  ({UNATTRIBUTED_NOTE})"),
+            Style::default().fg(theme().text_dim),
+        ));
+    }
+    ListItem::new(Line::from(spans))
+}
+
+/// One tool: its figures on the first line, its bar and what the figures do not
+/// say on the second.
+fn tool_item<'a>(row: &ToolUsageView, report: &Report<'_>, bar_width: usize) -> ListItem<'a> {
+    let name = drawn_name(row);
+    let active = report.axis();
+    // Both figures on every row, whichever ranks: the axis that is not sorted
+    // is the one that explains the other.
+    let mut first = vec![
+        Span::raw("  "),
+        Span::styled(format!("{name:<NAME_COLUMN$}"), Style::default()),
+        Span::styled(
+            format!("{} tokens", format_count(row.result_tokens)),
+            axis_style(active == Axis::Tokens),
+        ),
+        Span::styled(" \u{b7} ", Style::default().fg(theme().hint_sep)),
+        Span::styled(
+            plural_calls(u64::from(row.call_count)),
+            axis_style(active == Axis::Calls),
+        ),
+    ];
+    if let Some(tier) = row.tool_tier {
+        first.push(Span::styled(
+            format!("  [{}]", tier_label(tier)),
+            Style::default().fg(if tier.is_gated() {
+                theme().warn
+            } else {
+                theme().text_dim
+            }),
+        ));
+    }
+
+    let bar = bar_cells(report.fraction(row), bar_width);
+    let mut second = vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("{bar:<bar_width$}"),
+            Style::default().fg(theme().assistant_indicator),
+        ),
+        Span::styled(
+            format!(
+                "  largest {} \u{b7} resident {}",
+                format_bytes(row.max_result_bytes),
+                format_bytes(row.result_bytes)
+            ),
+            Style::default().fg(theme().text_dim),
+        ),
+    ];
+    if let Some(note) = eviction_note(row) {
+        second.push(Span::styled(
+            format!(" \u{b7} {note}"),
+            Style::default().fg(theme().warn),
+        ));
+    }
+
+    ListItem::new(vec![Line::from(first), Line::from(second)])
+}
+
+/// The ranked figure reads bright; the other one stays dim but present.
+fn axis_style(is_active: bool) -> Style {
+    if is_active {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme().text_dim)
+    }
+}
+
+/// The tool's name as its group shows it. The server prefix is already the
+/// heading above, so repeating it on every row buys nothing and costs the
+/// column the name needs.
+fn display_name(row: &ToolUsageView) -> &str {
+    match resolved_namespace(row) {
+        Some(namespace) => row
+            .tool_name
+            .strip_prefix(&format!("{namespace}{NAMESPACE_SEPARATOR}"))
+            .unwrap_or(&row.tool_name),
+        None => &row.tool_name,
+    }
+}
+
+/// The name a tool row is drawn under: the server prefix dropped (the heading
+/// above already carries it), control characters replaced, and the result cut
+/// to the name column.
+///
+/// A tool name and a server name both come from the server that declared them,
+/// so `ESC` and its friends must not reach the terminal. Every drawn name goes
+/// through here, so there is one place to check rather than one per call site.
+fn drawn_name(row: &ToolUsageView) -> String {
+    clamp_name(&sanitize(display_name(row)))
+}
+
+/// The heading a group is drawn under, given the same treatment as a row name.
+fn drawn_heading(group: &Group<'_>) -> String {
+    clamp_name(&sanitize(group.heading()))
+}
+
+/// Cut a server-declared name to the column it is drawn in.
+fn clamp_name(name: &str) -> String {
+    if name.chars().count() <= NAME_COLUMN {
+        return name.to_string();
+    }
+    let kept: String = name.chars().take(NAME_COLUMN.saturating_sub(3)).collect();
+    format!("{kept}...")
+}
+
+fn draw_status(f: &mut Frame, state: &State, area: Rect) {
+    let Some(busy) = &state.busy else {
+        return;
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            busy.clone(),
+            Style::default().fg(theme().debug_system),
+        )),
+        area,
+    );
+}
+
+fn draw_hints(f: &mut Frame, area: Rect) {
+    let hints = [
+        ("j/k", "move"),
+        ("s", "sort"),
+        ("Enter", "fold"),
+        ("r", "reread"),
+        ("Esc", "close"),
+    ];
+    let mut spans = Vec::with_capacity(hints.len() * 4);
+    for (index, (key, description)) in hints.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(
+                "  \u{b7}  ",
+                Style::default().fg(theme().hint_sep),
+            ));
+        }
+        spans.push(Span::styled(
+            *key,
+            Style::default()
+                .fg(theme().hint_key)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            *description,
+            Style::default().fg(theme().text_dim),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 #[cfg(test)]
@@ -801,13 +1333,42 @@ mod tests {
         );
     }
 
+    /// A tool name and a server name are declared by the server, so a hostile
+    /// one must not carry `ESC` onto the draw path.
+    ///
+    /// The assertion is against the strings this module builds, not against the
+    /// rendered buffer: ratatui drops zero-width graphemes on its way into the
+    /// buffer, so a buffer check passes whether or not anything here sanitizes,
+    /// and would hold a property this code does not enforce.
     #[test]
-    fn a_hostile_tool_name_cannot_inject_terminal_control_sequences() {
+    fn a_hostile_tool_name_is_sanitized_before_it_reaches_the_draw_path() {
         let rows = vec![tool("evil\u{1b}[2Jbox__wipe\u{1b}c", 1, 10)];
-        let out = rendered(&state_with(rows), 140, 40);
+        let report = Report::new(&rows, Axis::Tokens);
+        let groups = report.groups();
+
+        let heading = drawn_heading(&groups[0]);
         assert!(
-            !out.contains('\u{1b}'),
-            "a server-declared name reaches the terminal sanitized"
+            !heading.chars().any(char::is_control),
+            "a server name reaches the draw path sanitized, got {heading:?}"
+        );
+        let name = drawn_name(&rows[0]);
+        assert!(
+            !name.chars().any(char::is_control),
+            "a tool name reaches the draw path sanitized, got {name:?}"
+        );
+        assert!(
+            !rendered(&state_with(rows), 140, 40).contains('\u{1b}'),
+            "and nothing puts it back on the way to the terminal"
+        );
+    }
+
+    #[test]
+    fn an_over_long_name_is_cut_to_the_column_it_is_drawn_in() {
+        let long = "x".repeat(200);
+        let row = tool(&long, 1, 1);
+        assert!(
+            drawn_name(&row).chars().count() <= NAME_COLUMN,
+            "one absurd name must not push the figures off the row"
         );
     }
 

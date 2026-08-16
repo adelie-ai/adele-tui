@@ -170,6 +170,12 @@ pub fn handle_key_event(
     if key.code == KeyCode::F(6) && key.modifiers.is_empty() {
         return Some(Action::OpenSettings);
     }
+    // F7 opens the per-conversation tool-cost view (#132). An F-key rather than
+    // a Ctrl chord, matching its siblings: the letter space is crowded and this
+    // is a screen you open, not an action you fire.
+    if key.code == KeyCode::F(7) && key.modifiers.is_empty() {
+        return Some(Action::OpenToolUsage);
+    }
     // F1 toggles the keymap help overlay from any mode (`?` also opens it in
     // Normal mode; F1 is offered too since `?` is a literal character in the
     // composer).
@@ -379,6 +385,7 @@ pub fn help_sections() -> &'static [(&'static str, &'static [(&'static str, &'st
                 ("F4", "purposes"),
                 ("F5", "MCP servers"),
                 ("F6", "settings"),
+                ("F7", "tool cost"),
                 ("Ctrl+K", "knowledge base"),
                 ("Ctrl+M", "model picker"),
                 ("Ctrl+R", "personality"),
