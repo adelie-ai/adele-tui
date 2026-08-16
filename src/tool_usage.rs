@@ -56,7 +56,11 @@ use crate::theme::theme;
 /// where such a tool came from, so the heading says exactly that. Inventing a
 /// server called "unknown" would name something that does not exist, and a
 /// reader would go looking for it.
-pub const UNATTRIBUTED_HEADING: &str = "Unattributed";
+///
+/// The parentheses are load-bearing: a server name is a config table key, drawn
+/// from letters, digits, `-` and `_`, so no server can declare a name that
+/// renders as this heading and pass itself off as the absence of one.
+pub const UNATTRIBUTED_HEADING: &str = "(unattributed)";
 
 /// The dim note beside [`UNATTRIBUTED_HEADING`], so the group reads as an
 /// absence of information rather than as a server.
@@ -66,13 +70,34 @@ pub const UNATTRIBUTED_NOTE: &str = "no server reported";
 /// chart that reads as broken.
 pub const EMPTY_STATE: &str = "No tool calls in this conversation";
 
+/// What a read still in flight says.
+pub const READING: &str = "Reading tool cost...";
+
 /// How the daemon's MCP executor joins a server's namespace to a tool name.
 const NAMESPACE_SEPARATOR: &str = "__";
 
-/// The column a name is padded to, and the length it is cut at. A tool name and
-/// a server name are both server-declared, so one absurd value must not push
-/// the figures off the row.
+/// The column a name is padded to, and the width it is cut at, in terminal
+/// cells. A tool name and a server name are both server-declared, so one absurd
+/// value must not push the figures off the row.
 const NAME_COLUMN: usize = 32;
+
+/// What ends a name the column had to cut.
+const TRUNCATION_MARKER: &str = "...";
+
+/// Cells the figures beside a bar need. The bar gives up its width to them
+/// first, because a figure can be reasoned about without a bar and a bar cannot
+/// be reasoned about without a figure.
+const FIGURES_COLUMN: usize = 34;
+
+/// Longest server-declared name kept from the wire.
+///
+/// A tool name and a namespace are declared by a third-party MCP server and
+/// nothing on the wire bounds them. This view sorts on those strings and
+/// rebuilds every row on every draw and every key press, so one absurd name
+/// would cost that work on every frame. Cutting once at ingest bounds all of
+/// it. The cap is far above any real tool name, so nothing legitimate is
+/// touched.
+const MAX_STORED_NAME_CHARS: usize = 128;
 
 /// Longest bar the list will draw. Past this a bar stops being easier to
 /// compare and starts crowding out the figure beside it.
@@ -135,12 +160,20 @@ impl Group<'_> {
         self.namespace.unwrap_or(UNATTRIBUTED_HEADING)
     }
 
-    /// The subtotal for the active axis, as the heading row shows it.
+    /// The heading's subtotals, the ranked figure first.
+    ///
+    /// Both figures, for the same reason a tool row carries both: the axis that
+    /// is not ranking is the one that explains the other. It matters more on a
+    /// heading, because a folded group's rows are gone from the screen, so a
+    /// heading carrying one figure would hide what that server cost on the
+    /// other.
     #[must_use]
     pub fn subtotal_line(&self, axis: Axis) -> String {
+        let tokens = format!("{} tokens", format_count(self.total_tokens));
+        let calls = plural_calls(self.total_calls);
         match axis {
-            Axis::Tokens => format!("{} tokens", format_count(self.total_tokens)),
-            Axis::Calls => plural_calls(self.total_calls),
+            Axis::Tokens => format!("{tokens} \u{b7} {calls}"),
+            Axis::Calls => format!("{calls} \u{b7} {tokens}"),
         }
     }
 
@@ -295,6 +328,13 @@ fn plural_calls(calls: u64) -> String {
 /// `"<namespace>__<tool>"`. So this reads the daemon's own encoding rather than
 /// guessing, and it retires itself the day the field arrives.
 ///
+/// The tool is split off the END of the name, matching how the daemon reads the
+/// same encoding (`rsplit_once` in its own tool-provenance classifier). A server
+/// name may itself contain the separator - `home__assistant` is a legal config
+/// key - and splitting at the first separator would file its tools under a
+/// server called `home` that does not exist, and would merge its subtotals with
+/// every other `home__*` server.
+///
 /// A name with no separator, or one that begins with the separator, resolves to
 /// `None`: an empty group heading is worse than an honest unattributed one.
 #[must_use]
@@ -304,7 +344,7 @@ pub fn resolved_namespace(row: &ToolUsageView) -> Option<&str> {
     {
         return Some(namespace);
     }
-    let (prefix, _) = row.tool_name.split_once(NAMESPACE_SEPARATOR)?;
+    let (prefix, _) = row.tool_name.rsplit_once(NAMESPACE_SEPARATOR)?;
     (!prefix.is_empty()).then_some(prefix)
 }
 
@@ -368,21 +408,25 @@ pub fn format_count(value: u64) -> String {
 }
 
 /// A byte count in binary units.
+///
+/// The unit is chosen AFTER the value is rounded to its printed precision.
+/// Choosing it first prints figures in the wrong unit at the boundary: 1048575
+/// bytes is 1023.99 KiB, which rounds to "1024.0 KiB" - a number that should
+/// have been carried into the next unit.
 #[must_use]
 pub fn format_bytes(value: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    const GIB: f64 = MIB * 1024.0;
-    let bytes = value as f64;
-    if bytes < KIB {
-        format!("{value} B")
-    } else if bytes < MIB {
-        format!("{:.1} KiB", bytes / KIB)
-    } else if bytes < GIB {
-        format!("{:.1} MiB", bytes / MIB)
-    } else {
-        format!("{:.1} GiB", bytes / GIB)
+    const STEP: f64 = 1024.0;
+    const UNITS: [&str; 3] = ["KiB", "MiB", "GiB"];
+    if value < STEP as u64 {
+        return format!("{value} B");
     }
+    let mut scaled = value as f64 / STEP;
+    let mut unit = 0;
+    while unit + 1 < UNITS.len() && (scaled * 10.0).round() / 10.0 >= STEP {
+        scaled /= STEP;
+        unit += 1;
+    }
+    format!("{scaled:.1} {}", UNITS[unit])
 }
 
 /// The short chip label for a provenance tier.
@@ -487,6 +531,23 @@ impl State {
         entries
     }
 
+    /// Mark a read as in flight. Clears the previous failure, so a re-read
+    /// never shows a stale error beside a live request.
+    pub fn begin_read(&mut self) {
+        self.busy = Some(READING.into());
+        self.error = None;
+    }
+
+    /// Install a fresh answer from the daemon.
+    ///
+    /// Server-declared names are cut here rather than on the draw path, so the
+    /// bound holds for the sort and the row rebuild as well as for the render.
+    pub fn install_rows(&mut self, rows: Vec<ToolUsageView>) {
+        self.rows = rows.into_iter().map(bound_names).collect();
+        self.error = None;
+        self.selected = 0;
+    }
+
     /// Handle one key press. Pure: it mutates this state and reports what the
     /// caller must do off-loop.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Effect> {
@@ -529,7 +590,7 @@ impl State {
         let Some((namespace, heading_index)) = self.selected_group() else {
             return;
         };
-        let key = namespace.unwrap_or_default();
+        let key = fold_key(namespace.as_deref()).to_string();
         if !self.collapsed.remove(&key) {
             self.collapsed.insert(key);
         }
@@ -555,6 +616,15 @@ impl State {
             Entry::Tool(_) => None,
         }
     }
+}
+
+/// Cut a row's server-declared names to [`MAX_STORED_NAME_CHARS`].
+fn bound_names(mut row: ToolUsageView) -> ToolUsageView {
+    row.tool_name = row.tool_name.chars().take(MAX_STORED_NAME_CHARS).collect();
+    row.namespace = row
+        .namespace
+        .map(|n| n.chars().take(MAX_STORED_NAME_CHARS).collect());
+    row
 }
 
 /// The set key for a group. The unattributed group keys on the empty string,
@@ -605,11 +675,7 @@ impl Screen for ToolUsageScreen<'_> {
         if let Some(outcome) = self.pending.next().await {
             self.state.busy = None;
             match outcome {
-                Ok(rows) => {
-                    self.state.rows = rows;
-                    self.state.error = None;
-                    self.state.selected = 0;
-                }
+                Ok(rows) => self.state.install_rows(rows),
                 // An empty answer means "no tool calls" and draws the empty
                 // state; this arm is a real failure to ask, so it must not read
                 // as a quiet zero.
@@ -646,7 +712,7 @@ fn refresh<'a>(
     client: &'a TransportClient,
     conversation_id: &str,
 ) {
-    state.busy = Some("Reading tool cost...".into());
+    state.begin_read();
     let id = conversation_id.to_string();
     pending.push(async move { load(client, id).await });
 }
@@ -753,7 +819,7 @@ fn draw_body(f: &mut Frame, state: &State, area: Rect) {
         // calls" before the answer arrives would be a claim, not a reading.
         let message = if state.busy.is_some() {
             vec![Line::from(Span::styled(
-                "Reading tool cost...",
+                READING,
                 Style::default().fg(theme().text_dim),
             ))]
         } else {
@@ -777,7 +843,9 @@ fn draw_body(f: &mut Frame, state: &State, area: Rect) {
         .entries()
         .iter()
         .map(|entry| match entry {
-            Entry::Group { group, collapsed } => group_item(group, *collapsed, state.axis),
+            Entry::Group { group, collapsed } => {
+                group_item(group, *collapsed, state.axis, bar_width)
+            }
             Entry::Tool(row) => tool_item(row, &report, bar_width),
         })
         .collect();
@@ -792,23 +860,37 @@ fn draw_body(f: &mut Frame, state: &State, area: Rect) {
     f.render_stateful_widget(list, area, &mut list_state);
 }
 
-/// How wide the bars are for a list of this width. A third of the row, capped,
-/// so the figure beside the bar always has room.
+/// How wide the bars are for a list of this width.
+///
+/// The name column and the figures are paid first, and the bar takes what is
+/// left up to [`MAX_BAR_CELLS`]. On a terminal too narrow to hold all three the
+/// bar shrinks to nothing and the figures still fit: a figure can be reasoned
+/// about with no bar, and a bar cannot be reasoned about with no figure.
 fn bar_width_for(area_width: u16) -> usize {
-    let inner = usize::from(area_width).saturating_sub(4);
-    (inner / 3).min(MAX_BAR_CELLS)
+    usize::from(area_width)
+        // borders, the two-cell indent, the gap after the name column, and the
+        // two gaps around the bar
+        .saturating_sub(4 + 2 + NAME_COLUMN + 1 + 2 + FIGURES_COLUMN)
+        .min(MAX_BAR_CELLS)
 }
 
-/// A server heading: the fold marker, the server, and its subtotal on the
-/// active axis. The subtotal shows whether the group is open or folded, so
-/// folding a server away never hides what it cost.
-fn group_item<'a>(group: &Group<'_>, collapsed: bool, axis: Axis) -> ListItem<'a> {
+/// A server heading: the fold marker, the server, and its subtotals.
+///
+/// The subtotals stay whether the group is open or folded, so folding a server
+/// away never hides what it cost. They start in the same column as the tool
+/// rows' figures, so a heading and its rows read down one column.
+fn group_item<'a>(
+    group: &Group<'_>,
+    collapsed: bool,
+    axis: Axis,
+    bar_width: usize,
+) -> ListItem<'a> {
     let marker = if collapsed { "\u{25b8} " } else { "\u{25be} " };
     let heading = drawn_heading(group);
     let mut spans = vec![
         Span::styled(marker, Style::default().fg(theme().hint_sep)),
         Span::styled(
-            format!("{heading:<NAME_COLUMN$}"),
+            pad_to_width(&heading, NAME_COLUMN + 1 + bar_width + 2),
             Style::default()
                 .fg(theme().title)
                 .add_modifier(Modifier::BOLD),
@@ -827,25 +909,35 @@ fn group_item<'a>(group: &Group<'_>, collapsed: bool, axis: Axis) -> ListItem<'a
     ListItem::new(Line::from(spans))
 }
 
-/// One tool: its figures on the first line, its bar and what the figures do not
-/// say on the second.
+/// One tool: its name, its bar, and its figures on the first line; what the
+/// figures do not say on the second.
 fn tool_item<'a>(row: &ToolUsageView, report: &Report<'_>, bar_width: usize) -> ListItem<'a> {
     let name = drawn_name(row);
     let active = report.axis();
-    // Both figures on every row, whichever ranks: the axis that is not sorted
-    // is the one that explains the other.
+    let tokens = format!("{} tokens", format_count(row.result_tokens));
+    let calls = plural_calls(u64::from(row.call_count));
+    // The bar encodes the ranked figure, so the ranked figure is what sits
+    // beside it. A bar drawn next to some OTHER number reads as a claim about
+    // that number, and the two then look anti-correlated at a glance.
+    let (ranked, other) = match active {
+        Axis::Tokens => (tokens, calls),
+        Axis::Calls => (calls, tokens),
+    };
+    let bar = bar_cells(report.fraction(row), bar_width);
     let mut first = vec![
         Span::raw("  "),
-        Span::styled(format!("{name:<NAME_COLUMN$}"), Style::default()),
+        Span::styled(pad_to_width(&name, NAME_COLUMN), Style::default()),
+        Span::raw(" "),
         Span::styled(
-            format!("{} tokens", format_count(row.result_tokens)),
-            axis_style(active == Axis::Tokens),
+            pad_to_width(&bar, bar_width),
+            Style::default().fg(theme().assistant_indicator),
         ),
+        Span::raw("  "),
+        Span::styled(ranked, Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(" \u{b7} ", Style::default().fg(theme().hint_sep)),
-        Span::styled(
-            plural_calls(u64::from(row.call_count)),
-            axis_style(active == Axis::Calls),
-        ),
+        // Both figures on every row: the axis that is not ranking is the one
+        // that explains the other.
+        Span::styled(other, Style::default().fg(theme().text_dim)),
     ];
     if let Some(tier) = row.tool_tier {
         first.push(Span::styled(
@@ -858,39 +950,28 @@ fn tool_item<'a>(row: &ToolUsageView, report: &Report<'_>, bar_width: usize) -> 
         ));
     }
 
-    let bar = bar_cells(report.fraction(row), bar_width);
-    let mut second = vec![
-        Span::raw("  "),
-        Span::styled(
-            format!("{bar:<bar_width$}"),
-            Style::default().fg(theme().assistant_indicator),
-        ),
-        Span::styled(
-            format!(
-                "  largest {} \u{b7} resident {}",
-                format_bytes(row.max_result_bytes),
-                format_bytes(row.result_bytes)
-            ),
-            Style::default().fg(theme().text_dim),
-        ),
-    ];
+    // The eviction mark leads the second line. A narrow terminal cuts from the
+    // right, and a mark placed last is the first thing to go - leaving a
+    // resident figure on screen with nothing saying it under-reports, which is
+    // the one reading this view must never give.
+    let mut second = vec![Span::raw("  ")];
     if let Some(note) = eviction_note(row) {
+        second.push(Span::styled(note, Style::default().fg(theme().warn)));
         second.push(Span::styled(
-            format!(" \u{b7} {note}"),
-            Style::default().fg(theme().warn),
+            " \u{b7} ",
+            Style::default().fg(theme().hint_sep),
         ));
     }
+    second.push(Span::styled(
+        format!(
+            "largest {} \u{b7} resident {}",
+            format_bytes(row.max_result_bytes),
+            format_bytes(row.result_bytes)
+        ),
+        Style::default().fg(theme().text_dim),
+    ));
 
     ListItem::new(vec![Line::from(first), Line::from(second)])
-}
-
-/// The ranked figure reads bright; the other one stays dim but present.
-fn axis_style(is_active: bool) -> Style {
-    if is_active {
-        Style::default().add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme().text_dim)
-    }
 }
 
 /// The tool's name as its group shows it. The server prefix is already the
@@ -924,11 +1005,62 @@ fn drawn_heading(group: &Group<'_>) -> String {
 
 /// Cut a server-declared name to the column it is drawn in.
 fn clamp_name(name: &str) -> String {
-    if name.chars().count() <= NAME_COLUMN {
-        return name.to_string();
+    clamp_to_width(name, NAME_COLUMN)
+}
+
+/// Terminal cells one character occupies. A width the table does not know
+/// counts as one cell, so a name can never measure zero and slip past the cut.
+fn char_cells(c: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(c)
+        .unwrap_or(0)
+        .max(1)
+}
+
+/// Terminal cells `text` occupies.
+///
+/// Characters are the wrong unit for a column. One CJK glyph is one character
+/// and two cells, so a name cut and padded by character count takes up to twice
+/// the column it was given and pushes the figures beside it off the row; a name
+/// of zero-width characters takes far less and leaves the columns ragged.
+fn display_width(text: &str) -> usize {
+    text.chars().map(char_cells).sum()
+}
+
+/// Cut `text` to at most `width` terminal cells, marking the cut.
+fn clamp_to_width(text: &str, width: usize) -> String {
+    if display_width(text) <= width {
+        return text.to_string();
     }
-    let kept: String = name.chars().take(NAME_COLUMN.saturating_sub(3)).collect();
-    format!("{kept}...")
+    // Below the marker's own width there is no room to say that a cut happened.
+    // NAME_COLUMN is far above this; the branch is here so the helper is total.
+    let marker = if width >= TRUNCATION_MARKER.len() {
+        TRUNCATION_MARKER
+    } else {
+        ""
+    };
+    let budget = width - marker.len();
+    let mut kept = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let cells = char_cells(c);
+        if used + cells > budget {
+            break;
+        }
+        kept.push(c);
+        used += cells;
+    }
+    kept.push_str(marker);
+    kept
+}
+
+/// Pad `text` with spaces to `width` terminal cells, so what follows starts in
+/// the same column on every row whatever glyphs the name uses.
+fn pad_to_width(text: &str, width: usize) -> String {
+    let mut padded = text.to_string();
+    for _ in 0..width.saturating_sub(display_width(text)) {
+        padded.push(' ');
+    }
+    padded
 }
 
 fn draw_status(f: &mut Frame, state: &State, area: Rect) {
@@ -1129,6 +1261,31 @@ mod tests {
         );
     }
 
+    /// A narrow terminal cuts from the right, so the mark is placed where the
+    /// cut cannot reach it first. Checking only the widest case would pin the
+    /// favourable end of the range.
+    #[test]
+    fn the_eviction_mark_survives_a_narrow_terminal() {
+        // The byte figures are at their widest, so the line is at its longest
+        // and the narrow widths below actually discriminate. Testing only a
+        // roomy terminal would pin the favourable end of the range.
+        let rows = vec![ToolUsageView {
+            evicted_results: 3,
+            max_result_bytes: 1_048_524,
+            result_bytes: 1_073_213_337,
+            ..tool("web__fetch", 4, 1_000)
+        }];
+        let state = state_with(rows);
+        for width in [44, 60, 80, 140] {
+            let out = rendered(&state, width, 40);
+            assert!(
+                out.contains("3 evicted"),
+                "at {width} columns the reader must still be told the figure \
+                 under-reports, got: {out}"
+            );
+        }
+    }
+
     #[test]
     fn an_empty_conversation_shows_the_empty_state_not_an_error() {
         let state = state_with(Vec::new());
@@ -1148,6 +1305,52 @@ mod tests {
     }
 
     // --- What the ticket asks the view to render -----------------------------
+
+    /// Requirement 2 is a RENDERED property. Checking `fraction` and
+    /// `bar_cells` as pure functions leaves the draw path free to omit the bar
+    /// entirely, so this one renders and reads the glyphs back.
+    #[test]
+    fn a_bar_is_drawn_on_every_row_and_the_heaviest_row_draws_the_longest() {
+        let out = rendered(&state_with(mixed_rows()), 140, 40);
+        assert!(
+            out.contains(BAR_FULL),
+            "the rows must actually carry bars, got: {out}"
+        );
+
+        // Cells, not bytes: a bar glyph is three bytes, and a light row draws a
+        // partial cell rather than a whole one.
+        let is_bar = |c: char| c == BAR_FULL || BAR_EIGHTHS.contains(&c);
+        let runs: Vec<usize> = out
+            .split(|c| !is_bar(c))
+            .map(|run| run.chars().count())
+            .filter(|cells| *cells > 0)
+            .collect();
+        assert_eq!(runs.len(), 3, "one bar per tool row, got {runs:?}");
+        let heaviest = *runs.iter().max().expect("three bars");
+        let lightest = *runs.iter().min().expect("three bars");
+        assert_eq!(heaviest, MAX_BAR_CELLS, "the peak row fills the bar column");
+        assert!(
+            lightest < heaviest,
+            "and a lighter row draws a shorter one, got {runs:?}"
+        );
+    }
+
+    /// The bar and the number it encodes must sit together. A bar drawn beside
+    /// some other figure reads as a claim about that figure.
+    #[test]
+    fn the_ranked_figure_sits_beside_the_bar_that_encodes_it() {
+        let rows = vec![ToolUsageView {
+            max_result_bytes: 1_024,
+            ..tool("fileio__read_file", 10, 2_560)
+        }];
+        let out = rendered(&state_with(rows), 140, 40);
+        let bar_end = out.rfind(BAR_FULL).expect("a bar is drawn") + BAR_FULL.len_utf8();
+        let after: String = out[bar_end..].chars().take(24).collect();
+        assert!(
+            after.trim_start().starts_with("2,560 tokens"),
+            "the ranked figure must follow the bar, found {after:?}"
+        );
+    }
 
     #[test]
     fn bars_are_proportional_to_the_sorted_axis() {
@@ -1267,6 +1470,21 @@ mod tests {
         );
     }
 
+    /// The daemon splits the tool off the END of the name. A server name may
+    /// itself carry the separator, and splitting at the first one would file
+    /// its tools under a server that does not exist and merge its subtotals
+    /// with every other server sharing that first segment.
+    #[test]
+    fn a_server_name_that_carries_the_separator_is_kept_whole() {
+        let row = tool("home__assistant__get_state", 1, 1);
+        assert_eq!(resolved_namespace(&row), Some("home__assistant"));
+        assert_eq!(
+            display_name(&row),
+            "get_state",
+            "and the row shows only the tool part"
+        );
+    }
+
     #[test]
     fn the_daemon_reported_namespace_wins_over_the_encoded_one() {
         let row = ToolUsageView {
@@ -1337,9 +1555,11 @@ mod tests {
     /// one must not carry `ESC` onto the draw path.
     ///
     /// The assertion is against the strings this module builds, not against the
-    /// rendered buffer: ratatui drops zero-width graphemes on its way into the
-    /// buffer, so a buffer check passes whether or not anything here sanitizes,
-    /// and would hold a property this code does not enforce.
+    /// rendered buffer. A buffer-only assertion was measured against a build
+    /// with the sanitizer removed and still passed, so it does not hold this
+    /// property: the buffer swallows what it cannot place, and cannot tell a
+    /// sanitized name from an unsanitized one. The buffer check below is kept
+    /// as a second, weaker guard.
     #[test]
     fn a_hostile_tool_name_is_sanitized_before_it_reaches_the_draw_path() {
         let rows = vec![tool("evil\u{1b}[2Jbox__wipe\u{1b}c", 1, 10)];
@@ -1367,8 +1587,60 @@ mod tests {
         let long = "x".repeat(200);
         let row = tool(&long, 1, 1);
         assert!(
-            drawn_name(&row).chars().count() <= NAME_COLUMN,
+            display_width(&drawn_name(&row)) <= NAME_COLUMN,
             "one absurd name must not push the figures off the row"
+        );
+    }
+
+    /// The column is terminal cells, and a character is the wrong unit for it:
+    /// one CJK glyph is one character and two cells, so a name cut by character
+    /// count occupies twice the column it was given and pushes the figures
+    /// beside it off the row.
+    #[test]
+    fn a_wide_glyph_name_is_cut_by_terminal_cells_not_by_character_count() {
+        let wide = "\u{8bfb}".repeat(40);
+        assert_eq!(wide.chars().count(), 40, "40 characters");
+        assert_eq!(display_width(&wide), 80, "but 80 terminal cells");
+
+        let drawn = drawn_name(&tool(&wide, 1, 1));
+        assert!(
+            display_width(&drawn) <= NAME_COLUMN,
+            "cut at the column it is drawn in, got {} cells",
+            display_width(&drawn)
+        );
+    }
+
+    #[test]
+    fn every_name_is_padded_to_the_same_column_whatever_glyphs_it_uses() {
+        assert_eq!(
+            display_width(&pad_to_width("read_file", NAME_COLUMN)),
+            NAME_COLUMN
+        );
+        assert_eq!(
+            display_width(&pad_to_width("\u{8bfb}\u{53d6}", NAME_COLUMN)),
+            NAME_COLUMN,
+            "a wide name must not shift the figures beside it"
+        );
+        assert_eq!(
+            display_width(&pad_to_width("read\u{200b}\u{200b}file", NAME_COLUMN)),
+            NAME_COLUMN,
+            "and neither must a zero-width one"
+        );
+    }
+
+    /// The bar gives up its width to the figures, never the other way round.
+    #[test]
+    fn the_bar_yields_its_width_to_the_figures_on_a_narrow_terminal() {
+        assert_eq!(
+            bar_width_for(140),
+            MAX_BAR_CELLS,
+            "a wide list draws a full bar"
+        );
+        assert!(bar_width_for(100) > 0);
+        assert_eq!(
+            bar_width_for(50),
+            0,
+            "too narrow for all three, so the bar goes and the figures stay"
         );
     }
 
@@ -1387,6 +1659,113 @@ mod tests {
     }
 
     // --- Keys ----------------------------------------------------------------
+
+    /// Ranking rows in a `Report` built by hand proves nothing about what the
+    /// user sees. This drives the switch through `State` and renders it, so
+    /// pinning the drawn report to one axis cannot pass.
+    #[test]
+    fn switching_the_axis_re_ranks_the_drawn_list_and_its_bars() {
+        let mut state = state_with(mixed_rows());
+        state.handle_key(key(KeyCode::Char('s')));
+
+        let report = state.report();
+        assert_eq!(
+            report.axis(),
+            Axis::Calls,
+            "the drawn report follows the switch"
+        );
+
+        let entries = state.entries();
+        let Entry::Tool(first) = entries[1] else {
+            panic!("a tool is drawn under its own heading")
+        };
+        assert_eq!(
+            first.tool_name, "fileio__read_file",
+            "the chatty tool leads the list once calls rank it"
+        );
+        assert!(
+            (report.fraction(first) - 1.0).abs() < f64::EPSILON,
+            "and its bar fills, because it is now the peak"
+        );
+
+        let out = rendered(&state, 140, 40);
+        assert!(
+            out.contains("Call count"),
+            "the header names the axis the list is ranked by, got: {out}"
+        );
+    }
+
+    #[test]
+    fn the_unattributed_group_folds_like_any_other() {
+        let mut state = state_with(vec![
+            tool("say_this", 5, 300),
+            tool("web__fetch", 2, 50_000),
+        ]);
+        // Ranked by tokens `web` leads, so the unattributed heading is third.
+        state.handle_key(key(KeyCode::Char('j')));
+        state.handle_key(key(KeyCode::Char('j')));
+        assert!(matches!(state.entries()[2], Entry::Group { .. }));
+
+        state.handle_key(key(KeyCode::Enter));
+        assert!(
+            state.is_collapsed(None),
+            "the group the daemon could not attribute must fold like a named one"
+        );
+
+        let out = rendered(&state, 140, 40);
+        assert!(!out.contains("say_this"), "its rows fold away, got: {out}");
+        assert!(
+            out.contains("300 tokens"),
+            "and its subtotal stays, got: {out}"
+        );
+    }
+
+    #[test]
+    fn a_folded_group_keeps_both_of_its_figures() {
+        let mut state = state_with(vec![tool("web__fetch", 2, 50_000)]);
+        state.handle_key(key(KeyCode::Char('s')));
+        state.handle_key(key(KeyCode::Enter));
+        let out = rendered(&state, 140, 40);
+        assert!(out.contains("2 calls"), "the ranked figure, got: {out}");
+        assert!(
+            out.contains("50,000 tokens"),
+            "and the one it is not ranked on, which folding would otherwise \
+             hide with its rows, got: {out}"
+        );
+    }
+
+    #[test]
+    fn a_reread_clears_the_error_from_the_previous_attempt() {
+        let mut state = State {
+            error: Some("daemon said no".into()),
+            ..State::new()
+        };
+        state.begin_read();
+        assert!(
+            state.error.is_none(),
+            "a live request must not sit beside a stale failure"
+        );
+        assert!(state.busy.is_some());
+    }
+
+    /// A tool name is declared by a third-party server and nothing on the wire
+    /// bounds it. The view sorts on these strings and rebuilds every row on
+    /// every draw and every key press, so the bound is applied once, at ingest.
+    #[test]
+    fn an_unbounded_server_declared_name_is_cut_when_it_is_stored() {
+        let mut state = State::new();
+        state.install_rows(vec![ToolUsageView {
+            namespace: Some("n".repeat(100_000)),
+            ..tool(&"x".repeat(1_000_000), 1, 1)
+        }]);
+        assert!(state.rows[0].tool_name.chars().count() <= MAX_STORED_NAME_CHARS);
+        assert!(
+            state.rows[0]
+                .namespace
+                .as_ref()
+                .is_some_and(|n| n.chars().count() <= MAX_STORED_NAME_CHARS)
+        );
+    }
 
     #[test]
     fn s_switches_the_sort_axis() {
@@ -1493,6 +1872,19 @@ mod tests {
         assert_eq!(format_bytes(262_144), "256.0 KiB");
         assert_eq!(format_bytes(1_048_576), "1.0 MiB");
         assert_eq!(format_bytes(1_073_741_824), "1.0 GiB");
+    }
+
+    /// Rounding to one decimal can carry a value up into the next unit. Picking
+    /// the unit before that happens prints a figure in the wrong one.
+    #[test]
+    fn a_byte_figure_is_never_printed_in_the_unit_below_it() {
+        assert_eq!(format_bytes(1_048_575), "1.0 MiB", "not 1024.0 KiB");
+        assert_eq!(format_bytes(1_073_741_823), "1.0 GiB", "not 1024.0 MiB");
+        assert_eq!(
+            format_bytes(1_048_524),
+            "1023.9 KiB",
+            "just below the carry"
+        );
     }
 
     #[test]
