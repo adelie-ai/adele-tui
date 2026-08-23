@@ -145,6 +145,8 @@ mod tests {
         // mutates the same var concurrently.
         unsafe { env::set_var(ENV_DISABLE, "1") };
         f();
+        // SAFETY: held under ENV_LOCK so no other test in this module
+        // mutates the same var concurrently.
         unsafe {
             match prior {
                 Some(v) => env::set_var(ENV_DISABLE, v),
