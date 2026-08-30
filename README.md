@@ -23,6 +23,12 @@ chat, tool calls, and background tasks.
   remove the daemon's Model Context Protocol servers (local stdio or remote
   HTTP, with bearer-token or OAuth service-account auth), and enable/disable the
   client's compiled-in **built-in** servers (per-surface; applies on restart).
+- **Tool-cost view** (`F7`) - what each tool the open conversation called has
+  cost it. Ranks by token cost (the "what ate my context" reading) or by call
+  count, with a bar beside every figure so a re-sort visibly re-ranks; groups
+  the tools by the server that hosts them, with a subtotal per server that stays
+  visible when a group is folded away; and marks a tool whose results the model
+  now reads as a pointer rather than as the tool's own output.
 - **OAuth2 + PKCE** authentication flow and credentials stored in the system
   keyring (libsecret / kwallet via the OS).
 - **Knowledge base browser/editor** for the daemon's built-in KB.

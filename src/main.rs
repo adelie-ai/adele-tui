@@ -48,7 +48,7 @@ use adele::voice::{DictationOutcome, VoiceConfig, VoiceSession};
 use adele::voice_client::VoiceController;
 use adele::{
     client_tools, connections, credentials, kb, mcp, model_selector, personality_selector, picker,
-    purposes, screen, ui, voice,
+    purposes, screen, tool_usage, ui, voice,
 };
 use client_ui_common::{Effect, TurnOutcome, UiMessage};
 use desktop_assistant_api_model::ClientToolRegistration;
@@ -1129,6 +1129,33 @@ async fn run(
                         match next.save() {
                             Ok(()) => app.status_message = "Settings saved".into(),
                             Err(e) => app.status_message = format!("Settings not saved: {e}"),
+                        }
+                    }
+                }
+                ScreenRequest::ToolUsage => {
+                    // Only reachable with a loaded conversation (handle_action
+                    // gates on `current_conversation`), but re-check so the
+                    // borrow stays clean.
+                    let conv_id = app.current_conversation().map(|conv| conv.id.clone());
+                    if let (Some(conn), Some(conv_id)) = (connector.clone(), conv_id) {
+                        let mut sink = SubScreenSink {
+                            app: &mut app,
+                            connector: &connector,
+                            voice_daemon: &voice_daemon,
+                            voice_session: &voice_session,
+                            narration_tx: &narration_tx,
+                            disconnect: &mut disconnect,
+                        };
+                        if let Err(e) = tool_usage::run(
+                            terminal,
+                            conn.client(),
+                            conv_id,
+                            &mut signal_rx,
+                            &mut sink,
+                        )
+                        .await
+                        {
+                            sink.app.status_message = format!("Tool cost error: {e}");
                         }
                     }
                 }
@@ -2461,6 +2488,16 @@ async fn handle_action(
                 app.request_screen(ScreenRequest::ModelPicker);
             } else {
                 app.status_message = "Not connected — model picker unavailable".into();
+            }
+        }
+        Action::OpenToolUsage => {
+            if client.is_none() {
+                app.status_message = "Not connected - tool cost unavailable".into();
+            } else if app.current_conversation().is_none() {
+                app.status_message =
+                    "Open a conversation first (Enter) - tool cost is per-conversation".into();
+            } else {
+                app.request_screen(ScreenRequest::ToolUsage);
             }
         }
         Action::OpenPersonalityPicker => {

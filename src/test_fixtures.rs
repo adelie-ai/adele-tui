@@ -61,3 +61,23 @@ pub fn chat_message() -> ChatMessage {
         created_at_ms: None,
     }
 }
+
+/// A tool-cost row with every figure at zero and nothing attributed. A test
+/// names the `tool_name`, the figures, and the fields it is about on top of
+/// this.
+pub fn tool_usage_view() -> desktop_assistant_api_model::ToolUsageView {
+    desktop_assistant_api_model::ToolUsageView {
+        tool_name: String::new(),
+        namespace: None,
+        tool_tier: None,
+        call_count: 0,
+        result_bytes: 0,
+        result_tokens: 0,
+        max_result_bytes: 0,
+        evicted_results: 0,
+        first_ordinal: 0,
+        last_ordinal: 0,
+        first_used_at: None,
+        last_used_at: None,
+    }
+}

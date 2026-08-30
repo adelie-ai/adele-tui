@@ -30,6 +30,7 @@ pub mod telemetry;
 #[cfg(test)]
 pub mod test_fixtures;
 pub mod theme;
+pub mod tool_usage;
 pub mod toolbar;
 pub mod ui;
 pub mod voice;

@@ -126,6 +126,9 @@ pub enum ScreenRequest {
     McpServers,
     ModelPicker,
     PersonalityPicker,
+    /// The per-conversation tool-cost view (`F7`, #132). Per-conversation, so
+    /// it needs an open conversation as well as a connection.
+    ToolUsage,
     /// The client-local settings screen (`F6`, #135). Unlike its siblings this
     /// one needs no connection — every setting it edits is stored locally.
     Settings,
