@@ -1120,6 +1120,7 @@ mod tests {
             created_at: "2026-05-01T00:00:00Z".into(),
             updated_at: "2026-05-02T12:34:56Z".into(),
             summary: None,
+            disposition: "active".into(),
         }
     }
 
@@ -1247,11 +1248,40 @@ mod tests {
         assert!(row.spans[1].content.contains("preference"));
     }
 
+    /// `entry_row` renders through [`KnowledgeEntryView::display_line`],
+    /// which already applies the daemon's shared disposition marker
+    /// (desktop-assistant#1341) - so a refuted entry needs no new display
+    /// code here, only a test pinning that this crate's list row actually
+    /// takes that path.
+    #[test]
+    fn a_list_row_marks_a_refuted_entry_and_leaves_an_active_one_unmarked() {
+        let mut refuted = entry("kb-1", "The build needs Python 2.");
+        refuted.disposition = "refuted".into();
+        let active = entry("kb-2", "The build needs Python 3.");
+
+        assert!(
+            row_line(&refuted).starts_with("recorded, later refuted: "),
+            "refuted row: {}",
+            row_line(&refuted)
+        );
+        assert!(!row_line(&active).starts_with("recorded, later refuted: "));
+    }
+
     #[test]
     fn the_delete_prompt_names_the_entry_by_the_line_the_row_shows() {
         let e = entry_with_summary("kb-1", "a long body", "Prefers dark themes");
 
         assert_eq!(delete_label(&e), "Prefers dark themes");
+    }
+
+    /// `delete_label` calls the same `display_line`, so the confirm popup
+    /// must not let a refuted claim read as a plain one either.
+    #[test]
+    fn the_delete_prompt_marks_a_refuted_entry_too() {
+        let mut e = entry("kb-1", "The build needs Python 2.");
+        e.disposition = "refuted".into();
+
+        assert!(delete_label(&e).starts_with("recorded, later refuted: "));
     }
 
     #[test]
