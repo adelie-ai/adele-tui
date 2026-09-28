@@ -1120,6 +1120,7 @@ mod tests {
             created_at: "2026-05-01T00:00:00Z".into(),
             updated_at: "2026-05-02T12:34:56Z".into(),
             summary: None,
+            disposition: "active".into(),
         }
     }
 
